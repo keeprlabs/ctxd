@@ -1,0 +1,21 @@
+[package]
+name = "ctxd-mcp"
+description = "MCP server implementation for ctxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctxd-core = { path = "../ctxd-core" }
+ctxd-store = { path = "../ctxd-store" }
+ctxd-cap = { path = "../ctxd-cap" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rmcp = { version = "1", features = ["server", "transport-io", "schemars"] }
+schemars = "1.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "ctxd-http"
+description = "Admin REST API for ctxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctxd-core = { path = "../ctxd-core" }
+ctxd-store = { path = "../ctxd-store" }
+ctxd-cap = { path = "../ctxd-cap" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+axum = "0.8"
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
