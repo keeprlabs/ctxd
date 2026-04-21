@@ -1,0 +1,19 @@
+[package]
+name = "ctxd-core"
+description = "Core types for ctxd: events, subjects, hash chains"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+glob-match = "0.2"
+hex = "0.4"
+
+[dev-dependencies]
+serde_json = { workspace = true }
