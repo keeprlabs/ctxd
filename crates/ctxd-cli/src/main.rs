@@ -121,7 +121,20 @@ async fn main() -> Result<()> {
     let store = EventStore::open(&cli.db)
         .await
         .context("failed to open event store")?;
-    let cap_engine = Arc::new(CapEngine::new());
+    // Load or create the root capability key, persisted in the database
+    let cap_engine = match store.get_metadata("root_key").await? {
+        Some(key_bytes) => Arc::new(
+            CapEngine::from_private_key(&key_bytes).context("invalid stored root key")?,
+        ),
+        None => {
+            let engine = CapEngine::new();
+            store
+                .set_metadata("root_key", &engine.private_key_bytes())
+                .await
+                .context("failed to persist root key")?;
+            Arc::new(engine)
+        }
+    };
 
     match cli.command {
         Commands::Serve { bind, mcp_stdio } => {
@@ -136,11 +149,7 @@ async fn main() -> Result<()> {
             });
 
             if mcp_stdio {
-                let mcp_server = CtxdMcpServer::new(
-                    store,
-                    cap_engine,
-                    format!("ctxd://{addr}"),
-                );
+                let mcp_server = CtxdMcpServer::new(store, cap_engine, format!("ctxd://{addr}"));
                 tracing::info!("MCP server on stdio ready");
                 let transport = rmcp::transport::io::stdio();
                 let running = mcp_server

@@ -61,6 +61,12 @@ pub struct CapEngine {
     root_keypair: KeyPair,
 }
 
+impl Default for CapEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CapEngine {
     /// Create a new capability engine with a fresh root key pair.
     pub fn new() -> Self {
@@ -142,8 +148,8 @@ impl CapEngine {
 
         // Fallback: extract rights and do glob matching in Rust
         let mut query_auth = biscuit.authorizer()?;
-        let facts: Vec<(String, String)> = query_auth
-            .query(rule!("data($sub, $op) <- right($sub, $op)"))?;
+        let facts: Vec<(String, String)> =
+            query_auth.query(rule!("data($sub, $op) <- right($sub, $op)"))?;
 
         for (pattern, fact_op) in &facts {
             if fact_op == &op_str && glob_match_subject(pattern, subject) {
@@ -240,24 +246,36 @@ mod tests {
         let token = engine
             .mint("/**", &[Operation::Read, Operation::Write], None)
             .unwrap();
-        engine.verify(&token, "/test/hello", Operation::Read).unwrap();
-        engine.verify(&token, "/test/hello", Operation::Write).unwrap();
+        engine
+            .verify(&token, "/test/hello", Operation::Read)
+            .unwrap();
+        engine
+            .verify(&token, "/test/hello", Operation::Write)
+            .unwrap();
     }
 
     #[test]
     fn verify_rejects_wrong_operation() {
         let engine = CapEngine::new();
         let token = engine.mint("/**", &[Operation::Read], None).unwrap();
-        assert!(engine.verify(&token, "/test/hello", Operation::Write).is_err());
+        assert!(engine
+            .verify(&token, "/test/hello", Operation::Write)
+            .is_err());
     }
 
     #[test]
     fn scoped_subject_pattern() {
         let engine = CapEngine::new();
         let token = engine.mint("/test/**", &[Operation::Read], None).unwrap();
-        engine.verify(&token, "/test/hello", Operation::Read).unwrap();
-        engine.verify(&token, "/test/a/b/c", Operation::Read).unwrap();
-        assert!(engine.verify(&token, "/other/hello", Operation::Read).is_err());
+        engine
+            .verify(&token, "/test/hello", Operation::Read)
+            .unwrap();
+        engine
+            .verify(&token, "/test/a/b/c", Operation::Read)
+            .unwrap();
+        assert!(engine
+            .verify(&token, "/other/hello", Operation::Read)
+            .is_err());
     }
 
     #[test]
@@ -267,7 +285,9 @@ mod tests {
         let encoded = CapEngine::token_to_base64(&token);
         let decoded = CapEngine::token_from_base64(&encoded).unwrap();
         assert_eq!(token, decoded);
-        engine.verify(&decoded, "/test/hello", Operation::Read).unwrap();
+        engine
+            .verify(&decoded, "/test/hello", Operation::Read)
+            .unwrap();
     }
 
     #[test]
@@ -275,7 +295,9 @@ mod tests {
         let engine = CapEngine::new();
         let past = Utc::now() - chrono::Duration::hours(1);
         let token = engine.mint("/**", &[Operation::Read], Some(past)).unwrap();
-        assert!(engine.verify(&token, "/test/hello", Operation::Read).is_err());
+        assert!(engine
+            .verify(&token, "/test/hello", Operation::Read)
+            .is_err());
     }
 
     #[test]
@@ -284,7 +306,9 @@ mod tests {
         let key_bytes = engine.private_key_bytes();
         let engine2 = CapEngine::from_private_key(&key_bytes).unwrap();
         let token = engine.mint("/**", &[Operation::Read], None).unwrap();
-        engine2.verify(&token, "/test/hello", Operation::Read).unwrap();
+        engine2
+            .verify(&token, "/test/hello", Operation::Read)
+            .unwrap();
     }
 
     #[test]

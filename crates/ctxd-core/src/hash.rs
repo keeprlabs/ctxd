@@ -64,13 +64,19 @@ impl From<PredecessorHash> for String {
 /// Uses a `BTreeMap` to guarantee sorted key order.
 fn canonical_form(event: &Event) -> serde_json::Value {
     let mut map = BTreeMap::new();
-    map.insert("specversion", serde_json::to_value(&event.specversion).unwrap());
-    map.insert("id", serde_json::to_value(&event.id).unwrap());
+    map.insert(
+        "specversion",
+        serde_json::to_value(&event.specversion).unwrap(),
+    );
+    map.insert("id", serde_json::to_value(event.id).unwrap());
     map.insert("source", serde_json::to_value(&event.source).unwrap());
     map.insert("subject", serde_json::to_value(&event.subject).unwrap());
     map.insert("type", serde_json::to_value(&event.event_type).unwrap());
-    map.insert("time", serde_json::to_value(&event.time).unwrap());
-    map.insert("datacontenttype", serde_json::to_value(&event.datacontenttype).unwrap());
+    map.insert("time", serde_json::to_value(event.time).unwrap());
+    map.insert(
+        "datacontenttype",
+        serde_json::to_value(&event.datacontenttype).unwrap(),
+    );
     map.insert("data", event.data.clone());
     serde_json::to_value(map).unwrap()
 }
@@ -152,7 +158,10 @@ mod tests {
         e2.predecessorhash = Some(h1.to_string());
 
         // Verify the chain link
-        assert!(PredecessorHash::verify(&e1, e2.predecessorhash.as_ref().unwrap()));
+        assert!(PredecessorHash::verify(
+            &e1,
+            e2.predecessorhash.as_ref().unwrap()
+        ));
     }
 
     #[test]
