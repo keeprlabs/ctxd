@@ -59,7 +59,12 @@ impl Event {
     ///
     /// Sets `specversion` to "1.0", generates a UUIDv7 `id`,
     /// sets `time` to now, and `datacontenttype` to "application/json".
-    pub fn new(source: String, subject: Subject, event_type: String, data: serde_json::Value) -> Self {
+    pub fn new(
+        source: String,
+        subject: Subject,
+        event_type: String,
+        data: serde_json::Value,
+    ) -> Self {
         Self {
             specversion: "1.0".to_string(),
             id: Uuid::now_v7(),

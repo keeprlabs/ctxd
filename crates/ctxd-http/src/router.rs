@@ -75,9 +75,9 @@ async fn grant(
 
     let operations = operations.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    let expires_at = req.expires_in_secs.map(|secs| {
-        chrono::Utc::now() + chrono::Duration::seconds(secs)
-    });
+    let expires_at = req
+        .expires_in_secs
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs));
 
     let token = state
         .cap_engine
@@ -91,11 +91,7 @@ async fn grant(
 
 /// Basic store statistics.
 async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    let subjects = state
-        .store
-        .subjects(None, false)
-        .await
-        .unwrap_or_default();
+    let subjects = state.store.subjects(None, false).await.unwrap_or_default();
 
     Json(serde_json::json!({
         "subject_count": subjects.len(),

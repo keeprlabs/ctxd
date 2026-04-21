@@ -88,6 +88,18 @@ impl EventStore {
         .execute(&self.pool)
         .await?;
 
+        // Metadata table for daemon config (e.g., root capability key)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // KV view: latest value per subject
         sqlx::query(
             r#"
@@ -198,11 +210,7 @@ impl EventStore {
     }
 
     /// Read events for a subject, optionally recursive.
-    pub async fn read(
-        &self,
-        subject: &Subject,
-        recursive: bool,
-    ) -> Result<Vec<Event>, StoreError> {
+    pub async fn read(&self, subject: &Subject, recursive: bool) -> Result<Vec<Event>, StoreError> {
         let rows = if recursive {
             let pattern = if subject.as_str() == "/" {
                 "/%".to_string()
@@ -285,16 +293,37 @@ impl EventStore {
 
     /// Get the latest value for a subject from the KV view.
     pub async fn kv_get(&self, subject: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data FROM kv_view WHERE subject = ?")
-                .bind(subject)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM kv_view WHERE subject = ?")
+            .bind(subject)
+            .fetch_optional(&self.pool)
+            .await?;
 
         match row {
             Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
             None => Ok(None),
         }
+    }
+
+    /// Get a metadata value by key.
+    pub async fn get_metadata(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value FROM metadata WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// Set a metadata value.
+    pub async fn set_metadata(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Get the last event appended for a given subject path.
@@ -332,17 +361,14 @@ impl EventRow {
     fn into_event(self) -> Result<Event, StoreError> {
         Ok(Event {
             specversion: self.specversion,
-            id: self
-                .id
-                .parse()
-                .map_err(|e| StoreError::Database(sqlx::Error::Protocol(format!("bad uuid: {e}"))))?,
+            id: self.id.parse().map_err(|e| {
+                StoreError::Database(sqlx::Error::Protocol(format!("bad uuid: {e}")))
+            })?,
             source: self.source,
             subject: Subject::new(&self.subject)?,
             event_type: self.event_type,
             time: chrono::DateTime::parse_from_rfc3339(&self.time)
-                .map_err(|e| {
-                    StoreError::Database(sqlx::Error::Protocol(format!("bad time: {e}")))
-                })?
+                .map_err(|e| StoreError::Database(sqlx::Error::Protocol(format!("bad time: {e}"))))?
                 .with_timezone(&chrono::Utc),
             datacontenttype: self.datacontenttype,
             data: serde_json::from_str(&self.data)?,
@@ -368,7 +394,10 @@ mod tests {
         );
 
         let stored = store.append(event).await.unwrap();
-        assert!(stored.predecessorhash.is_none(), "first event has no predecessor");
+        assert!(
+            stored.predecessorhash.is_none(),
+            "first event has no predecessor"
+        );
 
         let events = store.read(&subject, false).await.unwrap();
         assert_eq!(events.len(), 1);
