@@ -137,11 +137,12 @@ impl EventStore {
     ///
     /// Computes and sets the predecessor hash based on the last event
     /// for the same subject tree. Updates materialized views.
+    #[tracing::instrument(skip(self, event), fields(subject = %event.subject))]
     pub async fn append(&self, mut event: Event) -> Result<Event, StoreError> {
         // Compute predecessor hash from the last event in this subject's chain
         let last_event = self.last_event_for_subject(event.subject.as_str()).await?;
         if let Some(ref prev) = last_event {
-            let hash = PredecessorHash::compute(prev);
+            let hash = PredecessorHash::compute(prev).map_err(StoreError::Serialization)?;
             event.predecessorhash = Some(hash.to_string());
         }
 
@@ -210,6 +211,7 @@ impl EventStore {
     }
 
     /// Read events for a subject, optionally recursive.
+    #[tracing::instrument(skip(self), fields(subject = %subject))]
     pub async fn read(&self, subject: &Subject, recursive: bool) -> Result<Vec<Event>, StoreError> {
         let rows = if recursive {
             let pattern = if subject.as_str() == "/" {
@@ -273,7 +275,43 @@ impl EventStore {
         Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 
+    /// Read events for a subject since a given timestamp, optionally recursive.
+    pub async fn read_since(
+        &self,
+        subject: &Subject,
+        since: chrono::DateTime<chrono::Utc>,
+        recursive: bool,
+    ) -> Result<Vec<Event>, StoreError> {
+        let since_str = since.to_rfc3339();
+        let rows = if recursive {
+            let pattern = if subject.as_str() == "/" {
+                "/%".to_string()
+            } else {
+                format!("{}/%", subject.as_str())
+            };
+            sqlx::query_as::<_, EventRow>(
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE (subject = ? OR subject LIKE ?) AND time > ? ORDER BY seq ASC",
+            )
+            .bind(subject.as_str())
+            .bind(&pattern)
+            .bind(&since_str)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, EventRow>(
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE subject = ? AND time > ? ORDER BY seq ASC",
+            )
+            .bind(subject.as_str())
+            .bind(&since_str)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(|r| r.into_event()).collect()
+    }
+
     /// Search events using FTS5 full-text search.
+    #[tracing::instrument(skip(self))]
     pub async fn search(&self, query: &str) -> Result<Vec<Event>, StoreError> {
         let rows: Vec<EventRow> = sqlx::query_as(
             r#"
@@ -306,11 +344,10 @@ impl EventStore {
 
     /// Get a metadata value by key.
     pub async fn get_metadata(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        let row: Option<(Vec<u8>,)> =
-            sqlx::query_as("SELECT value FROM metadata WHERE key = ?")
-                .bind(key)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT value FROM metadata WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|(v,)| v))
     }
 
@@ -428,7 +465,7 @@ mod tests {
         assert!(stored2.predecessorhash.is_some());
 
         // Verify the chain: hash of e1 should match e2's predecessor
-        let expected = PredecessorHash::compute(&stored1);
+        let expected = PredecessorHash::compute(&stored1).unwrap();
         assert_eq!(stored2.predecessorhash.as_ref().unwrap(), expected.as_str());
     }
 

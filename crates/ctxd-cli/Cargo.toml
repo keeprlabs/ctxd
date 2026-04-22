@@ -24,3 +24,10 @@ tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "1", features = ["server", "transport-io"] }
 axum = "0.8"
+rmp-serde = "1"
+uuid = { workspace = true }
+chrono = { workspace = true }
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.29"

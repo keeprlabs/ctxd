@@ -1,0 +1,31 @@
+[package]
+name = "ctxd-adapter-fs"
+description = "Filesystem watcher adapter for ctxd — watches directories and publishes file change events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ctxd-adapter-fs"
+path = "src/main.rs"
+
+[dependencies]
+ctxd-adapter-core = { path = "../ctxd-adapter-core" }
+ctxd-core = { path = "../ctxd-core" }
+ctxd-store = { path = "../ctxd-store" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+notify = "7"
+chrono = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

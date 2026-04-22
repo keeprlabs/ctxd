@@ -7,6 +7,10 @@ members = [
     "crates/ctxd-mcp",
     "crates/ctxd-http",
     "crates/ctxd-cli",
+    "crates/ctxd-adapter-core",
+    "crates/ctxd-adapter-fs",
+    "crates/ctxd-adapter-gmail",
+    "crates/ctxd-adapter-github",
 ]
 
 [workspace.package]

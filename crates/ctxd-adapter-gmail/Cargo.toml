@@ -1,0 +1,16 @@
+[package]
+name = "ctxd-adapter-gmail"
+description = "Gmail adapter for ctxd — ingests emails via the Gmail API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctxd-adapter-core = { path = "../ctxd-adapter-core" }
+ctxd-core = { path = "../ctxd-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"

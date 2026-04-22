@@ -26,11 +26,13 @@ impl PredecessorHash {
     /// This produces the canonical form of the event (excluding `predecessorhash`
     /// and `signature`), serializes it to JSON with sorted keys, and computes
     /// the SHA-256 hash.
-    pub fn compute(event: &Event) -> Self {
-        let canonical = canonical_form(event);
-        let json = serde_json::to_vec(&canonical).expect("BTreeMap serialization cannot fail");
+    ///
+    /// Returns an error if the event cannot be serialized to its canonical JSON form.
+    pub fn compute(event: &Event) -> Result<Self, serde_json::Error> {
+        let canonical = canonical_form(event)?;
+        let json = serde_json::to_vec(&canonical)?;
         let hash = Sha256::digest(&json);
-        Self(hex::encode(hash))
+        Ok(Self(hex::encode(hash)))
     }
 
     /// Returns the hash as a hex string.
@@ -40,9 +42,13 @@ impl PredecessorHash {
 
     /// Verify that a given hash matches the expected predecessor hash
     /// computed from the event.
+    ///
+    /// Returns `false` if the hash does not match or if serialization fails.
     pub fn verify(event: &Event, expected: &str) -> bool {
-        let computed = Self::compute(event);
-        computed.0 == expected
+        match Self::compute(event) {
+            Ok(computed) => computed.0 == expected,
+            Err(_) => false,
+        }
     }
 }
 
@@ -62,23 +68,22 @@ impl From<PredecessorHash> for String {
 ///
 /// Excludes `predecessorhash` and `signature` to avoid circular dependencies.
 /// Uses a `BTreeMap` to guarantee sorted key order.
-fn canonical_form(event: &Event) -> serde_json::Value {
+///
+/// Returns `Err` if any field cannot be serialized to JSON.
+fn canonical_form(event: &Event) -> Result<serde_json::Value, serde_json::Error> {
     let mut map = BTreeMap::new();
-    map.insert(
-        "specversion",
-        serde_json::to_value(&event.specversion).unwrap(),
-    );
-    map.insert("id", serde_json::to_value(event.id).unwrap());
-    map.insert("source", serde_json::to_value(&event.source).unwrap());
-    map.insert("subject", serde_json::to_value(&event.subject).unwrap());
-    map.insert("type", serde_json::to_value(&event.event_type).unwrap());
-    map.insert("time", serde_json::to_value(event.time).unwrap());
+    map.insert("specversion", serde_json::to_value(&event.specversion)?);
+    map.insert("id", serde_json::to_value(event.id)?);
+    map.insert("source", serde_json::to_value(&event.source)?);
+    map.insert("subject", serde_json::to_value(&event.subject)?);
+    map.insert("type", serde_json::to_value(&event.event_type)?);
+    map.insert("time", serde_json::to_value(event.time)?);
     map.insert(
         "datacontenttype",
-        serde_json::to_value(&event.datacontenttype).unwrap(),
+        serde_json::to_value(&event.datacontenttype)?,
     );
     map.insert("data", event.data.clone());
-    serde_json::to_value(map).unwrap()
+    serde_json::to_value(map)
 }
 
 #[cfg(test)]
@@ -95,8 +100,8 @@ mod tests {
             serde_json::json!({"msg": "hello"}),
         );
 
-        let h1 = PredecessorHash::compute(&event);
-        let h2 = PredecessorHash::compute(&event);
+        let h1 = PredecessorHash::compute(&event).unwrap();
+        let h2 = PredecessorHash::compute(&event).unwrap();
         assert_eq!(h1, h2);
     }
 
@@ -110,12 +115,12 @@ mod tests {
             serde_json::json!({"msg": "hello"}),
         );
 
-        let h1 = PredecessorHash::compute(&event);
+        let h1 = PredecessorHash::compute(&event).unwrap();
 
         event.predecessorhash = Some("deadbeef".to_string());
         event.signature = Some("sig123".to_string());
 
-        let h2 = PredecessorHash::compute(&event);
+        let h2 = PredecessorHash::compute(&event).unwrap();
         assert_eq!(h1, h2, "predecessor and signature must not affect hash");
     }
 
@@ -134,8 +139,8 @@ mod tests {
             serde_json::json!({"msg": "hello"}),
         );
 
-        let h1 = PredecessorHash::compute(&e1);
-        let h2 = PredecessorHash::compute(&e2);
+        let h1 = PredecessorHash::compute(&e1).unwrap();
+        let h2 = PredecessorHash::compute(&e2).unwrap();
         assert_ne!(h1, h2);
     }
 
@@ -147,7 +152,7 @@ mod tests {
             "demo".to_string(),
             serde_json::json!({"step": 1}),
         );
-        let h1 = PredecessorHash::compute(&e1);
+        let h1 = PredecessorHash::compute(&e1).unwrap();
 
         let mut e2 = Event::new(
             "ctxd://localhost".to_string(),
@@ -172,7 +177,7 @@ mod tests {
             "demo".to_string(),
             serde_json::json!({}),
         );
-        let hash = PredecessorHash::compute(&event);
+        let hash = PredecessorHash::compute(&event).unwrap();
         // SHA-256 produces 64 hex chars
         assert_eq!(hash.as_str().len(), 64);
         assert!(hash.as_str().chars().all(|c| c.is_ascii_hexdigit()));
