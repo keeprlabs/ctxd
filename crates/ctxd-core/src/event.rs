@@ -28,7 +28,7 @@ pub struct Event {
     pub source: String,
 
     /// The subject path this event is filed under.
-    /// Uses path syntax: `/work/exlo/customers/dmitry`
+    /// Uses path syntax: `/work/acme/customers/cust-42`
     pub subject: Subject,
 
     /// Event type descriptor, e.g. "ctx.note", "ctx.document", "demo".

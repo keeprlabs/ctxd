@@ -9,7 +9,7 @@ ctxd events follow the [CloudEvents v1.0 spec](https://cloudevents.io/) with ctx
 | `specversion` | string | yes | Always `"1.0"` |
 | `id` | UUID (v7) | yes | Time-ordered unique identifier |
 | `source` | string | yes | Origin of the event (e.g., `"ctxd://localhost:7777"`) |
-| `subject` | string | yes | Path where the event is filed (e.g., `"/work/exlo/customers/dmitry"`) |
+| `subject` | string | yes | Path where the event is filed (e.g., `"/work/acme/customers/cust-42"`) |
 | `type` | string | yes | Event type descriptor (e.g., `"ctx.note"`, `"demo"`) |
 | `time` | RFC 3339 | yes | When the event was created |
 | `datacontenttype` | string | yes | Content type of `data` (default: `"application/json"`) |
@@ -24,13 +24,13 @@ ctxd events follow the [CloudEvents v1.0 spec](https://cloudevents.io/) with ctx
   "specversion": "1.0",
   "id": "019756a3-1234-7000-8000-000000000001",
   "source": "ctxd://localhost:7777",
-  "subject": "/work/exlo/customers/dmitry",
+  "subject": "/work/acme/customers/cust-42",
   "type": "ctx.note",
   "time": "2025-01-15T10:30:00Z",
   "datacontenttype": "application/json",
   "data": {
-    "content": "Dmitry mentioned interest in the enterprise plan",
-    "author": "alice"
+    "content": "Customer mentioned interest in the enterprise plan",
+    "author": "user-1"
   },
   "predecessorhash": "a1b2c3d4e5f6..."
 }

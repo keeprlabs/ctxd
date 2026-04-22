@@ -1,6 +1,6 @@
 //! Subject paths for addressing context within ctxd.
 //!
-//! Subjects use path syntax (`/work/exlo/customers/dmitry`), not dotted notation.
+//! Subjects use path syntax (`/work/acme/customers/cust-42`), not dotted notation.
 //! Read operations support a recursive flag and glob wildcards (`*`, `**`).
 
 use serde::{Deserialize, Serialize};
@@ -136,7 +136,7 @@ mod tests {
         assert!(Subject::new("/").is_ok());
         assert!(Subject::new("/test").is_ok());
         assert!(Subject::new("/test/hello").is_ok());
-        assert!(Subject::new("/work/exlo/customers/dmitry").is_ok());
+        assert!(Subject::new("/work/acme/customers/cust-42").is_ok());
         assert!(Subject::new("/a-b_c.d").is_ok());
     }
 
@@ -196,10 +196,10 @@ mod tests {
 
     #[test]
     fn glob_matching() {
-        let subject = Subject::new("/work/exlo/customers/dmitry").unwrap();
+        let subject = Subject::new("/work/acme/customers/cust-42").unwrap();
 
-        assert!(subject.matches_glob("/work/exlo/customers/*"));
-        assert!(subject.matches_glob("/work/exlo/**"));
+        assert!(subject.matches_glob("/work/acme/customers/*"));
+        assert!(subject.matches_glob("/work/acme/**"));
         assert!(subject.matches_glob("/work/**"));
         assert!(subject.matches_glob("/**"));
         assert!(!subject.matches_glob("/work/other/*"));

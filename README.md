@@ -47,7 +47,7 @@ Then Claude can use `ctx_write`, `ctx_read`, and `ctx_subjects` tools.
 
 - **Event log is the source of truth.** Append-only, all views are derived.
 - **CloudEvents v1.0 spec.** Standard event format with ctxd extensions.
-- **Subjects are paths.** `/work/exlo/customers/dmitry` with recursive reads and glob wildcards.
+- **Subjects are paths.** `/work/acme/customers/cust-42` with recursive reads and glob wildcards.
 - **Predecessor hash chains.** SHA-256 tamper-evidence without consensus.
 - **Capabilities, not ACLs.** Biscuit tokens: signed, attenuable, bearer.
 - **SQLite.** Single-binary, zero-config. Other backends come later.
