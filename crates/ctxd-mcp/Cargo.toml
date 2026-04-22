@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rmcp = { version = "1", features = ["server", "transport-io", "schemars"] }
 schemars = "1.0"
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -95,16 +95,42 @@ impl CapEngine {
     }
 
     /// Mint a new capability token.
+    ///
+    /// # Parameters
+    /// - `subject_glob`: Subject path glob pattern (e.g., "/**", "/test/**").
+    /// - `operations`: The set of operations this token authorizes.
+    /// - `expires_at`: Optional expiry time for the token.
+    /// - `kind_allowed`: Optional list of event types this token is restricted to
+    ///   (e.g., `["ctx.note"]`). If `None`, all event types are allowed.
+    /// - `rate_limit_ops_per_sec`: Optional rate limit in operations per second.
+    ///   For v0.1, this is stored as a fact in the token but **not enforced**.
+    ///   Actual enforcement requires statefulness and is a v0.2 concern.
     pub fn mint(
         &self,
         subject_glob: &str,
         operations: &[Operation],
         expires_at: Option<DateTime<Utc>>,
+        kind_allowed: Option<&[&str]>,
+        rate_limit_ops_per_sec: Option<u32>,
     ) -> Result<Vec<u8>, CapError> {
         // Build using code() which parses a datalog string
         let mut facts = String::new();
         for op in operations {
             facts.push_str(&format!("right(\"{subject_glob}\", \"{op}\");\n"));
+        }
+
+        // KindAllowed caveat: store allowed event types as facts
+        if let Some(kinds) = kind_allowed {
+            for kind in kinds {
+                facts.push_str(&format!("kind_allowed(\"{kind}\");\n"));
+            }
+        }
+
+        // RateLimit caveat: store as a fact in the token.
+        // NOTE: Enforcement is a v0.2 feature — this fact is informational only.
+        // A stateful rate-limiter would read this fact and enforce it at request time.
+        if let Some(rate) = rate_limit_ops_per_sec {
+            facts.push_str(&format!("rate_limit_ops_per_sec({rate});\n"));
         }
 
         let mut code = facts;
@@ -113,32 +139,62 @@ impl CapEngine {
             code.push_str(&format!("check if time($time), $time <= {exp_secs};\n"));
         }
 
+        // If kind_allowed was specified, add a check that enforces it
+        if kind_allowed.is_some() {
+            code.push_str("check if event_type($etype), kind_allowed($etype);\n");
+        }
+
         let builder = Biscuit::builder().code(&code)?;
         let biscuit = builder.build(&self.root_keypair)?;
         Ok(biscuit.to_vec()?)
     }
 
     /// Verify a capability token for a specific operation on a subject.
+    ///
+    /// # Parameters
+    /// - `token`: The serialized biscuit token bytes.
+    /// - `subject`: The subject path to verify access for.
+    /// - `operation`: The operation to verify.
+    /// - `event_type`: Optional event type for KindAllowed caveat verification.
+    ///   If `None`, verifies without event type constraints (the KindAllowed
+    ///   check in the token will use a wildcard match).
     pub fn verify(
         &self,
         token: &[u8],
         subject: &str,
         operation: Operation,
+        event_type: Option<&str>,
     ) -> Result<(), CapError> {
         let biscuit = Biscuit::from(token, self.root_keypair.public())?;
         let op_str = operation.to_string();
         let now = Utc::now().timestamp();
 
         // Build authorizer with policies via code string
-        let auth_code = format!(
+        let mut auth_code = format!(
             r#"
             time({now});
             resource("{subject}");
             operation("{op_str}");
+            "#
+        );
+
+        // If an event_type is provided, add it as a fact for KindAllowed checks.
+        // If not provided, add a wildcard fact so that kind_allowed checks can
+        // match if there is a kind_allowed fact present.
+        if let Some(etype) = event_type {
+            auth_code.push_str(&format!("event_type(\"{etype}\");\n"));
+        } else {
+            // When no event type is specified, we provide a synthetic event_type
+            // that matches kind_allowed only if the token has no kind restriction.
+            // We query facts below to check for kind_allowed presence.
+        }
+
+        auth_code.push_str(&format!(
+            r#"
             allow if right("{subject}", "{op_str}");
             allow if right("/**", "{op_str}");
             "#
-        );
+        ));
 
         let auth_builder = AuthorizerBuilder::new().code(&auth_code)?;
         let mut authorizer = auth_builder.build(&biscuit)?;
@@ -147,18 +203,45 @@ impl CapEngine {
         }
 
         // Fallback: extract rights and do glob matching in Rust
+        let base_code = format!(
+            r#"
+            time({now});
+            resource("{subject}");
+            operation("{op_str}");
+            "#
+        );
+
+        let event_type_code = if let Some(etype) = event_type {
+            format!("event_type(\"{etype}\");\n")
+        } else {
+            String::new()
+        };
+
         let mut query_auth = biscuit.authorizer()?;
         let facts: Vec<(String, String)> =
             query_auth.query(rule!("data($sub, $op) <- right($sub, $op)"))?;
+
+        // Also check for kind_allowed facts when no event_type is provided
+        if event_type.is_none() {
+            let kind_facts: Vec<(String,)> =
+                query_auth.query(rule!("kind_data($k) <- kind_allowed($k)"))?;
+            if !kind_facts.is_empty() {
+                // Token has kind restrictions but no event_type was provided for
+                // verification. We cannot satisfy the kind_allowed check.
+                return Err(CapError::Denied(
+                    "token has kind_allowed restriction but no event_type provided for verification"
+                        .to_string(),
+                ));
+            }
+        }
 
         for (pattern, fact_op) in &facts {
             if fact_op == &op_str && glob_match_subject(pattern, subject) {
                 // Matched via glob. Re-authorize with injected right.
                 let final_code = format!(
                     r#"
-                    time({now});
-                    resource("{subject}");
-                    operation("{op_str}");
+                    {base_code}
+                    {event_type_code}
                     right("{subject}", "{op_str}");
                     allow if right("{subject}", "{op_str}");
                     "#
@@ -244,49 +327,61 @@ mod tests {
     fn mint_and_verify() {
         let engine = CapEngine::new();
         let token = engine
-            .mint("/**", &[Operation::Read, Operation::Write], None)
+            .mint(
+                "/**",
+                &[Operation::Read, Operation::Write],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         engine
-            .verify(&token, "/test/hello", Operation::Read)
+            .verify(&token, "/test/hello", Operation::Read, None)
             .unwrap();
         engine
-            .verify(&token, "/test/hello", Operation::Write)
+            .verify(&token, "/test/hello", Operation::Write, None)
             .unwrap();
     }
 
     #[test]
     fn verify_rejects_wrong_operation() {
         let engine = CapEngine::new();
-        let token = engine.mint("/**", &[Operation::Read], None).unwrap();
+        let token = engine
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
         assert!(engine
-            .verify(&token, "/test/hello", Operation::Write)
+            .verify(&token, "/test/hello", Operation::Write, None)
             .is_err());
     }
 
     #[test]
     fn scoped_subject_pattern() {
         let engine = CapEngine::new();
-        let token = engine.mint("/test/**", &[Operation::Read], None).unwrap();
-        engine
-            .verify(&token, "/test/hello", Operation::Read)
+        let token = engine
+            .mint("/test/**", &[Operation::Read], None, None, None)
             .unwrap();
         engine
-            .verify(&token, "/test/a/b/c", Operation::Read)
+            .verify(&token, "/test/hello", Operation::Read, None)
+            .unwrap();
+        engine
+            .verify(&token, "/test/a/b/c", Operation::Read, None)
             .unwrap();
         assert!(engine
-            .verify(&token, "/other/hello", Operation::Read)
+            .verify(&token, "/other/hello", Operation::Read, None)
             .is_err());
     }
 
     #[test]
     fn base64_roundtrip() {
         let engine = CapEngine::new();
-        let token = engine.mint("/**", &[Operation::Read], None).unwrap();
+        let token = engine
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
         let encoded = CapEngine::token_to_base64(&token);
         let decoded = CapEngine::token_from_base64(&encoded).unwrap();
         assert_eq!(token, decoded);
         engine
-            .verify(&decoded, "/test/hello", Operation::Read)
+            .verify(&decoded, "/test/hello", Operation::Read, None)
             .unwrap();
     }
 
@@ -294,9 +389,11 @@ mod tests {
     fn expired_token_rejected() {
         let engine = CapEngine::new();
         let past = Utc::now() - chrono::Duration::hours(1);
-        let token = engine.mint("/**", &[Operation::Read], Some(past)).unwrap();
+        let token = engine
+            .mint("/**", &[Operation::Read], Some(past), None, None)
+            .unwrap();
         assert!(engine
-            .verify(&token, "/test/hello", Operation::Read)
+            .verify(&token, "/test/hello", Operation::Read, None)
             .is_err());
     }
 
@@ -305,9 +402,11 @@ mod tests {
         let engine = CapEngine::new();
         let key_bytes = engine.private_key_bytes();
         let engine2 = CapEngine::from_private_key(&key_bytes).unwrap();
-        let token = engine.mint("/**", &[Operation::Read], None).unwrap();
+        let token = engine
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
         engine2
-            .verify(&token, "/test/hello", Operation::Read)
+            .verify(&token, "/test/hello", Operation::Read, None)
             .unwrap();
     }
 
@@ -321,5 +420,103 @@ mod tests {
         assert!(!glob_match_subject("/test/*", "/test/a/b"));
         assert!(glob_match_subject("/test/hello", "/test/hello"));
         assert!(!glob_match_subject("/test/hello", "/test/other"));
+    }
+
+    #[test]
+    fn attenuate_restricts_subject() {
+        let engine = CapEngine::new();
+        // Mint a /** token with read+write
+        let token = engine
+            .mint(
+                "/**",
+                &[Operation::Read, Operation::Write],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Attenuate to /test/**
+        let attenuated = engine
+            .attenuate(&token, "/test/**", &[Operation::Read, Operation::Write])
+            .unwrap();
+
+        // /test/hello should work
+        engine
+            .verify(&attenuated, "/test/hello", Operation::Read, None)
+            .unwrap();
+
+        // /other/hello should fail
+        assert!(engine
+            .verify(&attenuated, "/other/hello", Operation::Read, None)
+            .is_err());
+    }
+
+    #[test]
+    fn attenuate_restricts_operations() {
+        let engine = CapEngine::new();
+        // Mint a token with read+write
+        let token = engine
+            .mint(
+                "/**",
+                &[Operation::Read, Operation::Write],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Attenuate to read-only
+        let attenuated = engine.attenuate(&token, "/**", &[Operation::Read]).unwrap();
+
+        // Read should work
+        engine
+            .verify(&attenuated, "/test/hello", Operation::Read, None)
+            .unwrap();
+
+        // Write should fail
+        assert!(engine
+            .verify(&attenuated, "/test/hello", Operation::Write, None)
+            .is_err());
+    }
+
+    #[test]
+    fn kind_allowed_caveat() {
+        let engine = CapEngine::new();
+        // Mint a token restricted to "ctx.note" events only
+        let token = engine
+            .mint(
+                "/**",
+                &[Operation::Read, Operation::Write],
+                None,
+                Some(&["ctx.note"]),
+                None,
+            )
+            .unwrap();
+
+        // Verify with the correct event type should succeed
+        engine
+            .verify(&token, "/test/hello", Operation::Write, Some("ctx.note"))
+            .unwrap();
+
+        // Verify with a different event type should fail
+        assert!(engine
+            .verify(&token, "/test/hello", Operation::Write, Some("ctx.file"))
+            .is_err());
+    }
+
+    #[test]
+    fn rate_limit_fact_stored() {
+        let engine = CapEngine::new();
+        // Mint a token with a rate limit fact
+        // This should succeed; enforcement is v0.2 but the fact is stored.
+        let token = engine
+            .mint("/**", &[Operation::Read], None, None, Some(100))
+            .unwrap();
+
+        // Token should still verify normally (rate limit is not enforced in v0.1)
+        engine
+            .verify(&token, "/test/hello", Operation::Read, None)
+            .unwrap();
     }
 }

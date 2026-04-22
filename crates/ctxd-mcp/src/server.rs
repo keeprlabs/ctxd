@@ -57,6 +57,33 @@ pub struct SubjectsParams {
     pub token: Option<String>,
 }
 
+/// Arguments for ctx_search tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Optional subject prefix filter.
+    pub subject_pattern: Option<String>,
+    /// Maximum number of results (default 10).
+    pub k: Option<usize>,
+    /// Optional capability token (base64-encoded).
+    pub token: Option<String>,
+}
+
+/// Arguments for ctx_subscribe tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubscribeParams {
+    /// Subject path to poll events from.
+    pub subject: String,
+    /// Optional RFC3339 timestamp; only return events after this time.
+    pub since: Option<String>,
+    /// Whether to include child subjects.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Optional capability token (base64-encoded).
+    pub token: Option<String>,
+}
+
 /// The ctxd MCP server.
 #[derive(Clone)]
 pub struct CtxdMcpServer {
@@ -85,7 +112,7 @@ impl CtxdMcpServer {
         if let Some(tok) = token {
             let bytes = CapEngine::token_from_base64(tok).map_err(|e| e.to_string())?;
             self.cap_engine
-                .verify(&bytes, subject, operation)
+                .verify(&bytes, subject, operation, None)
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -195,6 +222,81 @@ impl CtxdMcpServer {
         match self.store.subjects(prefix.as_ref(), params.recursive).await {
             Ok(subjects) => serde_json::to_string_pretty(&subjects).unwrap_or_default(),
             Err(e) => format!("error: subjects failed: {e}"),
+        }
+    }
+
+    /// Full-text search over context events.
+    #[tool(
+        name = "ctx_search",
+        description = "Full-text search over context events. Takes query (string), optional subject_pattern (prefix filter), optional k (max results, default 10), and optional token."
+    )]
+    async fn ctx_search(&self, Parameters(params): Parameters<SearchParams>) -> String {
+        // Use subject_pattern for token verification if provided, otherwise use wildcard
+        let subject_for_auth = params.subject_pattern.as_deref().unwrap_or("/**");
+        if let Err(e) = self.verify_token(&params.token, subject_for_auth, Operation::Search) {
+            return format!("error: {e}");
+        }
+
+        let k = params.k.unwrap_or(10);
+
+        match self.store.search(&params.query).await {
+            Ok(events) => {
+                let filtered: Vec<&ctxd_core::event::Event> =
+                    if let Some(ref pattern) = params.subject_pattern {
+                        events
+                            .iter()
+                            .filter(|e| e.subject.as_str().starts_with(pattern.as_str()))
+                            .take(k)
+                            .collect()
+                    } else {
+                        events.iter().take(k).collect()
+                    };
+                let output: Vec<serde_json::Value> = filtered
+                    .iter()
+                    .map(|e| serde_json::to_value(e).unwrap_or_default())
+                    .collect();
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            }
+            Err(e) => format!("error: search failed: {e}"),
+        }
+    }
+
+    /// Poll for context events since a given timestamp.
+    #[tool(
+        name = "ctx_subscribe",
+        description = "Poll for context events since a given timestamp. Takes subject (path), optional since (RFC3339 timestamp), recursive (bool), and optional token."
+    )]
+    async fn ctx_subscribe(&self, Parameters(params): Parameters<SubscribeParams>) -> String {
+        if let Err(e) = self.verify_token(&params.token, &params.subject, Operation::Read) {
+            return format!("error: {e}");
+        }
+
+        let subject = match Subject::new(&params.subject) {
+            Ok(s) => s,
+            Err(e) => return format!("error: invalid subject: {e}"),
+        };
+
+        let since = match &params.since {
+            Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(e) => return format!("error: invalid timestamp: {e}"),
+            },
+            None => chrono::DateTime::<chrono::Utc>::MIN_UTC,
+        };
+
+        match self
+            .store
+            .read_since(&subject, since, params.recursive)
+            .await
+        {
+            Ok(events) => {
+                let output: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| serde_json::to_value(e).unwrap_or_default())
+                    .collect();
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            }
+            Err(e) => format!("error: subscribe failed: {e}"),
         }
     }
 }

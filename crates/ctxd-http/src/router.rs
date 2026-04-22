@@ -81,7 +81,7 @@ async fn grant(
 
     let token = state
         .cap_engine
-        .mint(&req.subject, &operations, expires_at)
+        .mint(&req.subject, &operations, expires_at, None, None)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(GrantResponse {
