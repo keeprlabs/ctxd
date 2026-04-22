@@ -14,7 +14,7 @@ Subjects are paths that address context within ctxd. They use forward-slash synt
 
 ```
 /                                    # root
-/work/exlo/customers/dmitry          # specific customer context
+/work/acme/customers/cust-42          # specific customer context
 /personal/journal/2025-01-15         # dated journal entry
 /projects/ctxd/decisions/001         # architectural decision record
 ```

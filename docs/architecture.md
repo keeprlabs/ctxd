@@ -6,7 +6,7 @@ ctxd is a single-binary daemon that ingests, stores, addresses, and serves conte
 
 1. **Event log is the source of truth.** Append-only. All materialized views (KV, FTS, vector) are derived from the log and can be rebuilt.
 2. **CloudEvents v1.0 spec.** Every event follows the standard with our extensions (`predecessorhash`, `signature`).
-3. **Subjects are paths.** `/work/exlo/customers/dmitry`, not dotted. Recursive reads, glob wildcards.
+3. **Subjects are paths.** `/work/acme/customers/cust-42`, not dotted. Recursive reads, glob wildcards.
 4. **Predecessor hash chains.** SHA-256 hash of the previous event's canonical form per subject tree. Tamper-evidence without consensus.
 5. **Capabilities, not ACLs.** Biscuit tokens: signed, attenuable, bearer. Grant/verify/attenuate in v0.1; revocation in v0.2.
 
