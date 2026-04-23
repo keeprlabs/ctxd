@@ -15,9 +15,9 @@ use ctxd_adapter_core::{Adapter, AdapterError, EventSink};
 /// GitHub adapter that ingests issues, PRs, and notifications via the GitHub API.
 pub struct GitHubAdapter {
     /// The GitHub owner (user or org) to watch.
-    owner: String,
+    _owner: String,
     /// The repository name to watch, or None to watch all repos for the owner.
-    repo: Option<String>,
+    _repo: Option<String>,
 }
 
 impl GitHubAdapter {
@@ -27,7 +27,10 @@ impl GitHubAdapter {
     /// * `owner` - The GitHub owner (user or organization)
     /// * `repo` - Optional repository name (None to watch all repos)
     pub fn new(owner: String, repo: Option<String>) -> Self {
-        Self { owner, repo }
+        Self {
+            _owner: owner,
+            _repo: repo,
+        }
     }
 }
 
@@ -42,10 +45,8 @@ impl Adapter for GitHubAdapter {
     }
 
     async fn run(&self, _sink: Box<dyn EventSink>) -> Result<(), AdapterError> {
-        todo!(
-            "GitHub adapter not yet implemented — requires API token and GitHub API integration for {}/{}",
-            self.owner,
-            self.repo.as_deref().unwrap_or("*")
-        )
+        Err(AdapterError::Internal(
+            "GitHub adapter not yet implemented. See docs/adapter-guide.md".to_string(),
+        ))
     }
 }

@@ -1,11 +1,14 @@
 //! ctxd — context substrate daemon for AI agents.
 
 mod protocol;
+mod query;
+mod rate_limit;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ctxd_cap::{CapEngine, Operation};
 use ctxd_core::event::Event;
+use ctxd_core::signing::EventSigner;
 use ctxd_core::subject::Subject;
 use ctxd_http::build_router;
 use ctxd_mcp::CtxdMcpServer;
@@ -62,6 +65,10 @@ enum Commands {
         /// Event data as JSON string.
         #[arg(long)]
         data: String,
+
+        /// Sign the event with the stored Ed25519 signing key.
+        #[arg(long, default_value_t = false)]
+        sign: bool,
     },
 
     /// Read events for a subject.
@@ -109,9 +116,20 @@ enum Commands {
 
     /// Revoke a capability token.
     Revoke {
-        /// Base64-encoded token to revoke.
+        /// Token ID to revoke.
         #[arg(long)]
-        token: String,
+        token_id: String,
+    },
+
+    /// Verify an event's Ed25519 signature.
+    VerifySignature {
+        /// Event ID to verify.
+        #[arg(long)]
+        event_id: String,
+
+        /// Hex-encoded public key (32 bytes = 64 hex chars).
+        #[arg(long)]
+        public_key: String,
     },
 
     /// List subjects in the store.
@@ -243,11 +261,35 @@ async fn main() -> Result<()> {
             subject,
             r#type,
             data,
+            sign,
         } => {
             let subject = Subject::new(&subject).context("invalid subject")?;
             let data: serde_json::Value =
                 serde_json::from_str(&data).context("invalid JSON data")?;
-            let event = Event::new("ctxd://cli".to_string(), subject, r#type, data);
+            let mut event = Event::new("ctxd://cli".to_string(), subject, r#type, data);
+
+            if sign {
+                // Load or create signing key from metadata
+                let signer = match store.get_metadata("signing_key").await? {
+                    Some(key_bytes) => EventSigner::from_bytes(&key_bytes)
+                        .map_err(|e| anyhow::anyhow!("invalid signing key: {e}"))?,
+                    None => {
+                        let signer = EventSigner::new();
+                        store
+                            .set_metadata("signing_key", &signer.secret_key_bytes())
+                            .await
+                            .context("failed to persist signing key")?;
+                        // Also store the public key for later verification
+                        store
+                            .set_metadata("signing_public_key", &signer.public_key_bytes())
+                            .await
+                            .context("failed to persist signing public key")?;
+                        signer
+                    }
+                };
+                event.signature = Some(signer.sign(&event));
+            }
+
             let stored = store.append(event).await.context("write failed")?;
             println!(
                 "{}",
@@ -255,6 +297,7 @@ async fn main() -> Result<()> {
                     "id": stored.id.to_string(),
                     "subject": stored.subject.as_str(),
                     "predecessorhash": stored.predecessorhash,
+                    "signature": stored.signature,
                 }))?
             );
         }
@@ -272,37 +315,24 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
 
-        Commands::Query { query } => {
-            // TODO(v0.2): Full EventQL parser integration.
-            // EventQL supports: FROM e IN events WHERE e.subject LIKE "/test/%" PROJECT INTO e
-            // For v0.1, we parse a basic LIKE filter as a subset.
-            eprintln!("EventQL query engine is a v0.2 feature.");
-            eprintln!("Running basic subject LIKE filter as fallback...");
-
-            if let Some(pattern) = extract_like_pattern(&query) {
-                let all_subjects = store
-                    .subjects(None, false)
-                    .await
-                    .context("subjects failed")?;
-                let matching: Vec<&String> = all_subjects
-                    .iter()
-                    .filter(|s| sql_like_match(s, &pattern))
-                    .collect();
-
-                for subj_str in matching {
-                    let subj = Subject::new(subj_str).context("invalid subject in store")?;
-                    let events = store.read(&subj, false).await.context("read failed")?;
-                    for event in &events {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::to_value(event)?)?
-                        );
-                    }
+        Commands::Query { query: query_str } => match query::parse_query(&query_str) {
+            Ok(parsed) => match query::execute_query(&store, &parsed).await {
+                Ok(events) => {
+                    let output: Vec<serde_json::Value> = events
+                        .iter()
+                        .map(|e| serde_json::to_value(e).unwrap())
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&output)?);
                 }
-            } else {
-                eprintln!("Could not parse query. Supported: FROM e IN events WHERE e.subject LIKE \"<pattern>\" PROJECT INTO e");
+                Err(e) => {
+                    eprintln!("Query execution failed: {e}");
+                }
+            },
+            Err(e) => {
+                eprintln!("EventQL parse error: {e}");
+                eprintln!("Supported: FROM e IN events WHERE e.subject LIKE \"/pattern/%\" AND e.type = \"ctx.note\" AND e.time > \"2025-01-01T00:00:00Z\" PROJECT INTO e");
             }
-        }
+        },
 
         Commands::Grant {
             subject,
@@ -346,10 +376,38 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Revoke { token: _ } => {
-            println!(
-                "Token revocation is a v0.2 feature. Tokens expire based on their expiry caveat."
-            );
+        Commands::Revoke { token_id } => {
+            store
+                .revoke_token(&token_id)
+                .await
+                .context("revoke failed")?;
+            println!("Token {token_id} has been revoked.");
+        }
+
+        Commands::VerifySignature {
+            event_id,
+            public_key,
+        } => {
+            let pk_bytes = hex::decode(&public_key).context("invalid hex public key")?;
+            // Find the event by ID
+            let subject = Subject::new("/").unwrap();
+            let all_events = store.read(&subject, true).await.context("read failed")?;
+            let event = all_events
+                .iter()
+                .find(|e| e.id.to_string() == event_id)
+                .ok_or_else(|| anyhow::anyhow!("event not found: {event_id}"))?;
+            match &event.signature {
+                Some(sig) => {
+                    if EventSigner::verify(event, sig, &pk_bytes) {
+                        println!("VERIFIED: signature is valid.");
+                    } else {
+                        println!("INVALID: signature verification failed.");
+                    }
+                }
+                None => {
+                    println!("Event has no signature.");
+                }
+            }
         }
 
         Commands::Subjects { prefix, recursive } => {
@@ -486,37 +544,4 @@ fn init_tracing() -> OtelGuard {
 
         OtelGuard { provider: None }
     }
-}
-
-/// Extract a LIKE pattern from a basic EventQL query.
-fn extract_like_pattern(query: &str) -> Option<String> {
-    let upper = query.to_uppercase();
-    let like_pos = upper.find("LIKE")?;
-    let rest = &query[like_pos + 4..];
-    let rest = rest.trim();
-    let start_quote = rest.find('"').or_else(|| rest.find('\''))?;
-    let quote_char = rest.as_bytes()[start_quote] as char;
-    let after_quote = &rest[start_quote + 1..];
-    let end_quote = after_quote.find(quote_char)?;
-    Some(after_quote[..end_quote].to_string())
-}
-
-/// Basic SQL LIKE matching (supports % wildcard).
-fn sql_like_match(value: &str, pattern: &str) -> bool {
-    if pattern == "%" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix('%') {
-        return value.starts_with(prefix);
-    }
-    if let Some(suffix) = pattern.strip_prefix('%') {
-        return value.ends_with(suffix);
-    }
-    if pattern.contains('%') {
-        let parts: Vec<&str> = pattern.split('%').collect();
-        if parts.len() == 2 {
-            return value.starts_with(parts[0]) && value.ends_with(parts[1]);
-        }
-    }
-    value == pattern
 }

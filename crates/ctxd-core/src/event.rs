@@ -137,4 +137,59 @@ mod tests {
         let value: serde_json::Value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["predecessorhash"], "abc123");
     }
+
+    #[test]
+    fn event_with_large_data_payload() {
+        // Build a ~1MB JSON payload
+        let large_string = "x".repeat(1_000_000);
+        let data = serde_json::json!({"content": large_string});
+        let subject = Subject::new("/test/large").unwrap();
+        let event = Event::new(
+            "ctxd://localhost".to_string(),
+            subject,
+            "demo".to_string(),
+            data.clone(),
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.data, data);
+        assert!(json.len() > 1_000_000);
+    }
+
+    #[test]
+    fn event_with_empty_data() {
+        let subject = Subject::new("/test/empty").unwrap();
+        let event = Event::new(
+            "ctxd://localhost".to_string(),
+            subject,
+            "demo".to_string(),
+            serde_json::json!(null),
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.data, serde_json::Value::Null);
+
+        // Also test with empty object and empty array
+        let event2 = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/test/empty2").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({}),
+        );
+        let json2 = serde_json::to_string(&event2).unwrap();
+        let deser2: Event = serde_json::from_str(&json2).unwrap();
+        assert_eq!(deser2.data, serde_json::json!({}));
+
+        let event3 = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/test/empty3").unwrap(),
+            "demo".to_string(),
+            serde_json::json!([]),
+        );
+        let json3 = serde_json::to_string(&event3).unwrap();
+        let deser3: Event = serde_json::from_str(&json3).unwrap();
+        assert_eq!(deser3.data, serde_json::json!([]));
+    }
 }

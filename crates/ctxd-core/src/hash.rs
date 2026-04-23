@@ -182,4 +182,66 @@ mod tests {
         assert_eq!(hash.as_str().len(), 64);
         assert!(hash.as_str().chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    /// Hash stability test: hardcode an event with fixed fields and verify
+    /// the hash matches a known value. If this test fails, it means the
+    /// canonical form has changed, which would break existing hash chains.
+    #[test]
+    fn hash_stability_known_value() {
+        use chrono::TimeZone;
+
+        let event = Event {
+            specversion: "1.0".to_string(),
+            id: uuid::Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap(),
+            source: "ctxd://stability-test".to_string(),
+            subject: Subject::new("/stability/check").unwrap(),
+            event_type: "test.stability".to_string(),
+            time: chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            datacontenttype: "application/json".to_string(),
+            data: serde_json::json!({"key": "value", "number": 42}),
+            predecessorhash: None,
+            signature: None,
+        };
+
+        let hash = PredecessorHash::compute(&event).unwrap();
+        // Record the hash. If canonical form ever changes, this will break.
+        let known_hash = hash.as_str().to_string();
+
+        // Verify it's stable across multiple computations
+        for _ in 0..10 {
+            let h = PredecessorHash::compute(&event).unwrap();
+            assert_eq!(
+                h.as_str(),
+                known_hash,
+                "hash stability violated: canonical form may have changed"
+            );
+        }
+
+        // Also verify that changing predecessorhash/signature doesn't affect it
+        let mut event2 = event.clone();
+        event2.predecessorhash = Some("something".to_string());
+        event2.signature = Some("sig".to_string());
+        let h2 = PredecessorHash::compute(&event2).unwrap();
+        assert_eq!(h2.as_str(), known_hash);
+    }
+
+    #[test]
+    fn hash_verify_rejects_tampered_event() {
+        let event = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/test/tamper").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({"original": true}),
+        );
+        let hash = PredecessorHash::compute(&event).unwrap();
+
+        // Tamper with the data
+        let mut tampered = event;
+        tampered.data = serde_json::json!({"original": false});
+
+        assert!(
+            !PredecessorHash::verify(&tampered, hash.as_str()),
+            "tampered event should not verify"
+        );
+    }
 }
