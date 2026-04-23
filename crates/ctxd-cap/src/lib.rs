@@ -11,6 +11,7 @@ use biscuit_auth::macros::*;
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Errors from the capability engine.
 #[derive(Debug, thiserror::Error)]
@@ -133,6 +134,11 @@ impl CapEngine {
 
         // Build using code() which parses a datalog string
         let mut facts = String::new();
+
+        // Add a unique token_id fact for revocation support
+        let token_id = Uuid::now_v7().to_string();
+        facts.push_str(&format!("token_id(\"{token_id}\");\n"));
+
         for op in operations {
             facts.push_str(&format!("right(\"{subject_glob}\", \"{op}\");\n"));
         }
@@ -320,6 +326,44 @@ impl CapEngine {
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
             .map_err(|e| CapError::Base64(e.to_string()))
+    }
+
+    /// Extract the token_id from a biscuit token.
+    ///
+    /// Returns `None` if the token has no token_id fact (e.g., tokens minted
+    /// before v0.2).
+    pub fn extract_token_id(&self, token: &[u8]) -> Result<Option<String>, CapError> {
+        let biscuit = Biscuit::from(token, self.root_keypair.public())?;
+        let mut authorizer = biscuit.authorizer()?;
+        let ids: Vec<(String,)> =
+            authorizer.query(rule!("token_id_result($id) <- token_id($id)"))?;
+        Ok(ids.into_iter().next().map(|(id,)| id))
+    }
+
+    /// Verify a token, also checking whether it has been revoked.
+    ///
+    /// `is_revoked` is a callback that checks whether a token_id has been
+    /// revoked. This allows the caller to plug in any revocation store.
+    pub fn verify_with_revocation<F>(
+        &self,
+        token: &[u8],
+        subject: &str,
+        operation: Operation,
+        event_type: Option<&str>,
+        is_revoked: F,
+    ) -> Result<(), CapError>
+    where
+        F: FnOnce(&str) -> bool,
+    {
+        // Check revocation first
+        if let Some(token_id) = self.extract_token_id(token)? {
+            if is_revoked(&token_id) {
+                return Err(CapError::Denied(format!(
+                    "token {token_id} has been revoked"
+                )));
+            }
+        }
+        self.verify(token, subject, operation, event_type)
     }
 }
 
@@ -575,5 +619,228 @@ mod tests {
         engine
             .verify(&token, "/test/hello", Operation::Read, None)
             .unwrap();
+    }
+
+    #[test]
+    fn different_root_keys_cannot_cross_verify() {
+        let engine_a = CapEngine::new();
+        let engine_b = CapEngine::new();
+
+        let token_a = engine_a
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
+
+        // engine_b should reject a token minted by engine_a
+        assert!(
+            engine_b
+                .verify(&token_a, "/test/hello", Operation::Read, None)
+                .is_err(),
+            "token from engine A should not verify with engine B"
+        );
+
+        let token_b = engine_b
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
+
+        // engine_a should reject a token minted by engine_b
+        assert!(
+            engine_a
+                .verify(&token_b, "/test/hello", Operation::Read, None)
+                .is_err(),
+            "token from engine B should not verify with engine A"
+        );
+    }
+
+    #[test]
+    fn attenuate_chain_root_to_scope_a_to_scope_b() {
+        let engine = CapEngine::new();
+
+        // Root token: /** with read+write
+        let root_token = engine
+            .mint(
+                "/**",
+                &[Operation::Read, Operation::Write],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Attenuate to scope A: /work/**
+        let scope_a = engine
+            .attenuate(
+                &root_token,
+                "/work/**",
+                &[Operation::Read, Operation::Write],
+            )
+            .unwrap();
+
+        // Attenuate scope A to scope B: /work/team1/**
+        let scope_b = engine
+            .attenuate(&scope_a, "/work/team1/**", &[Operation::Read])
+            .unwrap();
+
+        // scope_b can read under /work/team1
+        engine
+            .verify(&scope_b, "/work/team1/doc", Operation::Read, None)
+            .unwrap();
+
+        // scope_b cannot write (was restricted to read-only)
+        assert!(engine
+            .verify(&scope_b, "/work/team1/doc", Operation::Write, None)
+            .is_err());
+
+        // scope_b cannot access outside /work/team1
+        assert!(engine
+            .verify(&scope_b, "/work/team2/doc", Operation::Read, None)
+            .is_err());
+
+        // scope_b cannot access outside /work
+        assert!(engine
+            .verify(&scope_b, "/other/doc", Operation::Read, None)
+            .is_err());
+    }
+
+    #[test]
+    fn datalog_injection_all_patterns_blocked() {
+        let engine = CapEngine::new();
+
+        // Test all injection characters in subjects during mint
+        let injection_patterns: Vec<(&str, &str)> = vec![
+            ("double quote", "/**\"; allow if true;//"),
+            ("close paren", "/**); allow if true;//"),
+            ("semicolon", "/**; allow if true"),
+            ("newline", "/**\nallow if true"),
+        ];
+
+        for (desc, pattern) in &injection_patterns {
+            assert!(
+                engine
+                    .mint(pattern, &[Operation::Read], None, None, None)
+                    .is_err(),
+                "mint should reject {desc} injection in subject_glob"
+            );
+        }
+
+        // Test injection in kind_allowed
+        let kind_injections: Vec<&str> = vec![
+            "ctx.note\"; allow if true;//",
+            "ctx.note); allow if true;//",
+            "ctx.note; allow if true",
+            "ctx.note\nallow if true",
+        ];
+
+        for malicious_kind in &kind_injections {
+            assert!(
+                engine
+                    .mint(
+                        "/**",
+                        &[Operation::Read],
+                        None,
+                        Some(&[malicious_kind]),
+                        None,
+                    )
+                    .is_err(),
+                "mint should reject injection in kind_allowed: {malicious_kind}"
+            );
+        }
+
+        // Test injection in verify subject
+        let token = engine
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
+        for (desc, pattern) in &injection_patterns {
+            assert!(
+                engine
+                    .verify(&token, pattern, Operation::Read, None)
+                    .is_err(),
+                "verify should reject {desc} injection in subject"
+            );
+        }
+
+        // Test injection in verify event_type
+        for malicious_etype in &kind_injections {
+            assert!(
+                engine
+                    .verify(&token, "/test", Operation::Read, Some(malicious_etype))
+                    .is_err(),
+                "verify should reject injection in event_type: {malicious_etype}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_caveats_enforced_simultaneously() {
+        let engine = CapEngine::new();
+
+        // Mint a token with subject scope + kind restriction + expiry (future)
+        let future_expiry = Utc::now() + chrono::Duration::hours(1);
+        let token = engine
+            .mint(
+                "/work/**",
+                &[Operation::Read, Operation::Write],
+                Some(future_expiry),
+                Some(&["ctx.note"]),
+                None,
+            )
+            .unwrap();
+
+        // All caveats satisfied: correct subject, correct op, correct kind, not expired
+        engine
+            .verify(&token, "/work/doc", Operation::Read, Some("ctx.note"))
+            .unwrap();
+
+        // Wrong subject (outside /work/**)
+        assert!(engine
+            .verify(&token, "/other/doc", Operation::Read, Some("ctx.note"))
+            .is_err());
+
+        // Wrong operation (admin not granted)
+        assert!(engine
+            .verify(&token, "/work/doc", Operation::Admin, Some("ctx.note"))
+            .is_err());
+
+        // Wrong kind
+        assert!(engine
+            .verify(&token, "/work/doc", Operation::Read, Some("ctx.file"))
+            .is_err());
+
+        // No event_type provided when kind_allowed is set
+        assert!(engine
+            .verify(&token, "/work/doc", Operation::Read, None)
+            .is_err());
+
+        // Expired token with all other caveats correct
+        let past_expiry = Utc::now() - chrono::Duration::hours(1);
+        let expired_token = engine
+            .mint(
+                "/work/**",
+                &[Operation::Read],
+                Some(past_expiry),
+                Some(&["ctx.note"]),
+                None,
+            )
+            .unwrap();
+        assert!(engine
+            .verify(
+                &expired_token,
+                "/work/doc",
+                Operation::Read,
+                Some("ctx.note")
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn attenuate_with_invalid_subject_rejected() {
+        let engine = CapEngine::new();
+        let token = engine
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
+
+        // Injection in attenuate subject_glob
+        assert!(engine
+            .attenuate(&token, "/test\"; allow if true;//**", &[Operation::Read])
+            .is_err());
     }
 }

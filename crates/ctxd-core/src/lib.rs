@@ -5,6 +5,7 @@
 
 pub mod event;
 pub mod hash;
+pub mod signing;
 pub mod subject;
 
 pub use event::Event;

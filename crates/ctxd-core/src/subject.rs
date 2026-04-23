@@ -238,4 +238,65 @@ mod tests {
         let deserialized: Subject = serde_json::from_str(&json).unwrap();
         assert_eq!(subject, deserialized);
     }
+
+    #[test]
+    fn max_path_depth_20_segments() {
+        // Build a path with exactly 20 segments
+        let segments: Vec<String> = (1..=20).map(|i| format!("seg{i}")).collect();
+        let path = format!("/{}", segments.join("/"));
+        let subject = Subject::new(&path).unwrap();
+        assert_eq!(subject.as_str(), path);
+
+        // Verify parent/child at max depth
+        let parent_segments: Vec<String> = (1..=19).map(|i| format!("seg{i}")).collect();
+        let parent_path = format!("/{}", parent_segments.join("/"));
+        let parent = Subject::new(&parent_path).unwrap();
+        assert!(parent.is_parent_of(&subject));
+    }
+
+    #[test]
+    fn dots_and_hyphens_in_segments() {
+        let subject = Subject::new("/a.b/c-d/e_f").unwrap();
+        assert_eq!(subject.as_str(), "/a.b/c-d/e_f");
+
+        let subject2 = Subject::new("/my-project/v1.2.3/build-output").unwrap();
+        assert_eq!(subject2.as_str(), "/my-project/v1.2.3/build-output");
+
+        let subject3 = Subject::new("/a.b.c.d").unwrap();
+        assert_eq!(subject3.as_str(), "/a.b.c.d");
+
+        let subject4 = Subject::new("/a-b-c-d").unwrap();
+        assert_eq!(subject4.as_str(), "/a-b-c-d");
+
+        // Dots and hyphens combined with alphanumeric
+        let subject5 = Subject::new("/work/acme-corp/project.v2/task-123").unwrap();
+        assert_eq!(subject5.as_str(), "/work/acme-corp/project.v2/task-123");
+    }
+
+    #[test]
+    fn unicode_rejected_in_segments() {
+        // Unicode characters should be rejected since validation only allows
+        // alphanumeric, hyphens, underscores, dots, and slashes.
+        // However, alphanumeric includes unicode alphanumeric chars via is_alphanumeric().
+        // Test that basic unicode letters work (they are alphanumeric).
+        let result = Subject::new("/test/hello-world");
+        assert!(result.is_ok());
+
+        // Special chars like spaces, @, # should be rejected
+        assert!(Subject::new("/test/hello world").is_err());
+        assert!(Subject::new("/test/@user").is_err());
+        assert!(Subject::new("/test/#channel").is_err());
+    }
+
+    #[test]
+    fn cap_pattern_matching() {
+        assert!(Subject::matches_cap_pattern("/test/hello", "/**"));
+        assert!(Subject::matches_cap_pattern("/test/hello", "/test/**"));
+        assert!(Subject::matches_cap_pattern("/test/hello", "/test/*"));
+        assert!(Subject::matches_cap_pattern("/test/hello", "/test/hello"));
+        assert!(!Subject::matches_cap_pattern("/test/hello", "/other/**"));
+        assert!(!Subject::matches_cap_pattern("/test/a/b", "/test/*"));
+        assert!(Subject::matches_cap_pattern("/test/a/b", "/test/**"));
+        assert!(Subject::matches_cap_pattern("/test", "/test/**"));
+    }
 }

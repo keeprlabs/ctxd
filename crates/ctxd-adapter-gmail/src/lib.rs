@@ -12,6 +12,7 @@
 use ctxd_adapter_core::{Adapter, AdapterError, EventSink};
 
 /// Gmail adapter that ingests emails via the Gmail API.
+#[allow(dead_code)]
 pub struct GmailAdapter {
     /// The Gmail user ID (typically "me" for the authenticated user).
     user_id: String,
@@ -38,6 +39,8 @@ impl Adapter for GmailAdapter {
     }
 
     async fn run(&self, _sink: Box<dyn EventSink>) -> Result<(), AdapterError> {
-        todo!("Gmail adapter not yet implemented — requires OAuth2 setup and Gmail API integration for user {}", self.user_id)
+        Err(AdapterError::Internal(
+            "Gmail adapter not yet implemented. See docs/adapter-guide.md".to_string(),
+        ))
     }
 }

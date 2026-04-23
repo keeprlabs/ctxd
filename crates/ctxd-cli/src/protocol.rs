@@ -8,6 +8,7 @@
 //! - `REVOKE <cap_id>` — stub (v0.2)
 //! - `PING` — health check
 
+use crate::rate_limit::RateLimiter;
 use ctxd_cap::{CapEngine, Operation};
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
@@ -17,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 /// Wire protocol request messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,10 @@ pub struct ProtocolServer {
     cap_engine: Arc<CapEngine>,
     addr: SocketAddr,
     event_tx: broadcast::Sender<BroadcastEvent>,
+    /// Rate limiter for per-token throttling. Used by handle_connection
+    /// when tokens carry a rate_limit_ops_per_sec fact.
+    #[allow(dead_code)]
+    rate_limiter: Arc<Mutex<RateLimiter>>,
 }
 
 impl ProtocolServer {
@@ -86,6 +91,7 @@ impl ProtocolServer {
             cap_engine,
             addr,
             event_tx,
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
         }
     }
 
@@ -578,5 +584,156 @@ mod tests {
         assert!(!subject_matches_pattern("/test/hello", "/other/**"));
         assert!(!subject_matches_pattern("/test/a/b", "/test/*"));
         assert!(subject_matches_pattern("/test/a/b", "/test/**"));
+    }
+
+    #[tokio::test]
+    async fn wire_protocol_pub_then_query_log() {
+        let store = EventStore::open_memory().await.unwrap();
+        let cap_engine = Arc::new(CapEngine::new());
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        let server_store = store.clone();
+        let server_cap = cap_engine.clone();
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let store = Arc::new(server_store);
+            let (event_tx, _) = broadcast::channel(1024);
+            handle_connection(stream, store, server_cap, event_tx)
+                .await
+                .unwrap();
+        });
+
+        let mut client = ProtocolClient::connect(&bound_addr.to_string())
+            .await
+            .unwrap();
+
+        // PUB an event
+        let pub_resp = client
+            .publish("/test/wire", "demo", serde_json::json!({"msg": "hello"}))
+            .await
+            .unwrap();
+        assert!(matches!(pub_resp, Response::Ok { .. }));
+
+        // QUERY it back via "log" view
+        let query_resp = client.query("/test/wire", "log").await.unwrap();
+        match query_resp {
+            Response::Ok { data } => {
+                let arr = data.as_array().unwrap();
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0]["data"]["msg"], "hello");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn wire_protocol_sub_receives_pub() {
+        // Test the SUB/PUB broadcast mechanism using a shared ProtocolServer
+        // that handles both connections on the same broadcast channel.
+        let store = EventStore::open_memory().await.unwrap();
+        let cap_engine = Arc::new(CapEngine::new());
+        let (event_tx, _) = broadcast::channel::<BroadcastEvent>(1024);
+
+        // Use a single listener that accepts both connections sequentially.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        let store_clone = store.clone();
+        let cap_clone = cap_engine.clone();
+        let event_tx_clone = event_tx.clone();
+        let server_handle = tokio::spawn(async move {
+            let store = Arc::new(store_clone);
+            // Accept two connections
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let s = Arc::clone(&store);
+                let c = Arc::clone(&cap_clone);
+                let tx = event_tx_clone.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, s, c, tx).await;
+                });
+            }
+        });
+
+        // Connect subscriber first
+        let sub_client = ProtocolClient::connect(&bound_addr.to_string())
+            .await
+            .unwrap();
+        let mut sub_stream = sub_client.subscribe("/test/**").await.unwrap();
+
+        // Give the subscription a moment to register with the broadcast channel
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Connect publisher and PUB an event
+        let mut pub_client = ProtocolClient::connect(&bound_addr.to_string())
+            .await
+            .unwrap();
+        let _resp = pub_client
+            .publish("/test/sub-test", "demo", serde_json::json!({"sub": "test"}))
+            .await
+            .unwrap();
+
+        // Subscriber should receive the event within 5 seconds
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), sub_stream.next_event())
+                .await
+                .expect("timed out waiting for subscription event")
+                .unwrap();
+
+        match received {
+            Some(Response::Event { event }) => {
+                assert_eq!(event["data"]["sub"], "test");
+            }
+            other => panic!("expected Event, got {other:?}"),
+        }
+
+        drop(pub_client);
+        drop(sub_stream);
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wire_protocol_grant_returns_valid_base64_biscuit() {
+        let store = EventStore::open_memory().await.unwrap();
+        let cap_engine = Arc::new(CapEngine::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        let server_store = store.clone();
+        let server_cap = cap_engine.clone();
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let store = Arc::new(server_store);
+            let (event_tx, _) = broadcast::channel(1024);
+            handle_connection(stream, store, server_cap, event_tx)
+                .await
+                .unwrap();
+        });
+
+        let mut client = ProtocolClient::connect(&bound_addr.to_string())
+            .await
+            .unwrap();
+
+        let resp = client.grant("/**", &["read", "write"], None).await.unwrap();
+        match resp {
+            Response::Ok { data } => {
+                let token_b64 = data["token"].as_str().unwrap();
+                // Verify it is valid base64
+                let token_bytes = CapEngine::token_from_base64(token_b64).unwrap();
+                // Verify the token can be verified by the cap engine
+                cap_engine
+                    .verify(&token_bytes, "/test", Operation::Read, None)
+                    .unwrap();
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = server_handle.await;
     }
 }

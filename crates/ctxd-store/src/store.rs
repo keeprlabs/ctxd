@@ -2,6 +2,7 @@
 
 use ctxd_core::event::Event;
 use ctxd_core::hash::PredecessorHash;
+use ctxd_core::signing::EventSigner;
 use ctxd_core::subject::Subject;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -36,6 +37,8 @@ pub enum StoreError {
 #[derive(Clone)]
 pub struct EventStore {
     pool: SqlitePool,
+    /// Optional Ed25519 signing key for event signatures.
+    signing_key: Option<Vec<u8>>,
 }
 
 impl EventStore {
@@ -46,7 +49,10 @@ impl EventStore {
             .max_connections(5)
             .connect(&url)
             .await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            signing_key: None,
+        };
         store.initialize().await?;
         Ok(store)
     }
@@ -57,7 +63,10 @@ impl EventStore {
             .max_connections(1)
             .connect("sqlite::memory:")
             .await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            signing_key: None,
+        };
         store.initialize().await?;
         Ok(store)
     }
@@ -114,6 +123,18 @@ impl EventStore {
         .execute(&self.pool)
         .await?;
 
+        // Revoked tokens table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+                token_id TEXT PRIMARY KEY,
+                revoked_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // FTS5 view on event data
         sqlx::query(
             r#"
@@ -125,6 +146,46 @@ impl EventStore {
                 content='events',
                 content_rowid='seq'
             );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Graph view: entities
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS graph_entities (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                properties TEXT NOT NULL DEFAULT '{}',
+                source_event_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_type ON graph_entities(entity_type);
+            CREATE INDEX IF NOT EXISTS idx_entities_name ON graph_entities(name);
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Graph view: relationships
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS graph_relationships (
+                id TEXT PRIMARY KEY,
+                from_entity_id TEXT NOT NULL,
+                to_entity_id TEXT NOT NULL,
+                relationship_type TEXT NOT NULL,
+                properties TEXT NOT NULL DEFAULT '{}',
+                source_event_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (from_entity_id) REFERENCES graph_entities(id),
+                FOREIGN KEY (to_entity_id) REFERENCES graph_entities(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rel_from ON graph_relationships(from_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_rel_to ON graph_relationships(to_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_rel_type ON graph_relationships(relationship_type);
             "#,
         )
         .execute(&self.pool)
@@ -144,6 +205,13 @@ impl EventStore {
         if let Some(ref prev) = last_event {
             let hash = PredecessorHash::compute(prev).map_err(StoreError::Serialization)?;
             event.predecessorhash = Some(hash.to_string());
+        }
+
+        // Sign the event if a signing key is available
+        if let Some(ref key) = self.signing_key {
+            if let Ok(signer) = EventSigner::from_bytes(key) {
+                event.signature = Some(signer.sign(&event));
+            }
         }
 
         let id = event.id.to_string();
@@ -388,6 +456,97 @@ impl EventStore {
         Ok(())
     }
 
+    /// Set the Ed25519 signing key for event signatures.
+    pub fn set_signing_key(&mut self, key: Vec<u8>) {
+        self.signing_key = Some(key);
+    }
+
+    /// Revoke a token by its token_id.
+    pub async fn revoke_token(&self, token_id: &str) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO revoked_tokens (token_id, revoked_at) VALUES (?, ?) ON CONFLICT(token_id) DO NOTHING",
+        )
+        .bind(token_id)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Check if a token has been revoked.
+    pub async fn is_token_revoked(&self, token_id: &str) -> Result<bool, StoreError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT token_id FROM revoked_tokens WHERE token_id = ?")
+                .bind(token_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// Create a `GraphView` backed by the same connection pool.
+    pub fn graph_view(&self) -> crate::views::graph::GraphView {
+        crate::views::graph::GraphView::new(self.pool.clone())
+    }
+
+    /// Get the state of a subject at a specific point in time.
+    /// Returns events for this subject with time <= as_of, ordered by seq ASC.
+    pub async fn read_at(
+        &self,
+        subject: &Subject,
+        as_of: chrono::DateTime<chrono::Utc>,
+        recursive: bool,
+    ) -> Result<Vec<Event>, StoreError> {
+        let as_of_str = as_of.to_rfc3339();
+        let rows = if recursive {
+            let pattern = if subject.as_str() == "/" {
+                "/%".to_string()
+            } else {
+                format!("{}/%", subject.as_str())
+            };
+            sqlx::query_as::<_, EventRow>(
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE (subject = ? OR subject LIKE ?) AND time <= ? ORDER BY seq ASC",
+            )
+            .bind(subject.as_str())
+            .bind(&pattern)
+            .bind(&as_of_str)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, EventRow>(
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE subject = ? AND time <= ? ORDER BY seq ASC",
+            )
+            .bind(subject.as_str())
+            .bind(&as_of_str)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(|r| r.into_event()).collect()
+    }
+
+    /// Get the KV view state at a point in time.
+    /// Returns the latest event data for this subject with time <= as_of.
+    pub async fn kv_get_at(
+        &self,
+        subject: &str,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let as_of_str = as_of.to_rfc3339();
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data FROM events WHERE subject = ? AND time <= ? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(subject)
+        .bind(&as_of_str)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Get the last event appended for a given subject path.
     async fn last_event_for_subject(&self, subject: &str) -> Result<Option<Event>, StoreError> {
         let row: Option<EventRow> = sqlx::query_as(
@@ -589,5 +748,298 @@ mod tests {
         let results = store.search("hello world", None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].subject.as_str(), "/docs/readme");
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_10_tasks_100_events_each() {
+        let store = EventStore::open_memory().await.unwrap();
+        let store = std::sync::Arc::new(store);
+
+        let mut handles = Vec::new();
+        for task_id in 0..10 {
+            let store = std::sync::Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                for i in 0..100 {
+                    let subject = Subject::new(&format!("/concurrent/task{task_id}")).unwrap();
+                    let event = Event::new(
+                        "ctxd://test".to_string(),
+                        subject,
+                        "demo".to_string(),
+                        serde_json::json!({"task": task_id, "seq": i}),
+                    );
+                    store.append(event).await.unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify all 1000 events are present
+        let root = Subject::new("/concurrent").unwrap();
+        let all_events = store.read(&root, true).await.unwrap();
+        assert_eq!(all_events.len(), 1000);
+
+        // Verify each task has exactly 100 events
+        for task_id in 0..10 {
+            let subject = Subject::new(&format!("/concurrent/task{task_id}")).unwrap();
+            let events = store.read(&subject, false).await.unwrap();
+            assert_eq!(events.len(), 100, "task {task_id} should have 100 events");
+
+            // Verify hash chain integrity for this subject
+            for i in 1..events.len() {
+                assert!(
+                    events[i].predecessorhash.is_some(),
+                    "event {i} in task {task_id} should have predecessor hash"
+                );
+                let expected = PredecessorHash::compute(&events[i - 1]).unwrap();
+                assert_eq!(
+                    events[i].predecessorhash.as_ref().unwrap(),
+                    expected.as_str(),
+                    "hash chain broken at event {i} in task {task_id}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn large_dataset_10000_events() {
+        let store = EventStore::open_memory().await.unwrap();
+
+        for i in 0..10_000 {
+            let bucket = i % 100;
+            let subject = Subject::new(&format!("/large/bucket{bucket}")).unwrap();
+            let event = Event::new(
+                "ctxd://test".to_string(),
+                subject,
+                "demo".to_string(),
+                serde_json::json!({"index": i}),
+            );
+            store.append(event).await.unwrap();
+        }
+
+        // Verify recursive read returns all events
+        let root = Subject::new("/large").unwrap();
+        let all_events = store.read(&root, true).await.unwrap();
+        assert_eq!(all_events.len(), 10_000);
+
+        // Verify FTS search works over large dataset
+        let results = store.search("index", None).await.unwrap();
+        assert_eq!(results.len(), 10_000);
+
+        // Verify search with limit
+        let results = store.search("index", Some(10)).await.unwrap();
+        assert_eq!(results.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn kv_view_consistency_100_writes() {
+        let store = EventStore::open_memory().await.unwrap();
+        let subject = Subject::new("/kv/consistency").unwrap();
+
+        for i in 0..100 {
+            let event = Event::new(
+                "ctxd://test".to_string(),
+                subject.clone(),
+                "demo".to_string(),
+                serde_json::json!({"version": i}),
+            );
+            store.append(event).await.unwrap();
+        }
+
+        // KV should return the very last value
+        let latest = store.kv_get("/kv/consistency").await.unwrap().unwrap();
+        assert_eq!(latest, serde_json::json!({"version": 99}));
+
+        // Verify all 100 events are in the log
+        let events = store.read(&subject, false).await.unwrap();
+        assert_eq!(events.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn search_relevance_ordering() {
+        let store = EventStore::open_memory().await.unwrap();
+
+        let e1 = Event::new(
+            "ctxd://test".to_string(),
+            Subject::new("/search/first").unwrap(),
+            "document".to_string(),
+            serde_json::json!({"content": "the quick brown fox jumps over the lazy dog"}),
+        );
+        store.append(e1).await.unwrap();
+
+        let e2 = Event::new(
+            "ctxd://test".to_string(),
+            Subject::new("/search/second").unwrap(),
+            "document".to_string(),
+            serde_json::json!({"content": "a completely different topic about databases"}),
+        );
+        store.append(e2).await.unwrap();
+
+        let e3 = Event::new(
+            "ctxd://test".to_string(),
+            Subject::new("/search/third").unwrap(),
+            "document".to_string(),
+            serde_json::json!({"content": "the fox was quick and brown"}),
+        );
+        store.append(e3).await.unwrap();
+
+        // Search for "fox" should return the events that contain it
+        let results = store.search("fox", None).await.unwrap();
+        assert_eq!(results.len(), 2);
+        let subjects: Vec<&str> = results.iter().map(|e| e.subject.as_str()).collect();
+        assert!(subjects.contains(&"/search/first"));
+        assert!(subjects.contains(&"/search/third"));
+        assert!(!subjects.contains(&"/search/second"));
+    }
+
+    #[tokio::test]
+    async fn kv_view_and_events_always_agree() {
+        let store = EventStore::open_memory().await.unwrap();
+
+        for i in 0..50 {
+            let subject = Subject::new(&format!("/txn/subj{}", i % 5)).unwrap();
+            let event = Event::new(
+                "ctxd://test".to_string(),
+                subject,
+                "demo".to_string(),
+                serde_json::json!({"val": i}),
+            );
+            store.append(event).await.unwrap();
+        }
+
+        // For each subject, the KV view data should match the last event's data
+        for j in 0..5 {
+            let subject_str = format!("/txn/subj{j}");
+            let subject = Subject::new(&subject_str).unwrap();
+            let events = store.read(&subject, false).await.unwrap();
+            let last_event = events.last().unwrap();
+            let kv_data = store.kv_get(&subject_str).await.unwrap().unwrap();
+            assert_eq!(
+                last_event.data, kv_data,
+                "KV view disagrees with event log for {subject_str}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_get_nonexistent_returns_none() {
+        let store = EventStore::open_memory().await.unwrap();
+        let result = store.kv_get("/does/not/exist").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_at_returns_events_up_to_timestamp() {
+        use chrono::TimeZone;
+        let store = EventStore::open_memory().await.unwrap();
+        let subject = Subject::new("/temporal/test").unwrap();
+
+        let t1 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+        let t2 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 11, 0, 0).unwrap();
+        let t3 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap();
+
+        for (i, t) in [(1, t1), (2, t2), (3, t3)] {
+            let mut event = Event::new(
+                "ctxd://test".to_string(),
+                subject.clone(),
+                "demo".to_string(),
+                serde_json::json!({"version": i}),
+            );
+            event.time = t;
+            store.append(event).await.unwrap();
+        }
+
+        // Query at t2: should return events at t1 and t2 only
+        let events = store.read_at(&subject, t2, false).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, serde_json::json!({"version": 1}));
+        assert_eq!(events[1].data, serde_json::json!({"version": 2}));
+
+        // Query at t1: should return only the first event
+        let events = store.read_at(&subject, t1, false).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, serde_json::json!({"version": 1}));
+
+        // Query at t3: should return all three
+        let events = store.read_at(&subject, t3, false).await.unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn read_at_recursive() {
+        use chrono::TimeZone;
+        let store = EventStore::open_memory().await.unwrap();
+
+        let t1 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+        let t2 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 11, 0, 0).unwrap();
+
+        let mut e1 = Event::new(
+            "ctxd://test".to_string(),
+            Subject::new("/temporal/a").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({"sub": "a"}),
+        );
+        e1.time = t1;
+        store.append(e1).await.unwrap();
+
+        let mut e2 = Event::new(
+            "ctxd://test".to_string(),
+            Subject::new("/temporal/b").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({"sub": "b"}),
+        );
+        e2.time = t2;
+        store.append(e2).await.unwrap();
+
+        let parent = Subject::new("/temporal").unwrap();
+        // At t1 only /temporal/a should be visible
+        let events = store.read_at(&parent, t1, true).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subject.as_str(), "/temporal/a");
+
+        // At t2 both should be visible
+        let events = store.read_at(&parent, t2, true).await.unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn kv_get_at_returns_latest_before_timestamp() {
+        use chrono::TimeZone;
+        let store = EventStore::open_memory().await.unwrap();
+        let subject = Subject::new("/temporal/kv").unwrap();
+
+        let t1 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 10, 0, 0).unwrap();
+        let t2 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 11, 0, 0).unwrap();
+        let t3 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap();
+
+        for (i, t) in [(1, t1), (2, t2), (3, t3)] {
+            let mut event = Event::new(
+                "ctxd://test".to_string(),
+                subject.clone(),
+                "demo".to_string(),
+                serde_json::json!({"version": i}),
+            );
+            event.time = t;
+            store.append(event).await.unwrap();
+        }
+
+        // At t2, should get version 2 (not version 3)
+        let val = store.kv_get_at("/temporal/kv", t2).await.unwrap().unwrap();
+        assert_eq!(val, serde_json::json!({"version": 2}));
+
+        // At t1, should get version 1
+        let val = store.kv_get_at("/temporal/kv", t1).await.unwrap().unwrap();
+        assert_eq!(val, serde_json::json!({"version": 1}));
+
+        // At t3, should get version 3
+        let val = store.kv_get_at("/temporal/kv", t3).await.unwrap().unwrap();
+        assert_eq!(val, serde_json::json!({"version": 3}));
+
+        // Before t1, should get None
+        let t0 = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 9, 0, 0).unwrap();
+        let val = store.kv_get_at("/temporal/kv", t0).await.unwrap();
+        assert!(val.is_none());
     }
 }
