@@ -151,7 +151,9 @@ impl EventStore {
         let data = serde_json::to_string(&event.data)?;
         let time = event.time.to_rfc3339();
 
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+
+        let result = sqlx::query(
             r#"
             INSERT INTO events (id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -167,8 +169,10 @@ impl EventStore {
         .bind(&event.predecessorhash)
         .bind(&event.signature)
         .bind(&event.specversion)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        let seq = result.last_insert_rowid();
 
         // Update KV view
         sqlx::query(
@@ -185,27 +189,25 @@ impl EventStore {
         .bind(&id)
         .bind(&data)
         .bind(&time)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         // Update FTS view
-        let seq: (i64,) = sqlx::query_as("SELECT seq FROM events WHERE id = ?")
-            .bind(&id)
-            .fetch_one(&self.pool)
-            .await?;
         sqlx::query(
             r#"
             INSERT INTO fts_view (rowid, event_id, subject, event_type, data)
             VALUES (?, ?, ?, ?, ?)
             "#,
         )
-        .bind(seq.0)
+        .bind(seq)
         .bind(&id)
         .bind(&subject)
         .bind(&event.event_type)
         .bind(&data)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(event)
     }
@@ -312,19 +314,42 @@ impl EventStore {
 
     /// Search events using FTS5 full-text search.
     #[tracing::instrument(skip(self))]
-    pub async fn search(&self, query: &str) -> Result<Vec<Event>, StoreError> {
-        let rows: Vec<EventRow> = sqlx::query_as(
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, StoreError> {
+        let sql = if limit.is_some() {
             r#"
             SELECT e.id, e.source, e.subject, e.event_type, e.time, e.datacontenttype, e.data, e.predecessorhash, e.signature, e.specversion
             FROM events e
             JOIN fts_view f ON e.seq = f.rowid
             WHERE fts_view MATCH ?
             ORDER BY e.seq ASC
-            "#,
-        )
-        .bind(query)
-        .fetch_all(&self.pool)
-        .await?;
+            LIMIT ?
+            "#
+        } else {
+            r#"
+            SELECT e.id, e.source, e.subject, e.event_type, e.time, e.datacontenttype, e.data, e.predecessorhash, e.signature, e.specversion
+            FROM events e
+            JOIN fts_view f ON e.seq = f.rowid
+            WHERE fts_view MATCH ?
+            ORDER BY e.seq ASC
+            "#
+        };
+
+        let rows: Vec<EventRow> = if let Some(lim) = limit {
+            sqlx::query_as(sql)
+                .bind(query)
+                .bind(lim as i64)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as(sql)
+                .bind(query)
+                .fetch_all(&self.pool)
+                .await?
+        };
 
         rows.into_iter().map(|r| r.into_event()).collect()
     }
@@ -561,7 +586,7 @@ mod tests {
         );
         store.append(e2).await.unwrap();
 
-        let results = store.search("hello world").await.unwrap();
+        let results = store.search("hello world", None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].subject.as_str(), "/docs/readme");
     }

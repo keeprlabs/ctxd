@@ -239,7 +239,7 @@ impl CtxdMcpServer {
 
         let k = params.k.unwrap_or(10);
 
-        match self.store.search(&params.query).await {
+        match self.store.search(&params.query, Some(k)).await {
             Ok(events) => {
                 let filtered: Vec<&ctxd_core::event::Event> =
                     if let Some(ref pattern) = params.subject_pattern {
