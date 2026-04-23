@@ -2,26 +2,120 @@
 
 How to measure ctxd's performance and compare it to alternatives.
 
-## What to measure
+## ctxd benchmark results
 
-ctxd competes in the "context for AI agents" space. The relevant benchmarks are:
+Run with `cargo bench -p ctxd-store` on an in-memory SQLite store. Full details in [benchmark-results.md](benchmark-results.md).
 
-| Metric | What it tells you | Target |
-|--------|-------------------|--------|
-| Write throughput | Events per second via append() | >10k events/sec on SQLite |
-| Read latency (exact) | Time to read events for one subject | <1ms p99 |
-| Read latency (recursive) | Time to read a subject tree | <10ms for 1000 events |
-| FTS query latency | Time for a full-text search | <5ms for 100k events |
-| Vector search latency | k-NN query time | <10ms for 10k vectors |
-| MCP tool round-trip | End-to-end time for ctx_read over stdio | <50ms |
-| Wire protocol round-trip | End-to-end time for PUB over TCP | <5ms |
-| Cold start | Time from `ctxd serve` to first successful request | <500ms |
-| Memory at rest | RSS with N events in the store | <50MB for 100k events |
-| DB size per event | SQLite file growth per event | ~500B per event (JSON payload dependent) |
-| Token mint latency | Time to mint a biscuit capability token | <1ms |
-| Token verify latency | Time to verify a token | <1ms |
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| Append single event | 2.85 ms | Includes store initialization |
+| Append 100 sequential | 375 us/event | Amortized over batch |
+| Read exact (1 event) | 79.74 us | Single subject, single event |
+| Read recursive (100 events) | 1.09 ms | All events under one prefix |
+| Read recursive (1000 events) | 10.03 ms | All events under one prefix |
+| FTS search (100 events) | 987.17 us | SQLite FTS5 |
+| FTS search (10,000 events) | 105.87 ms | SQLite FTS5 |
+| KV get latest | 68.92 us | Latest value for a subject |
 
-## Running benchmarks
+Environment: release build, in-memory SQLite, Criterion v0.5, 100 samples.
+
+## Comparison with alternatives
+
+ctxd is not a database, a message broker, or a vector store. It is a context substrate that combines features from all three. Comparisons below are operation-specific -- each system is benchmarked on the operations it was designed for.
+
+### Feature comparison
+
+| | ctxd | Redis | NATS | SQLite (raw) | Mem0 | ChromaDB |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Open source | Apache-2.0 | BSD-3 | Apache-2.0 | Public domain | Partial | Apache-2.0 |
+| Self-hosted single binary | Yes | Yes | Yes | Library | No (cloud) | Yes |
+| MCP native | Yes | No | No | No | Partial | No |
+| Append-only event log | Yes | No | Yes (JetStream) | No | No | No |
+| Tamper-evident hash chains | Yes | No | No | No | No | No |
+| Capability-based auth | Yes (Biscuit) | ACL | NKEY/JWT | None | API key | None |
+| Full-text search | Yes (FTS5) | RediSearch | No | Manual | Via LLM | No |
+| Vector search | Yes (HNSW) | RedisVSS | No | No | Yes | Yes |
+| Subject-path addressing | Yes | Key-based | Subject-based | Tables | User/session | Collections |
+
+### Write throughput
+
+| System | Operation | Throughput | Source |
+|--------|-----------|------------|--------|
+| **ctxd** | append (in-process) | ~2,667 events/sec | Criterion bench, sequential appends |
+| **Redis** | SET (pipelined) | ~100,000+ ops/sec | redis-benchmark, single node |
+| **NATS** | PUB (no persistence) | ~10M+ msgs/sec | nats bench, single node |
+| **NATS JetStream** | PUB (persisted) | ~200,000 msgs/sec | NATS docs, single node, file store |
+| **SQLite** | INSERT (WAL mode) | ~50,000 rows/sec | Published benchmarks, single writer |
+| **Mem0** | add() | ~5-50 ops/sec | Requires LLM call per write |
+| **ChromaDB** | add (batch 1000) | ~1,000-5,000 docs/sec | Published benchmarks, depends on embedding model |
+
+**Why ctxd is slower than raw Redis/NATS/SQLite:** Every ctxd append does more work per operation:
+1. Fetch the previous event for predecessor hash computation (1 read)
+2. Compute SHA-256 hash of the canonical form
+3. Generate UUIDv7
+4. INSERT into the event log
+5. UPSERT into the KV view
+6. INSERT into the FTS index
+7. All within a single SQLite transaction
+
+This is 3 writes + 1 read + 1 hash per append, compared to Redis's single key-value SET or NATS's single message publish.
+
+### Read latency
+
+| System | Operation | Latency | Source |
+|--------|-----------|---------|--------|
+| **ctxd** | exact read (1 event) | 80 us | Criterion bench |
+| **ctxd** | recursive read (100 events) | 1.09 ms | Criterion bench |
+| **Redis** | GET | ~0.1-0.5 ms | redis-benchmark, single node |
+| **NATS JetStream** | fetch from stream | ~0.5-2 ms | NATS docs |
+| **SQLite** | SELECT by indexed key | ~10-50 us | Published benchmarks |
+| **Mem0** | get_all() | ~50-200 ms | Network + DB lookup |
+
+### Search latency
+
+| System | Operation | Latency | Source |
+|--------|-----------|---------|--------|
+| **ctxd** | FTS (100 events) | 987 us | Criterion bench |
+| **ctxd** | FTS (10k events) | 105.87 ms | Criterion bench |
+| **Redis + RediSearch** | FT.SEARCH (100k docs) | ~1-5 ms | Redis docs |
+| **ChromaDB** | query (10k vectors, k=10) | ~5-20 ms | Published benchmarks |
+| **Mem0** | search() | ~100-500 ms | Requires LLM for semantic search |
+
+### Vector search
+
+| System | Operation | Latency | Source |
+|--------|-----------|---------|--------|
+| **ctxd** | k-NN (HNSW, in-memory) | Not yet benchmarked | instant-distance crate |
+| **ChromaDB** | query (10k vectors, k=10) | ~5-20 ms | Published benchmarks |
+| **Qdrant** | search (1M vectors, k=10) | ~5-15 ms | Qdrant benchmarks |
+| **Redis + RedisVSS** | FT.SEARCH (100k vectors) | ~1-10 ms | Redis docs |
+
+## Where ctxd wins
+
+- **All-in-one for AI agents.** One binary gives you an event log, KV store, FTS index, vector search, capability auth, and MCP tools. No Redis + Elasticsearch + Qdrant + custom auth stack.
+- **Tamper evidence.** No other system in this category provides hash-chain integrity out of the box. If an event is modified after the fact, the chain breaks.
+- **Capability-based auth with attenuation.** Give a sub-agent a scoped, time-limited, narrowed token. It cannot escalate. Redis ACLs and NATS NKEYs do not support delegation chains.
+- **MCP native.** Connect Claude Desktop or Cursor in 30 seconds. No adapter layer, no SDK, no glue code.
+- **Zero external dependencies.** No Docker Compose, no managed service, no API keys. `cargo build && ctxd serve`.
+- **Subject-path addressing.** Hierarchical namespace with recursive reads and glob-based capability scoping. Natural fit for how context is organized (by project, team, entity).
+
+## Where ctxd loses
+
+- **Raw throughput.** Redis and NATS are purpose-built for speed. ctxd does more work per operation (hash chains, view updates, capability checks). If you need 100k+ writes/sec, ctxd is not the right choice today.
+- **Vector search at scale.** ChromaDB and Qdrant are purpose-built vector databases with optimized indexes, quantization, and sharding. ctxd's vector view is in-memory HNSW rebuilt on restart -- fine for 10k vectors, not for 10M.
+- **FTS at scale.** SQLite FTS5 is solid for small-to-medium datasets. For millions of documents, Elasticsearch or Typesense will be faster and more featureful (facets, fuzzy matching, etc.).
+- **Distributed systems.** NATS has built-in clustering, geo-replication, and super-cluster federation. ctxd is single-node only until v0.3.
+- **Ecosystem maturity.** Redis has 15+ years of production hardening, client libraries in every language, and a massive community. ctxd is v0.1.
+
+## The honest take
+
+ctxd is not trying to beat Redis at key-value storage or Qdrant at vector search. It occupies a different niche: a single substrate that gives AI agents persistent, tamper-evident, capability-scoped context over MCP.
+
+The right comparison is: **what does it cost to assemble the same feature set from separate tools?** Redis + Elasticsearch + Qdrant + custom auth + MCP adapter layer + hash chain verification. That is the alternative ctxd replaces.
+
+For a single developer or small team running AI agents locally, ctxd's performance is more than sufficient. The bottleneck in AI agent workflows is LLM inference (seconds per call), not context storage (microseconds per read).
+
+## Running your own benchmarks
 
 ### Setup
 
@@ -43,16 +137,8 @@ time for i in $(seq 1 10000); do
     --data "{\"i\":$i}" 2>/dev/null
 done
 
-# For higher throughput, use the wire protocol (avoids process spawn overhead):
-# 1. Start daemon: $CTXD --db $DB serve &
-# 2. Use a client that sends PUB over TCP in a loop
-```
-
-The CLI benchmark above includes process spawn overhead (~10ms per invocation). Real throughput via the wire protocol or in-process is 10-100x faster. To measure actual store throughput without process overhead:
-
-```bash
-# Rust benchmark (add to crates/ctxd-store/benches/)
-cargo bench -p ctxd-store
+# Note: CLI benchmark includes process spawn overhead (~10ms per invocation).
+# Real throughput via wire protocol or in-process is 10-100x faster.
 ```
 
 ### Read latency
@@ -101,122 +187,6 @@ time $CTXD --db $DB grant --subject "/**" --operations "read,write,subjects,sear
 # Verify
 TOKEN=$($CTXD --db $DB grant --subject "/**" --operations "read")
 time $CTXD --db $DB verify --token "$TOKEN" --subject /bench/item-1 --operation read
-```
-
-## Comparing to alternatives
-
-### Comparison matrix
-
-| System | Category | Open source | Self-hosted | MCP native | Event log | Cap auth | Federation |
-|--------|----------|-------------|-------------|------------|-----------|----------|------------|
-| **ctxd** | Context substrate | Yes (Apache-2.0) | Yes | Yes | Yes | Yes (biscuit) | v0.3 |
-| Mem0 | AI memory | Partial | No (cloud) | Partial | No | No | No |
-| Zep | AI memory | Partial | Yes | Partial | Partial | No | No |
-| Supermemory | AI memory | Partial | No | Yes | No | No | No |
-| Letta (MemGPT) | Agent framework | Yes | Yes | No | No | No | No |
-| ChromaDB | Vector DB | Yes | Yes | No | No | No | No |
-| Qdrant | Vector DB | Yes | Yes | No | No | No | No |
-| EventSourcingDB | Event store | No (commercial) | Yes | No | Yes | No (single token) | No |
-| NATS | Message broker | Yes | Yes | No | Yes (JetStream) | Partial | Yes |
-
-### What to benchmark against each
-
-**Mem0** (https://mem0.ai)
-- They have a Python SDK. Install: `pip install mem0ai`
-- Compare: write latency (their `add()` vs ctxd `write`), search latency (their `search()` vs ctxd FTS), memory per fact stored
-- Key difference: Mem0 requires an LLM for every write (extraction). ctxd stores raw events. Mem0 will be slower on writes but may return more structured data on reads.
-- Their hosted tier has network latency. Compare against their self-hosted OSS version if possible.
-
-```python
-# Mem0 benchmark sketch
-from mem0 import Memory
-import time
-
-m = Memory()
-start = time.time()
-for i in range(1000):
-    m.add(f"Fact number {i} about benchmarking", user_id="bench")
-write_time = time.time() - start
-print(f"Mem0: {1000/write_time:.0f} writes/sec")
-
-start = time.time()
-for i in range(100):
-    m.search("benchmarking", user_id="bench")
-search_time = time.time() - start
-print(f"Mem0: {100/search_time:.0f} searches/sec")
-```
-
-**Zep** (https://getzep.com)
-- They have a Python SDK and a self-hosted Docker option.
-- Compare: session memory write/read latency, fact extraction latency, search latency
-- Key difference: Zep is session-oriented (conversations). ctxd is subject-oriented (paths). Different data models.
-
-**ChromaDB / Qdrant** (vector DBs)
-- Only compare vector search performance, since these are not context substrates.
-- Use ctxd's vector view (user-supplied embeddings) vs their native vector insert/query.
-- ctxd will be slower on vector operations (in-memory HNSW rebuilt on each insert). This is by design, ctxd is not a vector DB.
-
-```python
-# ChromaDB benchmark sketch
-import chromadb
-import time
-import numpy as np
-
-client = chromadb.Client()
-collection = client.create_collection("bench")
-
-embeddings = np.random.rand(1000, 384).tolist()
-start = time.time()
-collection.add(
-    ids=[f"id-{i}" for i in range(1000)],
-    embeddings=embeddings,
-    documents=[f"Document {i}" for i in range(1000)]
-)
-print(f"ChromaDB insert 1000: {time.time()-start:.3f}s")
-
-query = np.random.rand(384).tolist()
-start = time.time()
-for _ in range(100):
-    collection.query(query_embeddings=[query], n_results=10)
-print(f"ChromaDB 100 queries: {time.time()-start:.3f}s")
-```
-
-**EventSourcingDB** (https://eventsourcingdb.io)
-- Commercial, free tier up to 25k events. Not open source.
-- Compare: event append latency, subject-based read latency, hash chain verification
-- Key difference: EventSourcingDB is a generic event store. ctxd adds capability auth, MCP, materialized views, and is OSS.
-- Use their HTTP API for benchmarking.
-
-**NATS** (https://nats.io)
-- Compare message throughput (NATS PUB/SUB vs ctxd wire PUB/SUB), persistence (JetStream vs ctxd event log).
-- NATS will win on raw message throughput (it's a message broker, not a context store). ctxd wins on context-specific features: subject-based read, FTS, capabilities, MCP.
-- Use `nats bench` tool for NATS side.
-
-```bash
-# NATS benchmark (install nats CLI first)
-nats bench test --pub 1 --msgs 10000 --size 256
-```
-
-### Benchmark reporting template
-
-When publishing benchmark results, include:
-
-```
-Machine:     [CPU, RAM, disk type]
-OS:          [name, version]
-ctxd:        [version, commit hash]
-Competitor:  [name, version]
-Dataset:     [N events, avg event size, N subjects]
-Methodology: [CLI / wire protocol / in-process / SDK]
-
-Results:
-  ctxd write:      X events/sec
-  ctxd read:       X ms (exact), X ms (recursive, N events)
-  ctxd search:     X ms (FTS, N events)
-  ctxd vector:     X ms (k-NN, N vectors, D dimensions)
-  competitor write: X events/sec
-  competitor read:  X ms
-  competitor search: X ms
 ```
 
 ## Writing a Criterion benchmark
@@ -288,12 +258,34 @@ criterion_main!(benches);
 
 Run: `cargo bench -p ctxd-store`
 
+## Benchmark reporting template
+
+When publishing benchmark results, include:
+
+```
+Machine:     [CPU, RAM, disk type]
+OS:          [name, version]
+ctxd:        [version, commit hash]
+Competitor:  [name, version]
+Dataset:     [N events, avg event size, N subjects]
+Methodology: [CLI / wire protocol / in-process / SDK]
+
+Results:
+  ctxd write:      X events/sec
+  ctxd read:       X ms (exact), X ms (recursive, N events)
+  ctxd search:     X ms (FTS, N events)
+  ctxd vector:     X ms (k-NN, N vectors, D dimensions)
+  competitor write: X events/sec
+  competitor read:  X ms
+  competitor search: X ms
+```
+
 ## What ctxd is NOT competing on
 
 Do not benchmark ctxd against:
-- **LLMs** (ctxd stores context, does not generate it)
-- **Agent frameworks** (LangChain, CrewAI, etc. are orchestration layers)
-- **General databases** (Postgres, Redis, DynamoDB are general-purpose)
-- **Search engines** (Elasticsearch, Typesense are full-featured search)
+- **LLMs** -- ctxd stores context, does not generate it
+- **Agent frameworks** -- LangChain, CrewAI are orchestration layers
+- **General databases** -- Postgres, DynamoDB are general-purpose
+- **Search engines** -- Elasticsearch, Typesense are full-featured search
 
 ctxd competes on the combination: event log + subject addressing + capability auth + MCP native + single binary. No single alternative does all five.

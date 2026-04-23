@@ -43,37 +43,52 @@ The canonical form excludes `predecessorhash` and `signature` to avoid circular 
 Excluded fields: `predecessorhash`, `signature`
 Included fields (sorted): `data`, `datacontenttype`, `id`, `source`, `specversion`, `subject`, `time`, `type`
 
+## Hash chain integrity
+
+Each subject maintains an independent hash chain. Events link to their predecessor via the `predecessorhash` field, creating a tamper-evident log.
+
+```mermaid
+flowchart LR
+    E1["Event 1\nsubject: /work/acme/notes\n\npredecessorhash = null\n(first event)"]
+    E2["Event 2\nsubject: /work/acme/notes\n\npredecessorhash =\nSHA256(canonical(Event 1))"]
+    E3["Event 3\nsubject: /work/acme/notes\n\npredecessorhash =\nSHA256(canonical(Event 2))"]
+
+    E1 -->|"SHA-256 of\ncanonical form"| E2
+    E2 -->|"SHA-256 of\ncanonical form"| E3
+```
+
+**Tamper detection:** If someone modifies Event 1 after the fact, `SHA256(modified Event 1) != SHA256(original Event 1)`, so Event 2's `predecessorhash` no longer matches. The chain is broken, and the tampering is detectable.
+
+**Per-subject scoping:** Events on `/work/acme` and `/personal/journal` have completely independent chains. Appending to one subject does not affect another subject's chain.
+
+**Verification:** For each event with a `predecessorhash`, compute the hash of the previous event's canonical form and compare. If they don't match, the chain is broken at that point.
+
 ## Signatures
 
 Events can be signed with Ed25519. The signature covers the same canonical form used for predecessor hashing. This proves the event was produced by the holder of the signing key and has not been modified.
 
-```
-Signing flow:
-1. Compute canonical form (same as hashing: exclude predecessorhash/signature, sort keys)
-2. Serialize to JSON bytes
-3. Sign with Ed25519 private key
-4. Hex-encode the signature
-5. Store in the `signature` field
+```mermaid
+flowchart TD
+    subgraph "Signing (write time)"
+        S1["Event fields\n(exclude predecessorhash, signature)"]
+        S2["Sort keys alphabetically"]
+        S3["Serialize to JSON bytes"]
+        S4["Sign with Ed25519 private key"]
+        S5["Hex-encode signature"]
+        S6["Store in signature field"]
 
-Verification flow:
-1. Compute canonical form of the event
-2. Serialize to JSON bytes
-3. Verify the hex-decoded signature against the public key
+        S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    end
+
+    subgraph "Verification (read time)"
+        V1["Recompute canonical form"]
+        V2["Serialize to JSON bytes"]
+        V3["Hex-decode the stored signature"]
+        V4["Verify against public key"]
+        V5["Accept or reject"]
+
+        V1 --> V2 --> V3 --> V4 --> V5
+    end
 ```
 
 The signing key is separate from the capability root key. Capabilities authorize operations. Signatures prove provenance. A single event can have both.
-
-## Hash chain integrity
-
-```
-Subject: /work/acme/notes
-
-Event 1: predecessorhash = null (first event in this subject's chain)
-Event 2: predecessorhash = SHA256(canonical(Event 1))
-Event 3: predecessorhash = SHA256(canonical(Event 2))
-
-Verification: for each event with a predecessorhash, compute the hash of
-the previous event and compare. If they don't match, the chain is broken.
-
-Hash chains are per-subject. Events on different subjects have independent chains.
-```
