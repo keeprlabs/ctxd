@@ -7,7 +7,7 @@ echo "=== ctxd quickstart ==="
 echo ""
 
 DB=$(mktemp /tmp/ctxd-quickstart-XXXXXX.db)
-CTXD="cargo run -q -- --db $DB"
+CTXD="cargo run -q --bin ctxd -- --db $DB"
 
 echo "1. Writing three events..."
 
