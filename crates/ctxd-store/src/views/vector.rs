@@ -15,6 +15,19 @@
 use instant_distance::{Builder, HnswMap, Search};
 use std::collections::HashMap;
 
+/// Errors from vector view operations.
+#[derive(Debug, thiserror::Error)]
+pub enum VectorError {
+    /// Embedding dimension does not match the view's configured dimensions.
+    #[error("dimension mismatch: expected {expected}, got {got}")]
+    DimensionMismatch {
+        /// Expected dimensionality.
+        expected: usize,
+        /// Actual dimensionality provided.
+        got: usize,
+    },
+}
+
 /// A point in the embedding space, wrapping a `Vec<f32>`.
 #[derive(Clone, Debug)]
 struct EmbeddingPoint(Vec<f32>);
@@ -63,17 +76,14 @@ impl VectorView {
 
     /// Add a vector embedding associated with an event ID.
     ///
-    /// # Panics
-    ///
-    /// Panics if `embedding.len() != self.dimensions`.
-    pub fn insert(&mut self, event_id: &str, embedding: Vec<f32>) {
-        assert_eq!(
-            embedding.len(),
-            self.dimensions,
-            "embedding dimension mismatch: expected {}, got {}",
-            self.dimensions,
-            embedding.len()
-        );
+    /// Returns an error if `embedding.len() != self.dimensions`.
+    pub fn insert(&mut self, event_id: &str, embedding: Vec<f32>) -> Result<(), VectorError> {
+        if embedding.len() != self.dimensions {
+            return Err(VectorError::DimensionMismatch {
+                expected: self.dimensions,
+                got: embedding.len(),
+            });
+        }
 
         // If this event_id already exists, update in place.
         if let Some(&idx) = self.id_to_index.get(event_id) {
@@ -86,41 +96,38 @@ impl VectorView {
         }
 
         self.rebuild_index();
+        Ok(())
     }
 
     /// Search for the `k` nearest neighbors to the given query vector.
     ///
     /// Returns a list of `(event_id, distance)` pairs sorted by ascending distance.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `query.len() != self.dimensions`.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
-        assert_eq!(
-            query.len(),
-            self.dimensions,
-            "query dimension mismatch: expected {}, got {}",
-            self.dimensions,
-            query.len()
-        );
+    /// Returns an error if `query.len() != self.dimensions`.
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(String, f32)>, VectorError> {
+        if query.len() != self.dimensions {
+            return Err(VectorError::DimensionMismatch {
+                expected: self.dimensions,
+                got: query.len(),
+            });
+        }
 
         let index = match &self.index {
             Some(idx) => idx,
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
         let query_point = EmbeddingPoint(query.to_vec());
         let mut search = Search::default();
         let results = index.search(&query_point, &mut search);
 
-        results
+        Ok(results
             .take(k)
             .map(|item| {
                 let point_idx = *item.value;
                 let event_id = self.event_ids[point_idx].clone();
                 (event_id, item.distance)
             })
-            .collect()
+            .collect())
     }
 
     /// Returns the number of vectors in the index.
@@ -162,22 +169,22 @@ mod tests {
         assert_eq!(view.len(), 0);
         assert!(view.is_empty());
 
-        view.insert("event-1", vec![1.0, 0.0, 0.0]);
+        view.insert("event-1", vec![1.0, 0.0, 0.0]).unwrap();
         assert_eq!(view.len(), 1);
         assert!(!view.is_empty());
     }
 
     #[test]
-    #[should_panic(expected = "dimension mismatch")]
     fn insert_wrong_dimensions() {
         let mut view = VectorView::new(3);
-        view.insert("event-1", vec![1.0, 0.0]); // only 2 dims
+        let err = view.insert("event-1", vec![1.0, 0.0]).unwrap_err();
+        assert!(err.to_string().contains("dimension mismatch"));
     }
 
     #[test]
     fn search_empty_returns_empty() {
         let view = VectorView::new(3);
-        let results = view.search(&[1.0, 0.0, 0.0], 5);
+        let results = view.search(&[1.0, 0.0, 0.0], 5).unwrap();
         assert!(results.is_empty());
     }
 
@@ -189,13 +196,13 @@ mod tests {
         // Vectors are spread along the first axis.
         for i in 0..10 {
             let embedding = vec![i as f32, 0.0, 0.0, 0.0];
-            view.insert(&format!("event-{i}"), embedding);
+            view.insert(&format!("event-{i}"), embedding).unwrap();
         }
         assert_eq!(view.len(), 10);
 
         // Query near event-3 (position [3, 0, 0, 0]).
         let query = vec![3.1, 0.0, 0.0, 0.0];
-        let results = view.search(&query, 3);
+        let results = view.search(&query, 3).unwrap();
 
         assert_eq!(results.len(), 3);
 
@@ -216,11 +223,11 @@ mod tests {
     #[test]
     fn update_existing_event() {
         let mut view = VectorView::new(2);
-        view.insert("event-1", vec![1.0, 0.0]);
-        view.insert("event-1", vec![0.0, 1.0]); // update
+        view.insert("event-1", vec![1.0, 0.0]).unwrap();
+        view.insert("event-1", vec![0.0, 1.0]).unwrap(); // update
         assert_eq!(view.len(), 1); // still one entry
 
-        let results = view.search(&[0.0, 1.0], 1);
+        let results = view.search(&[0.0, 1.0], 1).unwrap();
         assert_eq!(results[0].0, "event-1");
         assert!(results[0].1 < 0.01); // should be very close
     }
@@ -228,11 +235,11 @@ mod tests {
     #[test]
     fn search_returns_correct_distances() {
         let mut view = VectorView::new(2);
-        view.insert("origin", vec![0.0, 0.0]);
-        view.insert("one-one", vec![1.0, 1.0]);
-        view.insert("three-four", vec![3.0, 4.0]);
+        view.insert("origin", vec![0.0, 0.0]).unwrap();
+        view.insert("one-one", vec![1.0, 1.0]).unwrap();
+        view.insert("three-four", vec![3.0, 4.0]).unwrap();
 
-        let results = view.search(&[0.0, 0.0], 3);
+        let results = view.search(&[0.0, 0.0], 3).unwrap();
         assert_eq!(results.len(), 3);
 
         // Distance from origin to (0,0) should be 0

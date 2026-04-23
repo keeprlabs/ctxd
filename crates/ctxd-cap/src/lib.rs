@@ -56,6 +56,17 @@ impl std::fmt::Display for Operation {
     }
 }
 
+/// Validate a string is safe for interpolation into biscuit datalog.
+/// Rejects strings containing characters that could break datalog syntax.
+fn validate_datalog_safe(input: &str, field_name: &str) -> Result<(), CapError> {
+    if input.contains('"') || input.contains(')') || input.contains(';') || input.contains('\n') {
+        return Err(CapError::Denied(format!(
+            "{field_name} contains invalid characters for capability tokens"
+        )));
+    }
+    Ok(())
+}
+
 /// The capability engine. Holds the root key pair for minting tokens.
 pub struct CapEngine {
     root_keypair: KeyPair,
@@ -113,6 +124,13 @@ impl CapEngine {
         kind_allowed: Option<&[&str]>,
         rate_limit_ops_per_sec: Option<u32>,
     ) -> Result<Vec<u8>, CapError> {
+        validate_datalog_safe(subject_glob, "subject_glob")?;
+        if let Some(kinds) = kind_allowed {
+            for kind in kinds {
+                validate_datalog_safe(kind, "kind_allowed")?;
+            }
+        }
+
         // Build using code() which parses a datalog string
         let mut facts = String::new();
         for op in operations {
@@ -165,6 +183,11 @@ impl CapEngine {
         operation: Operation,
         event_type: Option<&str>,
     ) -> Result<(), CapError> {
+        validate_datalog_safe(subject, "subject")?;
+        if let Some(etype) = event_type {
+            validate_datalog_safe(etype, "event_type")?;
+        }
+
         let biscuit = Biscuit::from(token, self.root_keypair.public())?;
         let op_str = operation.to_string();
         let now = Utc::now().timestamp();
@@ -265,6 +288,8 @@ impl CapEngine {
         subject_glob: &str,
         operations: &[Operation],
     ) -> Result<Vec<u8>, CapError> {
+        validate_datalog_safe(subject_glob, "subject_glob")?;
+
         let biscuit = Biscuit::from(token, self.root_keypair.public())?;
 
         let ops_str: Vec<String> = operations.iter().map(|o| format!("\"{o}\"")).collect();
@@ -503,6 +528,38 @@ mod tests {
         assert!(engine
             .verify(&token, "/test/hello", Operation::Write, Some("ctx.file"))
             .is_err());
+    }
+
+    #[test]
+    fn datalog_injection_prevented() {
+        let engine = CapEngine::new();
+
+        // Try to mint with a malicious subject containing datalog injection
+        let malicious_subject = r#"/**", "admin"); allow if true; //"#;
+        let result = engine.mint(malicious_subject, &[Operation::Read], None, None, None);
+        assert!(result.is_err(), "should reject malicious subject_glob");
+
+        // Try injection via kind_allowed
+        let malicious_kind = r#"ctx.note"); allow if true; //"#;
+        let result = engine.mint(
+            "/**",
+            &[Operation::Read],
+            None,
+            Some(&[malicious_kind]),
+            None,
+        );
+        assert!(result.is_err(), "should reject malicious kind_allowed");
+
+        // Try injection via verify subject
+        let token = engine
+            .mint("/**", &[Operation::Read], None, None, None)
+            .unwrap();
+        let result = engine.verify(&token, malicious_subject, Operation::Read, None);
+        assert!(result.is_err(), "should reject malicious subject in verify");
+
+        // Try injection via event_type
+        let result = engine.verify(&token, "/test", Operation::Read, Some(malicious_kind));
+        assert!(result.is_err(), "should reject malicious event_type");
     }
 
     #[test]

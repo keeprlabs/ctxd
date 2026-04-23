@@ -306,7 +306,7 @@ async fn handle_query(
             let events = store.read(&subject, true).await?;
             let data: Vec<serde_json::Value> = events
                 .iter()
-                .map(|e| serde_json::to_value(e).unwrap())
+                .filter_map(|e| serde_json::to_value(e).ok())
                 .collect();
             Ok(Response::Ok {
                 data: serde_json::Value::Array(data),
@@ -319,10 +319,10 @@ async fn handle_query(
             })
         }
         "fts" => {
-            let events = store.search(subject_pattern).await?;
+            let events = store.search(subject_pattern, None).await?;
             let data: Vec<serde_json::Value> = events
                 .iter()
-                .map(|e| serde_json::to_value(e).unwrap())
+                .filter_map(|e| serde_json::to_value(e).ok())
                 .collect();
             Ok(Response::Ok {
                 data: serde_json::Value::Array(data),
@@ -370,25 +370,9 @@ fn handle_grant(
     })
 }
 
-/// Check if a subject matches a pattern (supports `**` and `*` globs).
+/// Check if a subject matches a pattern (delegates to ctxd_core).
 fn subject_matches_pattern(subject: &str, pattern: &str) -> bool {
-    if pattern == "/**" {
-        return true;
-    }
-    if pattern == subject {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return subject == prefix || subject.starts_with(&format!("{prefix}/"));
-    }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        if !subject.starts_with(&format!("{prefix}/")) {
-            return false;
-        }
-        let rest = &subject[prefix.len() + 1..];
-        return !rest.contains('/');
-    }
-    false
+    ctxd_core::subject::Subject::matches_cap_pattern(subject, pattern)
 }
 
 /// TCP client for connecting to a running ctxd daemon via the wire protocol.

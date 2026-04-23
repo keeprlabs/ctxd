@@ -94,6 +94,30 @@ impl Subject {
         glob_match::glob_match(pattern, &self.0)
     }
 
+    /// Check if a subject path matches a capability-style pattern.
+    ///
+    /// Supports `/**` (any depth) and `/*` (single segment) suffixes.
+    /// Used by the capability engine and wire protocol for subject scoping.
+    pub fn matches_cap_pattern(subject: &str, pattern: &str) -> bool {
+        if pattern == "/**" {
+            return true;
+        }
+        if pattern == subject {
+            return true;
+        }
+        if let Some(prefix) = pattern.strip_suffix("/**") {
+            return subject == prefix || subject.starts_with(&format!("{prefix}/"));
+        }
+        if let Some(prefix) = pattern.strip_suffix("/*") {
+            if !subject.starts_with(&format!("{prefix}/")) {
+                return false;
+            }
+            let rest = &subject[prefix.len() + 1..];
+            return !rest.contains('/');
+        }
+        false
+    }
+
     /// Returns true if `self` exactly equals `other`, or (when `recursive` is true)
     /// if `other` is a descendant of `self`.
     pub fn matches(&self, other: &Subject, recursive: bool) -> bool {
