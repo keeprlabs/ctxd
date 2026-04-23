@@ -32,6 +32,7 @@ impl RateLimiter {
     /// rate limit (operations per second).
     ///
     /// Returns `true` if the request is allowed, `false` if rate-limited.
+    #[allow(dead_code)]
     pub fn check(&mut self, token_id: &str, max_ops_per_sec: u32) -> bool {
         let now = Instant::now();
 
