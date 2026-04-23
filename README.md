@@ -4,12 +4,20 @@ Context substrate for AI agents. Single binary, append-only event log, subject-b
 
 Not a vector DB. Not an agent framework. Not a knowledge graph. A substrate.
 
-```
-Agent ----MCP----> ctxd ----SQLite----> event log
-                    |                      |
-                    |--- KV view ----------|  (latest value per subject)
-                    |--- FTS view ---------|  (full-text search via FTS5)
-                    |--- Vector view ------|  (HNSW nearest-neighbor)
+```mermaid
+flowchart LR
+    Agent["AI Agent\n(Claude, Cursor, custom)"]
+    MCP["MCP\n(stdio)"]
+    CTXD["ctxd daemon"]
+    LOG["Event Log\n(SQLite)"]
+    KV["KV View"]
+    FTS["FTS View"]
+    VEC["Vector View"]
+
+    Agent -->|"ctx_write\nctx_read\nctx_search"| MCP --> CTXD --> LOG
+    LOG --- KV
+    LOG --- FTS
+    LOG --- VEC
 ```
 
 ## Install and run
@@ -78,7 +86,7 @@ The event log is append-only. Every write is tamper-evident via predecessor hash
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full picture with diagrams.
+See [docs/architecture.md](docs/architecture.md) for the full picture with diagrams.
 
 Quick version:
 
@@ -150,14 +158,14 @@ Global flag: `--db <path>` (default: `ctxd.db`)
 
 | Document | What it covers |
 |----------|---------------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, data flow, crate map, diagrams |
+| [architecture.md](docs/architecture.md) | System design, data flow, crate map, diagrams |
 | [events.md](docs/events.md) | CloudEvents schema, canonical form, hash chain |
 | [subjects.md](docs/subjects.md) | Path syntax, recursive reads, glob patterns |
 | [capabilities.md](docs/capabilities.md) | Biscuit tokens, caveats, verification model |
 | [capability-tutorial.md](docs/capability-tutorial.md) | Hands-on walkthrough with CLI commands |
 | [mcp.md](docs/mcp.md) | MCP tool reference with parameter tables |
 | [adapter-guide.md](docs/adapter-guide.md) | How to write ingestion adapters |
-| [benchmarking.md](docs/benchmarking.md) | How to benchmark ctxd against alternatives |
+| [benchmarking.md](docs/benchmarking.md) | Performance numbers and comparisons vs Redis, NATS, Mem0, ChromaDB |
 | [decisions/](docs/decisions/) | Architecture Decision Records |
 
 ## Development
