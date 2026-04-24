@@ -527,6 +527,248 @@ impl PeerManager {
             .map_err(|e| FederationError::io(e.to_string()))
     }
 
+    /// Catch up a single peer from its receive-cursor: ask the peer
+    /// for its inbound cursor (i.e., what it last got from us), then
+    /// replay any local events with `time > cursor.last_event_time`
+    /// that match the peer's grants.
+    ///
+    /// This is the resume path for `peer_cursor_get`. It's safe to
+    /// call repeatedly — duplicate events are idempotent on the
+    /// receiver via the UNIQUE constraint on `events.id`.
+    #[tracing::instrument(skip(self), fields(peer = %peer.peer_id))]
+    pub async fn catch_up_peer(&self, peer: &EnrolledPeer) -> Result<usize, FederationError> {
+        // Get peer's URL from store.
+        let peers = self
+            .store
+            .peer_list_impl()
+            .await
+            .map_err(|e| FederationError::io(e.to_string()))?;
+        let row = peers
+            .into_iter()
+            .find(|p| p.peer_id == peer.peer_id)
+            .ok_or_else(|| FederationError::io(format!("peer {} not in store", peer.peer_id)))?;
+        if row.url.starts_with("inbound:") {
+            return Ok(0);
+        }
+
+        // Pick the union pattern (use first grant for now). Multi-glob
+        // peers replay each glob's catch-up under a separate cursor.
+        let mut sent = 0usize;
+        for pattern in &peer.remote_grants_us {
+            let mut client = ProtocolClient::connect(&row.url)
+                .await
+                .map_err(FederationError::io)?;
+
+            // Ask the peer what its receive-cursor is — this is the
+            // last event the peer has from us for this pattern.
+            let resp = client
+                .request(&Request::PeerCursorRequest {
+                    peer_id: self.local_peer_id.clone(),
+                    subject_pattern: pattern.clone(),
+                })
+                .await
+                .map_err(FederationError::io)?;
+
+            let last_event_time: Option<chrono::DateTime<chrono::Utc>> = match resp {
+                Response::Ok { data } => data
+                    .get("last_event_time")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc)),
+                Response::Error { message } => {
+                    tracing::warn!(error = %message, "cursor request errored, replaying full pattern");
+                    None
+                }
+                _ => None,
+            };
+
+            // Read local events for this pattern since the cursor.
+            let prefix = pattern
+                .trim_end_matches("/**")
+                .trim_end_matches("/*")
+                .to_string();
+            let prefix_subject = if prefix.is_empty() {
+                ctxd_core::subject::Subject::new("/")
+                    .map_err(|e| FederationError::io(e.to_string()))?
+            } else {
+                ctxd_core::subject::Subject::new(&prefix)
+                    .map_err(|e| FederationError::io(e.to_string()))?
+            };
+            let recursive = pattern.ends_with("/**") || prefix.is_empty();
+            let events = match last_event_time {
+                Some(t) => self
+                    .store
+                    .read_since(&prefix_subject, t, recursive)
+                    .await
+                    .map_err(|e| FederationError::io(e.to_string()))?,
+                None => self
+                    .store
+                    .read(&prefix_subject, recursive)
+                    .await
+                    .map_err(|e| FederationError::io(e.to_string()))?,
+            };
+
+            // Stream them to the peer in (time, id) order. read_since
+            // already returns by seq which is ~chronological; sort
+            // explicitly for deterministic replay across backends.
+            let mut sorted = events;
+            sorted.sort_by(|a, b| {
+                a.time
+                    .cmp(&b.time)
+                    .then(a.id.to_string().cmp(&b.id.to_string()))
+            });
+
+            for ev in sorted {
+                if !ctxd_core::subject::Subject::matches_cap_pattern(ev.subject.as_str(), pattern) {
+                    continue;
+                }
+                let event_json =
+                    serde_json::to_value(&ev).map_err(|e| FederationError::io(e.to_string()))?;
+                let resp = client
+                    .request(&Request::PeerReplicate {
+                        origin_peer_id: self.local_peer_id.clone(),
+                        event: event_json,
+                    })
+                    .await
+                    .map_err(FederationError::io)?;
+                match resp {
+                    Response::Ok { .. } => sent += 1,
+                    Response::Error { message } => {
+                        tracing::warn!(error = %message, event_id = %ev.id, "peer rejected event during catch-up");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        tracing::info!(sent, peer = %peer.peer_id, "catch-up complete");
+        Ok(sent)
+    }
+
+    /// Run [`Self::catch_up_peer`] for every enrolled peer once. Used
+    /// at daemon startup to flush any accumulated backlog.
+    pub async fn catch_up_all(&self) -> Vec<(String, Result<usize, FederationError>)> {
+        let peers = self.peers.read().await.clone();
+        let mut results = Vec::new();
+        for (pid, peer) in peers {
+            let r = self.catch_up_peer(&peer).await;
+            results.push((pid, r));
+        }
+        results
+    }
+
+    /// Backfill a missing parent: ask the origin peer for the parent
+    /// event by id, append it locally, recursing for its own missing
+    /// parents until the chain closes. Acceptably-bounded by the
+    /// in-memory `seen` set; cycles in a healthy DAG should not exist
+    /// (UUIDv7 monotonicity), but we guard anyway.
+    #[tracing::instrument(skip(self), fields(peer_id = %peer_id))]
+    pub async fn backfill_parents(
+        &self,
+        peer_id: &str,
+        parent_ids: &[Uuid],
+    ) -> Result<(), FederationError> {
+        if parent_ids.is_empty() {
+            return Ok(());
+        }
+        let peers = self
+            .store
+            .peer_list_impl()
+            .await
+            .map_err(|e| FederationError::io(e.to_string()))?;
+        let row = peers
+            .into_iter()
+            .find(|p| p.peer_id == peer_id)
+            .ok_or_else(|| FederationError::io(format!("peer {peer_id} not in store")))?;
+        if row.url.starts_with("inbound:") {
+            return Err(FederationError::Io(
+                "cannot backfill from inbound-only peer".to_string(),
+            ));
+        }
+
+        // Compute which parent ids are missing from our store.
+        let root = Subject::new("/").map_err(|e| FederationError::io(e.to_string()))?;
+        let local = self
+            .store
+            .read(&root, true)
+            .await
+            .map_err(|e| FederationError::io(e.to_string()))?;
+        let local_ids: HashSet<Uuid> = local.iter().map(|e| e.id).collect();
+        let missing: Vec<String> = parent_ids
+            .iter()
+            .filter(|id| !local_ids.contains(*id))
+            .map(|id| id.to_string())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let mut client = ProtocolClient::connect(&row.url)
+            .await
+            .map_err(FederationError::io)?;
+        let resp = client
+            .request(&Request::PeerFetchEvents { event_ids: missing })
+            .await
+            .map_err(FederationError::io)?;
+        let events_array = match resp {
+            Response::Ok { data } => data
+                .as_array()
+                .cloned()
+                .ok_or_else(|| FederationError::Io("fetch response not an array".to_string()))?,
+            Response::Error { message } => return Err(FederationError::io(message)),
+            other => {
+                return Err(FederationError::io(format!(
+                    "unexpected fetch response: {other:?}"
+                )))
+            }
+        };
+
+        // Topological sort by parent depth: append events whose parents
+        // are already satisfied, repeat until none remain.
+        let mut pending: Vec<Event> = events_array
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<Event>(v).ok())
+            .collect();
+        let mut applied: HashSet<Uuid> = local_ids;
+        while !pending.is_empty() {
+            let before_len = pending.len();
+            let mut still_pending = Vec::with_capacity(pending.len());
+            for ev in pending.drain(..) {
+                if ev.parents.iter().all(|p| applied.contains(p)) {
+                    let event_id = ev.id;
+                    // Verify before appending — backfill events still
+                    // have to satisfy signature + cap-scope.
+                    self.verify_inbound(peer_id, &ev).await?;
+                    match self.store.append(ev).await {
+                        Ok(_) => {
+                            applied.insert(event_id);
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if !msg.contains("UNIQUE") && !msg.contains("constraint") {
+                                return Err(FederationError::io(msg));
+                            }
+                            applied.insert(event_id);
+                        }
+                    }
+                } else {
+                    still_pending.push(ev);
+                }
+            }
+            if still_pending.len() == before_len {
+                // Made no progress — there's still a missing parent.
+                // Don't infinite loop; surface it as an error.
+                return Err(FederationError::io(format!(
+                    "backfill stalled with {} events still pending; remote may be missing ancestors",
+                    still_pending.len()
+                )));
+            }
+            pending = still_pending;
+        }
+
+        Ok(())
+    }
+
     /// Begin replication tasks for every enrolled peer. Each peer gets a
     /// dedicated outbound task. Inbound is multiplexed through the
     /// existing wire protocol's connection handler.
@@ -644,8 +886,9 @@ impl PeerManager {
     }
 
     /// Server-side: handle an inbound `PeerReplicate`. Verifies signature
-    /// + cap scope, appends idempotently to the local store, advances
-    /// the cursor, and returns a `PeerAck`.
+    /// + cap scope, optionally backfills missing parents, appends
+    /// idempotently to the local store, advances the cursor, and returns
+    /// a `PeerAck`.
     #[tracing::instrument(skip(self, event_value))]
     pub async fn handle_peer_replicate(
         &self,
@@ -657,6 +900,18 @@ impl PeerManager {
 
         // Signature + cap scope verification.
         self.verify_inbound(origin_peer_id, &event).await?;
+
+        // Parent backfill: if the event references parent ids we don't
+        // have, fetch them from origin first. Ignored for empty
+        // parents (the common case for non-merge events).
+        if !event.parents.is_empty() {
+            if let Err(e) = self.backfill_parents(origin_peer_id, &event.parents).await {
+                tracing::warn!(error = %e, "parent backfill failed; proceeding with append");
+                // Proceed anyway — the event itself may still be useful
+                // even with missing ancestry. The hash-chain check
+                // doesn't apply to `parents` (only `predecessorhash`).
+            }
+        }
 
         // Idempotent append: if the event id is already present, our
         // append errors but we treat that as success and short-circuit
