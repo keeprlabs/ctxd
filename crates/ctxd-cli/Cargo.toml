@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "ctxd_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ctxd"
 path = "src/main.rs"
@@ -12,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 ctxd-core = { path = "../ctxd-core" }
 ctxd-store = { path = "../ctxd-store" }
+ctxd-store-core = { path = "../ctxd-store-core" }
 ctxd-cap = { path = "../ctxd-cap" }
 ctxd-mcp = { path = "../ctxd-mcp" }
 ctxd-http = { path = "../ctxd-http" }
@@ -19,6 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
@@ -32,3 +38,6 @@ opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.29"
+
+[dev-dependencies]
+tempfile = { workspace = true }
