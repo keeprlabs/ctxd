@@ -1,46 +1,16 @@
 //! Gmail adapter for ctxd.
 //!
-//! When fully implemented, this adapter will:
-//! - Connect to the Gmail API using OAuth2 credentials
-//! - Poll for new emails (or use push notifications via Google Pub/Sub)
-//! - Publish events under `/work/email/gmail/{label}/{message_id}`
-//! - Event types: `email.received`, `email.sent`, `email.archived`
-//! - Event data includes: sender, recipients, subject, body (text), date, labels, thread ID
-//! - Support incremental sync using Gmail history IDs
-//! - Respect rate limits and handle token refresh
+//! Implements OAuth2 device-code authorization and AES-256-GCM at-rest
+//! token encryption. Gmail API sync, the [`Adapter`] trait
+//! implementation, and the `ctxd-adapter-gmail` binary land in
+//! follow-up commits.
+//!
+//! # Modules
+//! - [`oauth`] — OAuth2 device-code flow + token refresh.
+//! - [`crypto`] — AES-256-GCM token encryption at rest.
 
-use ctxd_adapter_core::{Adapter, AdapterError, EventSink};
+pub mod crypto;
+pub mod oauth;
 
-/// Gmail adapter that ingests emails via the Gmail API.
-#[allow(dead_code)]
-pub struct GmailAdapter {
-    /// The Gmail user ID (typically "me" for the authenticated user).
-    user_id: String,
-}
-
-impl GmailAdapter {
-    /// Create a new Gmail adapter.
-    ///
-    /// # Arguments
-    /// * `user_id` - The Gmail user ID (typically "me")
-    pub fn new(user_id: String) -> Self {
-        Self { user_id }
-    }
-}
-
-#[async_trait::async_trait]
-impl Adapter for GmailAdapter {
-    fn name(&self) -> &str {
-        "gmail"
-    }
-
-    fn subject_prefix(&self) -> &str {
-        "/work/email/gmail"
-    }
-
-    async fn run(&self, _sink: Box<dyn EventSink>) -> Result<(), AdapterError> {
-        Err(AdapterError::Internal(
-            "Gmail adapter not yet implemented. See docs/adapter-guide.md".to_string(),
-        ))
-    }
-}
+/// OAuth2 scope required for the adapter (read-only Gmail).
+pub const GMAIL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
