@@ -147,11 +147,24 @@ pub enum Response {
     EndOfStream,
 }
 
-/// Broadcast event for SUB fan-out.
+/// Broadcast event for SUB fan-out and federation replay.
+///
+/// `origin_peer_id` carries the peer-id of the daemon that *originally*
+/// published the event (locally produced events use the local
+/// daemon's peer_id; replicated-in events carry the origin from the
+/// `PeerReplicate` envelope). Federation's outbound replicator uses
+/// this for the loop-guard rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastEvent {
+    /// Subject of the event.
     pub subject: String,
+    /// JSON-serialized event payload.
     pub event: serde_json::Value,
+    /// Origin peer id. Defaults to empty string for local PUB; the
+    /// federation receiver overrides this with the inbound
+    /// `PeerReplicate.origin_peer_id` before re-broadcasting.
+    #[serde(default)]
+    pub origin_peer_id: String,
 }
 
 /// The wire protocol TCP server.
@@ -469,10 +482,14 @@ async fn handle_pub(
     let stored = store.append(event).await?;
     let event_json = serde_json::to_value(&stored)?;
 
-    // Broadcast to subscribers (ignore errors if no receivers).
+    // Broadcast to subscribers (ignore errors if no receivers). Origin
+    // is empty here — `handle_pub` is the local-PUB path; federation
+    // receivers tag inbound events with their actual origin via the
+    // `PeerReplicate` envelope before re-broadcasting.
     let _ = event_tx.send(BroadcastEvent {
         subject: subject.to_string(),
         event: event_json.clone(),
+        origin_peer_id: String::new(),
     });
 
     Ok(Response::Ok { data: event_json })

@@ -378,10 +378,25 @@ impl PeerManager {
             .map_err(|e| FederationError::io(format!("local signing key invalid: {e}")))?;
         let local_pk = signer.public_key_bytes();
 
-        // Persist remote in our Store.
+        // Persist remote in our Store. If a row already exists with a
+        // real (non-inbound) URL, preserve that URL — `handle_peer_hello`
+        // is called on the receiver side and we don't want to clobber a
+        // dial-able URL set by a prior outbound handshake.
+        let existing_url = self
+            .store
+            .peer_list_impl()
+            .await
+            .map_err(|e| FederationError::io(e.to_string()))?
+            .into_iter()
+            .find(|p| p.peer_id == remote_peer_id)
+            .map(|p| p.url);
+        let preserved_url = match existing_url {
+            Some(u) if !u.starts_with("inbound:") => u,
+            _ => format!("inbound:{}", pk_hex),
+        };
         let peer_row = ctxd_store_core::Peer {
             peer_id: remote_peer_id.to_string(),
-            url: format!("inbound:{}", pk_hex),
+            url: preserved_url,
             public_key: remote_pubkey.to_vec(),
             granted_subjects: remote_subjects.to_vec(),
             trust_level: serde_json::json!({"auto_accept": true}),
@@ -524,23 +539,28 @@ impl PeerManager {
             loop {
                 match rx.recv().await {
                     Ok(broadcast_event) => {
+                        // Origin: empty means "produced locally via PUB";
+                        // non-empty means "replicated in from peer X" —
+                        // we preserve X for the loop-guard check.
+                        let origin = if broadcast_event.origin_peer_id.is_empty() {
+                            mgr.local_peer_id.clone()
+                        } else {
+                            broadcast_event.origin_peer_id.clone()
+                        };
                         let peers = mgr.peers.read().await.clone();
                         for (_pid, peer) in peers {
-                            // Origin defaults to local for events
-                            // produced via PUB; replicated events
-                            // recompose origin as part of inbound.
-                            if !mgr.should_forward(
-                                &peer,
-                                &broadcast_event.subject,
-                                &mgr.local_peer_id,
-                            ) {
+                            if !mgr.should_forward(&peer, &broadcast_event.subject, &origin) {
                                 continue;
                             }
                             let event_value = broadcast_event.event.clone();
+                            let origin = origin.clone();
                             let mgr = Arc::clone(&mgr);
                             let peer = Arc::clone(&peer);
                             tokio::spawn(async move {
-                                if let Err(e) = mgr.send_replicate(&peer, event_value).await {
+                                if let Err(e) = mgr
+                                    .send_replicate_with_origin(&peer, event_value, &origin)
+                                    .await
+                                {
                                     tracing::warn!(
                                         peer = %peer.peer_id,
                                         error = %e,
@@ -562,14 +582,29 @@ impl PeerManager {
         })
     }
 
-    /// Send a single `PeerReplicate` to `peer`. Looks up the peer's URL
-    /// from the Store on demand. Used by [`Self::start_replication_tasks`]
-    /// and by tests that drive replication directly.
-    #[tracing::instrument(skip(self, event_json), fields(peer = %peer.peer_id))]
+    /// Send a single `PeerReplicate` to `peer`, using the local peer
+    /// id as the origin. Convenience wrapper for tests.
     pub async fn send_replicate(
         &self,
         peer: &EnrolledPeer,
         event_json: serde_json::Value,
+    ) -> Result<(), FederationError> {
+        let origin = self.local_peer_id.clone();
+        self.send_replicate_with_origin(peer, event_json, &origin)
+            .await
+    }
+
+    /// Send a `PeerReplicate` to `peer` carrying an explicit origin id.
+    ///
+    /// Used by the broadcast subscriber so events that arrived via
+    /// inbound replication get re-fanned-out with the *original*
+    /// origin tag preserved — that's what the loop-guard relies on.
+    #[tracing::instrument(skip(self, event_json), fields(peer = %peer.peer_id, origin = %origin))]
+    pub async fn send_replicate_with_origin(
+        &self,
+        peer: &EnrolledPeer,
+        event_json: serde_json::Value,
+        origin: &str,
     ) -> Result<(), FederationError> {
         // Look up the URL from the Store. We don't cache it on
         // EnrolledPeer because the operator might `peer remove` then
@@ -595,7 +630,7 @@ impl PeerManager {
             .await
             .map_err(FederationError::io)?;
         let req = Request::PeerReplicate {
-            origin_peer_id: self.local_peer_id.clone(),
+            origin_peer_id: origin.to_string(),
             event: event_json,
         };
         let resp = client.request(&req).await.map_err(FederationError::io)?;
@@ -624,25 +659,42 @@ impl PeerManager {
         self.verify_inbound(origin_peer_id, &event).await?;
 
         // Idempotent append: if the event id is already present, our
-        // append errors but we treat that as success.
+        // append errors but we treat that as success and short-circuit
+        // the broadcast — re-broadcasting a duplicate would burn cycles
+        // and could amplify churn under reconnect storms.
         let event_id = event.id;
         let event_time = event.time;
         let subject_pattern = event.subject.as_str().to_string();
+        let event_for_broadcast = event.clone();
+        let mut newly_stored = true;
         match self.store.append(event).await {
             Ok(_) => {}
             Err(e) => {
-                // A UNIQUE-constraint violation on `events.id` means we
-                // already have this event — that's idempotent success.
                 let msg = e.to_string();
                 if !msg.contains("UNIQUE") && !msg.contains("constraint") {
                     return Err(FederationError::io(msg));
                 }
+                newly_stored = false;
             }
         }
 
         // Advance the inbound cursor after a successful append.
         self.advance_inbound_cursor(origin_peer_id, &subject_pattern, event_id, event_time)
             .await?;
+
+        // Re-fan-out via the local broadcast channel so other
+        // federation peers (and SUBs) can receive it. Stamp the
+        // BroadcastEvent with the *origin* peer-id so the loop guard
+        // can drop it cleanly when it would loop back.
+        if newly_stored {
+            let event_json = serde_json::to_value(&event_for_broadcast)
+                .map_err(|e| FederationError::io(e.to_string()))?;
+            let _ = self.event_tx.send(BroadcastEvent {
+                subject: event_for_broadcast.subject.as_str().to_string(),
+                event: event_json,
+                origin_peer_id: origin_peer_id.to_string(),
+            });
+        }
 
         Ok(serde_json::json!({
             "ack": event_id.to_string(),

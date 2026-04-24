@@ -44,21 +44,25 @@ pub struct Daemon {
 
 impl Daemon {
     /// Build an in-memory daemon with the given auto-accept policy.
+    #[allow(dead_code)]
     pub async fn start_memory(policy: AutoAcceptPolicy) -> Self {
         Self::start(policy, None).await
     }
 
     /// Build a daemon. When `db_path` is None, uses an in-memory store.
+    #[allow(dead_code)]
     pub async fn start(policy: AutoAcceptPolicy, db_path: Option<std::path::PathBuf>) -> Self {
-        let (store, tempdir) = match db_path {
+        let (mut store, tempdir) = match db_path {
             Some(p) => (EventStore::open(&p).await.expect("open"), None),
             None => (EventStore::open_memory().await.expect("memory"), None),
         };
-        let store = Arc::new(store);
-        let cap_engine = Arc::new(CapEngine::new());
 
         // Local signing key: persist into the store so a restart can
-        // recover the same identity.
+        // recover the same identity. Generate first so we can also
+        // wire the same key into store.set_signing_key() — this way
+        // every PUB'd event is auto-signed under the daemon's
+        // federation identity, which is what inbound replicators
+        // expect when they verify against `peer.remote_pubkey`.
         let signing_bytes = match store.get_metadata("signing_key").await.expect("meta") {
             Some(b) => b,
             None => {
@@ -74,6 +78,10 @@ impl Daemon {
                 s.secret_key_bytes()
             }
         };
+        store.set_signing_key(signing_bytes.clone());
+        let store = Arc::new(store);
+        let cap_engine = Arc::new(CapEngine::new());
+
         let signer = EventSigner::from_bytes(&signing_bytes).expect("signer");
         let peer_id = hex::encode(signer.public_key_bytes());
 
@@ -124,10 +132,51 @@ impl Daemon {
 
     /// Convenience: dial the other daemon and complete the handshake,
     /// granting `subjects` to it.
+    #[allow(dead_code)]
     pub async fn dial_and_handshake(&self, other: &Daemon, subjects: &[String]) -> EnrolledPeer {
         self.fed
             .handshake_outbound(&other.peer_id, &other.addr.to_string(), subjects)
             .await
             .expect("handshake")
+    }
+
+    /// Publish via the wire protocol so the broadcast fanout fires.
+    /// Returns the stored event.
+    #[allow(dead_code)]
+    pub async fn pub_event(
+        &self,
+        subject: &str,
+        event_type: &str,
+        data: serde_json::Value,
+    ) -> ctxd_core::event::Event {
+        use ctxd_cli::protocol::{ProtocolClient, Response};
+        let mut client = ProtocolClient::connect(&self.addr.to_string())
+            .await
+            .expect("connect");
+        let resp = client
+            .publish(subject, event_type, data)
+            .await
+            .expect("publish");
+        match resp {
+            Response::Ok { data } => serde_json::from_value(data).expect("event"),
+            other => panic!("unexpected pub response: {other:?}"),
+        }
+    }
+
+    /// Wait until the local store contains an event with `event_id`.
+    /// Polls every 25ms up to `timeout`.
+    #[allow(dead_code)]
+    pub async fn wait_for_event(&self, event_id: uuid::Uuid, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let root = ctxd_core::subject::Subject::new("/").expect("subject");
+            if let Ok(events) = self.store.read(&root, true).await {
+                if events.iter().any(|e| e.id == event_id) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
     }
 }
