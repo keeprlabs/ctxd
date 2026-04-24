@@ -410,6 +410,18 @@ impl CaveatState for InMemoryCaveatState {
         let start = std::time::Instant::now();
         let notifier = self.notifier_for(approval_id)?;
         loop {
+            // CRITICAL: construct the `Notified` future BEFORE
+            // re-checking status. `Notify::notify_waiters` only signals
+            // tasks that are *already* parked on a `Notified`. If we
+            // checked status first and *then* awaited, a decide that
+            // landed in between would be lost and we'd wait until
+            // timeout. By constructing the future first, we subscribe
+            // before the next status read; any decide that lands
+            // either flips status (we exit on the next read) or wakes
+            // the future we already hold.
+            let notified = notifier.notified();
+            tokio::pin!(notified);
+
             let st = self.approval_status(approval_id).await?;
             if st != ApprovalDecision::Pending {
                 return Ok(st);
@@ -419,12 +431,8 @@ impl CaveatState for InMemoryCaveatState {
                 return Ok(ApprovalDecision::Pending);
             }
             let remaining = timeout - elapsed;
-            // Park on the notifier OR the remaining timeout, whichever
-            // fires first. After wake we re-check status — Notify only
-            // signals pre-existing waiters, so a status fetch is the
-            // canonical source of truth.
             tokio::select! {
-                _ = notifier.notified() => {}
+                _ = notified.as_mut() => {}
                 _ = tokio::time::sleep(remaining) => {
                     return self.approval_status(approval_id).await;
                 }
