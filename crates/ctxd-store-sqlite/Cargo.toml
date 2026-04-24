@@ -9,6 +9,7 @@ license.workspace = true
 ctxd-core = { path = "../ctxd-core" }
 ctxd-store-core = { path = "../ctxd-store-core" }
 ctxd-cap = { path = "../ctxd-cap" }
+ctxd-embed = { path = "../ctxd-embed" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -18,7 +19,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 async-trait = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-instant-distance = "0.6"
+hnsw_rs = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -28,7 +29,12 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 ctxd-store-core = { path = "../ctxd-store-core", features = ["testsuite"] }
 sha2 = { workspace = true }
 hex = "0.4"
+rand = "0.8"
 
 [[bench]]
 name = "store_bench"
+harness = false
+
+[[bench]]
+name = "vector_bench"
 harness = false

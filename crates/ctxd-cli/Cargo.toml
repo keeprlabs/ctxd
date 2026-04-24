@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "ctxd"
 path = "src/main.rs"
 
+[features]
+# By default the CLI ships both real embedder providers compiled in.
+# Operators can disable either at build time to drop the reqwest
+# transitive dependency, e.g. for size-constrained images.
+default = ["openai", "ollama"]
+openai = ["ctxd-embed/openai"]
+ollama = ["ctxd-embed/ollama"]
+
 [dependencies]
 ctxd-core = { path = "../ctxd-core" }
 ctxd-store = { path = "../ctxd-store" }
@@ -20,6 +28,7 @@ ctxd-store-core = { path = "../ctxd-store-core" }
 ctxd-cap = { path = "../ctxd-cap" }
 ctxd-mcp = { path = "../ctxd-mcp" }
 ctxd-http = { path = "../ctxd-http" }
+ctxd-embed = { path = "../ctxd-embed" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

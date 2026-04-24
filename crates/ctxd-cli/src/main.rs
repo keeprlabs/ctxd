@@ -49,6 +49,27 @@ enum Commands {
         /// Run MCP server on stdio (for Claude Desktop / mcp-inspector).
         #[arg(long, default_value_t = true)]
         mcp_stdio: bool,
+
+        /// Embedder backend: `null` (default — zero vectors),
+        /// `openai`, or `ollama`. Real backends require the
+        /// matching feature flag at compile time.
+        #[arg(long = "embedder", default_value = "null")]
+        embedder: String,
+
+        /// Override the embedder model. Provider-specific defaults
+        /// apply when unset (`text-embedding-3-small` for OpenAI,
+        /// `nomic-embed-text` for Ollama).
+        #[arg(long = "embedder-model")]
+        embedder_model: Option<String>,
+
+        /// Override the embedder base URL.
+        #[arg(long = "embedder-url")]
+        embedder_url: Option<String>,
+
+        /// API key for the embedder (OpenAI only). Falls back to
+        /// `OPENAI_API_KEY` env if unset. Never logged.
+        #[arg(long = "embedder-api-key")]
+        embedder_api_key: Option<String>,
     },
 
     /// Append an event to the store.
@@ -283,7 +304,7 @@ async fn main() -> Result<()> {
     let _otel_guard = init_tracing();
 
     let cli = Cli::parse();
-    let store = EventStore::open(&cli.db)
+    let mut store = EventStore::open(&cli.db)
         .await
         .context("failed to open event store")?;
     // Load or create the root capability key, persisted in the database
@@ -306,10 +327,36 @@ async fn main() -> Result<()> {
             bind,
             wire_bind,
             mcp_stdio,
+            embedder,
+            embedder_model,
+            embedder_url,
+            embedder_api_key,
         } => {
             let addr: SocketAddr = bind.parse().context("invalid bind address")?;
             let wire_addr: SocketAddr = wire_bind.parse().context("invalid wire bind address")?;
             tracing::info!("starting ctxd daemon on {addr}");
+
+            // Construct the embedder up front so we fail loudly on
+            // misconfiguration rather than at first auto-embed.
+            let choice = ctxd_cli::embedder::EmbedderChoice::parse(&embedder)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let embed_opts = ctxd_cli::embedder::EmbedderOpts {
+                model: embedder_model,
+                url: embedder_url,
+                api_key: embedder_api_key,
+                dimensions: None,
+            };
+            let embedder_arc = ctxd_cli::embedder::build_embedder(choice, embed_opts)
+                .context("failed to construct embedder")?;
+            tracing::info!(
+                kind = %embedder_arc.kind(),
+                model = embedder_arc.model(),
+                dimensions = embedder_arc.dimensions(),
+                "embedder ready"
+            );
+            // Install on the store so `append` auto-embeds when the
+            // event has indexable text.
+            store.set_embedder(embedder_arc.clone());
 
             let router = build_router(store.clone(), cap_engine.clone());
             let http_handle = tokio::spawn(async move {

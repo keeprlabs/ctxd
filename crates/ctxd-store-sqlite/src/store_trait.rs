@@ -190,11 +190,14 @@ impl EventStore {
         Ok(())
     }
 
-    /// Brute-force top-k cosine-distance scan over persisted vectors.
+    /// Top-k vector search.
     ///
-    /// Phase 4 will replace this with a persisted HNSW index (see
-    /// [`crate::views::vector`]). Until then, we do a linear scan — fine
-    /// for conformance tests and small stores.
+    /// Uses the in-memory HNSW index when one has been opened via
+    /// [`EventStore::ensure_vector_index`]; otherwise falls back to
+    /// a brute-force cosine scan over `vector_embeddings`. The
+    /// brute-force path is intentionally still here so unconfigured
+    /// stores (e.g. the conformance suite) can exercise the trait
+    /// surface without spinning up an HNSW.
     pub async fn vector_search_impl(
         &self,
         query: &[f32],
@@ -202,6 +205,20 @@ impl EventStore {
     ) -> Result<Vec<VectorSearchResult>, SqliteStoreError> {
         if k == 0 || query.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(idx) = self.vector_index() {
+            // Index path — O(log n) thanks to HNSW.
+            match idx.search(query, k) {
+                Ok(pairs) => {
+                    return Ok(pairs
+                        .into_iter()
+                        .map(|(event_id, score)| VectorSearchResult { event_id, score })
+                        .collect())
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "HNSW search failed; falling back to brute force");
+                }
+            }
         }
         let rows: Vec<(String, i64, Vec<u8>)> =
             sqlx::query_as("SELECT event_id, dimensions, vector FROM vector_embeddings")
