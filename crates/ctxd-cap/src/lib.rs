@@ -17,7 +17,10 @@ use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 use uuid::Uuid;
+
+use crate::state::{ApprovalDecision, BudgetLimit, CaveatState, OperationCost};
 
 // Re-exports so callers don't have to depend on `biscuit_auth` directly to
 // pass third-party authority keys around. The two types are opaque from the
@@ -115,6 +118,23 @@ impl std::fmt::Display for Operation {
     }
 }
 
+/// The set of stateful caveats embedded in a token at mint time.
+///
+/// Returned by [`CapEngine::extract_stateful_caveats`]. Callers rarely
+/// need to inspect this directly — [`CapEngine::verify_with_state`]
+/// already consults it during enforcement — but tests and admin tools
+/// use it to confirm that mint-time facts round-trip.
+#[derive(Debug, Clone, Default)]
+pub struct StatefulCaveats {
+    /// The token's [`BudgetLimit`], if any. Only the *first*
+    /// `budget_limit(...)` fact is honored — multi-currency budgets are
+    /// out of scope for v0.3.
+    pub budget_limit: Option<state::BudgetLimit>,
+    /// Operations that require human approval before the verifier
+    /// allows them through.
+    pub requires_approval: Vec<Operation>,
+}
+
 /// A constraint that can be added to a capability via a third-party block.
 ///
 /// `Caveat` is a small, declarative description of what an attenuating
@@ -185,7 +205,11 @@ impl CapEngine {
         self.root_keypair.private().to_bytes().to_vec()
     }
 
-    /// Mint a new capability token.
+    /// Mint a new capability token (legacy, no stateful caveats).
+    ///
+    /// Equivalent to [`Self::mint_full`] with `budget_limit = None` and
+    /// `requires_approval = &[]`. Existing call sites that don't need
+    /// budget or approval caveats keep working unchanged.
     ///
     /// # Parameters
     /// - `subject_glob`: Subject path glob pattern (e.g., "/**", "/test/**").
@@ -204,10 +228,56 @@ impl CapEngine {
         kind_allowed: Option<&[&str]>,
         rate_limit_ops_per_sec: Option<u32>,
     ) -> Result<Vec<u8>, CapError> {
+        self.mint_full(
+            subject_glob,
+            operations,
+            expires_at,
+            kind_allowed,
+            rate_limit_ops_per_sec,
+            None,
+            &[],
+        )
+    }
+
+    /// Mint a new capability token with full v0.3 caveat support.
+    ///
+    /// In addition to the v0.2 caveats, this accepts:
+    /// - `budget_limit`: emits a `budget_limit("<currency>", <amount>)`
+    ///   fact. The amount is in micro-units (1 USD = 1_000_000). When
+    ///   present, [`Self::verify_with_state`] charges per-operation
+    ///   cost (see [`OperationCost`]) and rejects with
+    ///   [`CapError::BudgetExceeded`] once the cap is breached.
+    /// - `requires_approval`: emits one `requires_approval("<op>")` fact
+    ///   per operation in the slice. When present,
+    ///   [`Self::verify_with_state`] blocks the calling task on
+    ///   [`CaveatState::approval_wait`] for the configured timeout
+    ///   before allowing the op.
+    // Caveat parameters are intentionally each their own argument so
+    // call-sites read declaratively. Wrapping into a builder is on the
+    // v0.4 backlog.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_full(
+        &self,
+        subject_glob: &str,
+        operations: &[Operation],
+        expires_at: Option<DateTime<Utc>>,
+        kind_allowed: Option<&[&str]>,
+        rate_limit_ops_per_sec: Option<u32>,
+        budget_limit: Option<&BudgetLimit>,
+        requires_approval: &[Operation],
+    ) -> Result<Vec<u8>, CapError> {
         validate_datalog_safe(subject_glob, "subject_glob")?;
         if let Some(kinds) = kind_allowed {
             for kind in kinds {
                 validate_datalog_safe(kind, "kind_allowed")?;
+            }
+        }
+        if let Some(b) = budget_limit {
+            validate_datalog_safe(&b.currency, "budget_limit.currency")?;
+            if b.amount_micro_units < 0 {
+                return Err(CapError::Denied(
+                    "budget_limit.amount_micro_units must be non-negative".to_string(),
+                ));
             }
         }
 
@@ -236,6 +306,22 @@ impl CapEngine {
             facts.push_str(&format!("rate_limit_ops_per_sec({rate});\n"));
         }
 
+        // BudgetLimit caveat (v0.3). Stored as a fact; the verifier
+        // resolves it against `CaveatState::budget_increment` at
+        // verify time. Currency is already datalog-safe-validated.
+        if let Some(b) = budget_limit {
+            facts.push_str(&format!(
+                "budget_limit(\"{}\", {});\n",
+                b.currency, b.amount_micro_units
+            ));
+        }
+
+        // HumanApprovalRequired caveat (v0.3). One fact per op so the
+        // verifier can ask `requires_approval(<op>)` cheaply.
+        for op in requires_approval {
+            facts.push_str(&format!("requires_approval(\"{op}\");\n"));
+        }
+
         let mut code = facts;
         if let Some(exp) = expires_at {
             let exp_secs = exp.timestamp();
@@ -253,6 +339,13 @@ impl CapEngine {
     }
 
     /// Verify a capability token for a specific operation on a subject.
+    ///
+    /// This is the v0.2-compatible entry point: the verifier checks the
+    /// static caveats (subject glob, operation, expiry, kind, third-party
+    /// chain) but treats stateful caveats (`budget_limit`,
+    /// `requires_approval`) as observed-but-not-enforced. To enforce
+    /// them, use [`Self::verify_with_state`] and pass an
+    /// `Arc<dyn CaveatState>`.
     ///
     /// # Parameters
     /// - `token`: The serialized biscuit token bytes.
@@ -364,6 +457,169 @@ impl CapEngine {
         Err(CapError::Denied(format!(
             "no matching right for '{op_str}' on '{subject}'"
         )))
+    }
+
+    /// Verify a capability token, additionally enforcing stateful
+    /// caveats against the supplied [`CaveatState`].
+    ///
+    /// # Stateful caveats
+    /// - `budget_limit(currency, amount)`: every successful verify
+    ///   charges the per-[`OperationCost`] cost for `operation` against
+    ///   `(token_id, currency)` and rejects with
+    ///   [`CapError::BudgetExceeded`] if the cumulative spend exceeds
+    ///   `amount`. **The increment commits before the caller's op
+    ///   runs** — see ADR 011 for the trade-off rationale.
+    /// - `requires_approval(op)`: if a fact matches `operation`, the
+    ///   verifier records a pending approval, blocks via
+    ///   [`CaveatState::approval_wait`] for up to
+    ///   `approval_timeout`, and returns
+    ///   [`CapError::ApprovalDenied`] / [`CapError::ApprovalTimeout`]
+    ///   on `Deny` / `Pending`.
+    ///
+    /// # Fallback semantics
+    /// When `state` is `None`, behavior matches [`Self::verify`] —
+    /// stateful caveats are observed (the static caveats still pass)
+    /// but not enforced. Per ADR 011 this is intentional for tests and
+    /// legacy call sites; a token that carries `requires_approval`
+    /// will return [`CapError::ApprovalStateMissing`] when state is
+    /// `None` to surface the wiring bug. Budget caveats degrade
+    /// silently (return Ok) so v0.2 call sites keep working.
+    ///
+    /// # Tracing
+    /// Approval-related events emit `tracing::info!` with structured
+    /// fields (`token_id`, `approval_id`, `operation`, `subject`,
+    /// `decision`). Tokens are never logged.
+    pub async fn verify_with_state(
+        &self,
+        token: &[u8],
+        subject: &str,
+        operation: Operation,
+        event_type: Option<&str>,
+        state: Option<&dyn CaveatState>,
+        approval_timeout: Duration,
+    ) -> Result<(), CapError> {
+        // 1. Static caveats first. If the token can't even pass these
+        //    we don't want to charge a budget.
+        self.verify(token, subject, operation, event_type)?;
+
+        // 2. Extract stateful facts. The token's `token_id` is needed
+        //    for both budget and approval bookkeeping; missing token_id
+        //    means a pre-v0.2 token, which can't carry the new caveats
+        //    in the first place — short-circuit Ok.
+        let token_id = match self.extract_token_id(token)? {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        let stateful = self.extract_stateful_caveats(token)?;
+
+        // Loud-fail when the token says "needs approval for op X" but
+        // the verifier was given no state. We do *not* silently
+        // downgrade — that's how production caveats stop being
+        // enforced.
+        if stateful.requires_approval.contains(&operation) && state.is_none() {
+            return Err(CapError::ApprovalStateMissing);
+        }
+
+        let Some(state) = state else {
+            // No state means the budget caveat is observed-but-not
+            // -enforced (v0.2 fallback). The approval caveat already
+            // returned `ApprovalStateMissing` above for any matching op.
+            return Ok(());
+        };
+
+        // 3. Budget enforcement. Reserve-then-commit semantics: we
+        //    increment first and bail on overshoot. The trade-off (see
+        //    ADR 011): a downstream op that fails *after* verify will
+        //    have already charged the budget. Refund is left to the
+        //    caller via a future `budget_refund` API; for v0.3 we
+        //    accept the over-conservatism.
+        if let Some(budget) = stateful.budget_limit.as_ref() {
+            let cost = OperationCost::from(operation).as_i64();
+            // Skip the round-trip when cost is zero (read/subjects/…).
+            if cost > 0 {
+                let total = state
+                    .budget_increment(&token_id, &budget.currency, cost)
+                    .await?;
+                budget.check(total)?;
+            }
+        }
+
+        // 4. Approval enforcement.
+        if stateful.requires_approval.contains(&operation) {
+            let approval_id = Uuid::now_v7().to_string();
+            let op_str = operation.to_string();
+            tracing::info!(
+                token_id = %token_id,
+                approval_id = %approval_id,
+                operation = %op_str,
+                subject = %subject,
+                "requesting human approval"
+            );
+            state
+                .approval_request(&approval_id, &token_id, &op_str, subject)
+                .await?;
+            let decision = state.approval_wait(&approval_id, approval_timeout).await?;
+            tracing::info!(
+                token_id = %token_id,
+                approval_id = %approval_id,
+                operation = %op_str,
+                decision = ?decision,
+                "approval decision received"
+            );
+            match decision {
+                ApprovalDecision::Allow => {}
+                ApprovalDecision::Deny => {
+                    return Err(CapError::ApprovalDenied { approval_id });
+                }
+                ApprovalDecision::Pending => {
+                    return Err(CapError::ApprovalTimeout { approval_id });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract the `budget_limit` and `requires_approval` facts from a
+    /// token. Used by [`Self::verify_with_state`] and by tests that
+    /// want to assert the mint-time facts round-trip.
+    pub fn extract_stateful_caveats(&self, token: &[u8]) -> Result<StatefulCaveats, CapError> {
+        let biscuit = Biscuit::from(token, self.root_keypair.public())?;
+        let mut authorizer = biscuit.authorizer()?;
+        let budget_rows: Vec<(String, i64)> =
+            authorizer.query(rule!("budget($c, $n) <- budget_limit($c, $n)"))?;
+        let approval_rows: Vec<(String,)> =
+            authorizer.query(rule!("approval($op) <- requires_approval($op)"))?;
+
+        let budget_limit = budget_rows.into_iter().next().map(|(c, n)| BudgetLimit {
+            currency: c,
+            amount_micro_units: n,
+        });
+
+        let mut requires_approval = Vec::new();
+        for (op,) in approval_rows {
+            // Map the string back to the enum. Unknown ops are
+            // silently dropped — they were minted by an older client
+            // and we can't safely interpret them.
+            let parsed = match op.as_str() {
+                "read" => Some(Operation::Read),
+                "write" => Some(Operation::Write),
+                "subjects" => Some(Operation::Subjects),
+                "search" => Some(Operation::Search),
+                "admin" => Some(Operation::Admin),
+                "peer" => Some(Operation::Peer),
+                "subscribe" => Some(Operation::Subscribe),
+                _ => None,
+            };
+            if let Some(op) = parsed {
+                requires_approval.push(op);
+            }
+        }
+
+        Ok(StatefulCaveats {
+            budget_limit,
+            requires_approval,
+        })
     }
 
     /// Attenuate a token by adding restrictions.
