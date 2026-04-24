@@ -5,12 +5,33 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "ctxd-adapter-github"
+path = "src/main.rs"
+
 [dependencies]
 ctxd-adapter-core = { path = "../ctxd-adapter-core" }
 ctxd-core = { path = "../ctxd-core" }
+ctxd-store = { path = "../ctxd-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 async-trait = "0.1"
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+anyhow = { workspace = true }
+dirs = "5"
+url = "2"
+
+[dev-dependencies]
+ctxd-adapter-core = { path = "../ctxd-adapter-core" }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+wiremock = "0.6"
+serde_json = { workspace = true }
