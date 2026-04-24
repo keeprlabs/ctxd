@@ -22,6 +22,10 @@ use tokio::sync::{broadcast, Mutex};
 
 /// Wire protocol request messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Federation verbs intentionally carry the `PeerCursorRequest` suffix to
+// mirror the RFC-style PeerCursorRequest/PeerCursor pair (a request vs a
+// carrier). The clippy lint is a style nudge we've chosen to reject here.
+#[allow(clippy::enum_variant_names)]
 pub enum Request {
     /// Publish (append) an event.
     Pub {
@@ -46,6 +50,85 @@ pub enum Request {
     Revoke { cap_id: String },
     /// Health check.
     Ping,
+
+    // --- v0.3 federation (2A) ---
+    //
+    // The federation verbs are wire-level types introduced in v0.3. A
+    // handler for each is wired via `ctxd-cli/src/federation.rs` in a
+    // follow-up; for now the `ProtocolServer::handle_connection` path
+    // returns `Error { message: "federation not yet wired" }` for any
+    // federation request. The shape here is the source-of-truth for
+    // the over-the-wire payload.
+    /// A peer introduces itself. Includes its Ed25519 public key, the
+    /// capability it's offering the remote peer (base64-encoded biscuit),
+    /// and the subject globs the remote should deliver to it.
+    PeerHello {
+        /// Local peer id (typically remote pubkey hex).
+        peer_id: String,
+        /// Sender's Ed25519 public key (32 raw bytes).
+        public_key: Vec<u8>,
+        /// Capability token sender mints for recipient (base64-encoded).
+        offered_cap: String,
+        /// Subject globs sender will deliver to recipient.
+        subjects: Vec<String>,
+    },
+
+    /// Remote's welcome response with its reciprocal capability.
+    PeerWelcome {
+        /// Remote peer id.
+        peer_id: String,
+        /// Remote's Ed25519 public key.
+        public_key: Vec<u8>,
+        /// Reciprocal capability token (base64-encoded).
+        offered_cap: String,
+        /// Subject globs remote will deliver to sender.
+        subjects: Vec<String>,
+    },
+
+    /// Streaming replication message carrying an event from peer.
+    PeerReplicate {
+        /// Origin peer id of the event.
+        origin_peer_id: String,
+        /// Serialized `ctxd_core::event::Event` as JSON.
+        event: serde_json::Value,
+    },
+
+    /// Acknowledgement of a `PeerReplicate`, used to advance cursors.
+    PeerAck {
+        /// Origin peer id of the event being ACKed.
+        origin_peer_id: String,
+        /// UUIDv7 event id that was accepted.
+        event_id: String,
+    },
+
+    /// Request the peer's current cursor for a subject pattern, to
+    /// resume replication after a disconnect.
+    PeerCursorRequest {
+        /// Peer id whose cursor we're asking about.
+        peer_id: String,
+        /// Subject glob pattern.
+        subject_pattern: String,
+    },
+
+    /// Carrier for a cursor response.
+    PeerCursor {
+        /// Peer id the cursor belongs to.
+        peer_id: String,
+        /// Subject glob pattern.
+        subject_pattern: String,
+        /// Last-known event id, or `None` if no events have been
+        /// exchanged for this pattern.
+        last_event_id: Option<String>,
+        /// RFC3339 timestamp of the last-known event, or `None`.
+        last_event_time: Option<String>,
+    },
+
+    /// Request a batch of events by id — used for parent-backfill when
+    /// an incoming `PeerReplicate` references parents we don't have.
+    PeerFetchEvents {
+        /// UUIDv7 event ids to fetch.
+        event_ids: Vec<String>,
+    },
 }
 
 /// Wire protocol response messages.
@@ -231,6 +314,27 @@ async fn handle_connection(
                     &mut stream,
                     &Response::Error {
                         message: "REVOKE is not implemented, scheduled for v0.2".to_string(),
+                    },
+                )
+                .await?;
+            }
+
+            // Federation verbs — wire-level types in place; the connection
+            // handler in `federation.rs` will own these in the follow-up
+            // sub-task. For now we return a structured error so peers
+            // (and tests) can detect that the receiver is federation-aware
+            // but not yet handling the verb.
+            Request::PeerHello { .. }
+            | Request::PeerWelcome { .. }
+            | Request::PeerReplicate { .. }
+            | Request::PeerAck { .. }
+            | Request::PeerCursorRequest { .. }
+            | Request::PeerCursor { .. }
+            | Request::PeerFetchEvents { .. } => {
+                send_response(
+                    &mut stream,
+                    &Response::Error {
+                        message: "federation protocol handler not yet wired (Phase 2D)".to_string(),
                     },
                 )
                 .await?;
@@ -567,6 +671,39 @@ mod tests {
             },
             Request::Revoke {
                 cap_id: "id-1".to_string(),
+            },
+            Request::PeerHello {
+                peer_id: "peer-a".to_string(),
+                public_key: vec![1u8; 32],
+                offered_cap: "Y2Fw".to_string(),
+                subjects: vec!["/work/**".to_string()],
+            },
+            Request::PeerWelcome {
+                peer_id: "peer-b".to_string(),
+                public_key: vec![2u8; 32],
+                offered_cap: "Y2Fw".to_string(),
+                subjects: vec!["/home/**".to_string()],
+            },
+            Request::PeerReplicate {
+                origin_peer_id: "peer-a".to_string(),
+                event: serde_json::json!({"id": "01"}),
+            },
+            Request::PeerAck {
+                origin_peer_id: "peer-a".to_string(),
+                event_id: "01".to_string(),
+            },
+            Request::PeerCursorRequest {
+                peer_id: "peer-a".to_string(),
+                subject_pattern: "/**".to_string(),
+            },
+            Request::PeerCursor {
+                peer_id: "peer-a".to_string(),
+                subject_pattern: "/**".to_string(),
+                last_event_id: Some("abc".to_string()),
+                last_event_time: Some("2025-01-01T00:00:00Z".to_string()),
+            },
+            Request::PeerFetchEvents {
+                event_ids: vec!["abc".to_string(), "def".to_string()],
             },
         ];
         for v in &variants {
