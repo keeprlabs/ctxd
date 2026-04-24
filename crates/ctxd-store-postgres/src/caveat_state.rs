@@ -62,14 +62,13 @@ impl CaveatState for PostgresCaveatState {
     }
 
     async fn budget_get(&self, token_id: &str, currency: &str) -> Result<i64, CapError> {
-        let row = sqlx::query(
-            "SELECT spent FROM token_budgets WHERE token_id = $1 AND currency = $2",
-        )
-        .bind(token_id)
-        .bind(currency)
-        .fetch_optional(self.store.pool())
-        .await
-        .map_err(map_err)?;
+        let row =
+            sqlx::query("SELECT spent FROM token_budgets WHERE token_id = $1 AND currency = $2")
+                .bind(token_id)
+                .bind(currency)
+                .fetch_optional(self.store.pool())
+                .await
+                .map_err(map_err)?;
         match row {
             Some(r) => {
                 let spent: i64 = r
@@ -118,13 +117,11 @@ impl CaveatState for PostgresCaveatState {
     }
 
     async fn approval_status(&self, approval_id: &str) -> Result<ApprovalDecision, CapError> {
-        let row = sqlx::query(
-            "SELECT decision FROM pending_approvals WHERE approval_id = $1",
-        )
-        .bind(approval_id)
-        .fetch_optional(self.store.pool())
-        .await
-        .map_err(map_err)?;
+        let row = sqlx::query("SELECT decision FROM pending_approvals WHERE approval_id = $1")
+            .bind(approval_id)
+            .fetch_optional(self.store.pool())
+            .await
+            .map_err(map_err)?;
         match row {
             Some(r) => {
                 let decision: String = r
@@ -139,9 +136,7 @@ impl CaveatState for PostgresCaveatState {
                     ))),
                 }
             }
-            None => Err(CapError::Denied(format!(
-                "no such approval: {approval_id}"
-            ))),
+            None => Err(CapError::Denied(format!("no such approval: {approval_id}"))),
         }
     }
 
@@ -169,9 +164,7 @@ impl CaveatState for PostgresCaveatState {
         .await
         .map_err(map_err)?;
         if result.rows_affected() == 0 {
-            return Err(CapError::Denied(format!(
-                "no such approval: {approval_id}"
-            )));
+            return Err(CapError::Denied(format!("no such approval: {approval_id}")));
         }
         Ok(())
     }

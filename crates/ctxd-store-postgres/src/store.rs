@@ -140,8 +140,7 @@ impl PostgresStore {
         // their signature — recomputing would invalidate the
         // signature.
         if event.predecessorhash.is_none() {
-            let last_event =
-                last_event_for_subject_in_tx(&mut tx, event.subject.as_str()).await?;
+            let last_event = last_event_for_subject_in_tx(&mut tx, event.subject.as_str()).await?;
             if let Some(ref prev) = last_event {
                 let hash = PredecessorHash::compute(prev).map_err(StoreError::Serialization)?;
                 event.predecessorhash = Some(hash.to_string());
@@ -236,11 +235,7 @@ impl PostgresStore {
 
     /// Read events for a subject, optionally recursive.
     #[tracing::instrument(skip(self), fields(subject = %subject))]
-    pub async fn read(
-        &self,
-        subject: &Subject,
-        recursive: bool,
-    ) -> Result<Vec<Event>, StoreError> {
+    pub async fn read(&self, subject: &Subject, recursive: bool) -> Result<Vec<Event>, StoreError> {
         let rows = if recursive {
             let pattern = recursive_like_pattern(subject.as_str());
             sqlx::query(

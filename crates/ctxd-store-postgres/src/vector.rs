@@ -71,11 +71,9 @@ impl PostgresStore {
             return Ok(Vec::new());
         }
 
-        let rows = sqlx::query(
-            "SELECT event_id, dimensions, vector FROM vector_embeddings",
-        )
-        .fetch_all(self.pool())
-        .await?;
+        let rows = sqlx::query("SELECT event_id, dimensions, vector FROM vector_embeddings")
+            .fetch_all(self.pool())
+            .await?;
 
         let mut scored = Vec::with_capacity(rows.len());
         for row in rows {

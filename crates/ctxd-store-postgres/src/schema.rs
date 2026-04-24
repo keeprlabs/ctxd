@@ -43,10 +43,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), StoreError> {
     })?;
     for (name, sql) in MIGRATIONS {
         tracing::debug!(migration = %name, "applying postgres migration");
-        conn.execute(*sql).await.map_err(|e| StoreError::Migration {
-            name: (*name).to_string(),
-            source: e,
-        })?;
+        conn.execute(*sql)
+            .await
+            .map_err(|e| StoreError::Migration {
+                name: (*name).to_string(),
+                source: e,
+            })?;
     }
     Ok(())
 }

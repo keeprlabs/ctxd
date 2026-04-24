@@ -10,8 +10,8 @@ use chrono::{DateTime, Utc};
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
 use ctxd_store_core::{
-    EntityQuery, EntityRow, Peer, PeerCursor, RelationshipRow, Store,
-    StoreError as CoreStoreError, VectorSearchResult,
+    EntityQuery, EntityRow, Peer, PeerCursor, RelationshipRow, Store, StoreError as CoreStoreError,
+    VectorSearchResult,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -306,9 +306,9 @@ impl PostgresStore {
             let eprops: serde_json::Value = r
                 .try_get("eprops")
                 .map_err(|e| PgStoreError::Decode(format!("entity.properties (joined): {e}")))?;
-            let esrc: String = r
-                .try_get("esrc")
-                .map_err(|e| PgStoreError::Decode(format!("entity.source_event_id (joined): {e}")))?;
+            let esrc: String = r.try_get("esrc").map_err(|e| {
+                PgStoreError::Decode(format!("entity.source_event_id (joined): {e}"))
+            })?;
 
             out.push((
                 RelationshipRow {
@@ -338,11 +338,7 @@ impl Store for PostgresStore {
         self.append(event).await.map_err(Into::into)
     }
 
-    async fn read(
-        &self,
-        subject: &Subject,
-        recursive: bool,
-    ) -> Result<Vec<Event>, CoreStoreError> {
+    async fn read(&self, subject: &Subject, recursive: bool) -> Result<Vec<Event>, CoreStoreError> {
         self.read(subject, recursive).await.map_err(Into::into)
     }
 
