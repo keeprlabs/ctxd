@@ -12,6 +12,7 @@
 //! New code should prefer the trait. Existing call sites may keep using
 //! the concrete type — the public API is stable across v0.2 and v0.3.
 
+pub mod caveat_state;
 pub mod migrate;
 pub mod migrations;
 pub mod store;

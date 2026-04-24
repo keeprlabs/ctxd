@@ -4,7 +4,11 @@
 //! use the biscuit-auth format with ctxd-specific facts for subject paths
 //! and operation kinds.
 //!
-//! For v0.1: grant/verify/attenuate. Revocation is v0.2.
+//! For v0.1: grant/verify/attenuate. Revocation is v0.2. v0.3 adds the
+//! [`state::CaveatState`] trait for budget + approval-style stateful
+//! caveats.
+
+pub mod state;
 
 use biscuit_auth::builder::{Algorithm, AuthorizerBuilder, BlockBuilder};
 use biscuit_auth::macros::*;

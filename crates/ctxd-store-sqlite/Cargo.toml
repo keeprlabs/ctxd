@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ctxd-core = { path = "../ctxd-core" }
 ctxd-store-core = { path = "../ctxd-store-core" }
+ctxd-cap = { path = "../ctxd-cap" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
