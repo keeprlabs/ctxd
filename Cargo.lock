@@ -752,11 +752,14 @@ name = "ctxd-adapter-gmail"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "clap",
  "ctxd-adapter-core",
  "ctxd-core",
+ "ctxd-store",
  "hkdf",
  "hmac",
  "rand 0.8.6",
@@ -769,6 +772,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
  "wiremock",
 ]
 

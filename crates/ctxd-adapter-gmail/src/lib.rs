@@ -1,9 +1,16 @@
 //! Gmail adapter for ctxd.
 //!
 //! Implements OAuth2 device-code authorization, AES-256-GCM at-rest token
-//! encryption, and an incremental Gmail History API sync layer. The
-//! [`Adapter`](ctxd_adapter_core::Adapter) trait implementation and the
-//! `ctxd-adapter-gmail` binary land in the next commit.
+//! encryption, and incremental Gmail History API polling. Publishes one
+//! event per (message, label) pair into ctxd under
+//! `/work/email/gmail/{label}/{message_id}`.
+//!
+//! # Subcommands
+//! - `auth` — runs the OAuth2 device-code flow and persists an encrypted
+//!   refresh token.
+//! - `run` — loads the encrypted token, refreshes the access token, and
+//!   syncs the inbox via the History API.
+//! - `status` — prints the current sync state.
 //!
 //! # Modules
 //! - [`oauth`] — OAuth2 device-code flow + token refresh.
@@ -12,12 +19,17 @@
 //!   history.list).
 //! - [`parse`] — header parsing, body extraction, subject normalization.
 //! - [`state`] — persisted sync cursor + idempotency tracking via SQLite.
+//! - [`adapter`] — the [`GmailAdapter`] type that implements
+//!   [`ctxd_adapter_core::Adapter`].
 
+pub mod adapter;
 pub mod crypto;
 pub mod gmail;
 pub mod oauth;
 pub mod parse;
 pub mod state;
+
+pub use adapter::{GmailAdapter, GmailAdapterConfig};
 
 /// Maximum body size we will store on an event, in bytes (128 KB).
 pub const MAX_BODY_SIZE: usize = 128 * 1024;
