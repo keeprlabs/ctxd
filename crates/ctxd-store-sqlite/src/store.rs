@@ -674,6 +674,39 @@ impl EventStore {
         Ok(row.is_some())
     }
 
+    /// List all approvals still in the `pending` state (v0.3
+    /// `HumanApprovalRequired` caveat).
+    ///
+    /// Returns lightweight JSON-shaped rows so the HTTP handler can
+    /// serialize them directly. Empty list is returned if the table is
+    /// empty or doesn't exist (older databases).
+    pub async fn pending_approvals_list(&self) -> Result<Vec<serde_json::Value>, StoreError> {
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT approval_id, token_id, operation, subject, requested_at
+            FROM pending_approvals
+            WHERE decision = 'pending'
+            ORDER BY requested_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(approval_id, token_id, operation, subject, requested_at)| {
+                    serde_json::json!({
+                        "approval_id": approval_id,
+                        "token_id": token_id,
+                        "operation": operation,
+                        "subject": subject,
+                        "requested_at": requested_at,
+                    })
+                },
+            )
+            .collect())
+    }
+
     /// Create a `GraphView` backed by the same connection pool.
     pub fn graph_view(&self) -> crate::views::graph::GraphView {
         crate::views::graph::GraphView::new(self.pool.clone())
