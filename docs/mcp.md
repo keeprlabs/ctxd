@@ -304,6 +304,21 @@ This is a deliberate decision — see
 deployments (the daemon and its consumers on the same host) the
 proxy is unnecessary; TLS adds nothing on `127.0.0.1`.
 
+## DNS rebinding protection
+
+The streamable-HTTP transport rejects requests whose `Host` header is
+not in an allow-list. The default list is `localhost`, `127.0.0.1`,
+and `::1` — sufficient for loopback deployments. If you bind to a
+non-loopback address (e.g. `0.0.0.0:7780` so a reverse proxy can
+forward in), the proxy must rewrite the `Host` header to one of those
+values, OR you can extend the allow-list at startup (see
+`StreamableHttpServerConfig::with_allowed_hosts` in the rmcp source —
+this is currently a code-level configuration; a CLI flag is on the
+roadmap).
+
+The SSE transport does not enforce this check today — its `Host`
+validation lives upstream of any proxy you put in front of it.
+
 ## Body size limits
 
 The HTTP transports cap inbound JSON-RPC bodies at **1 MiB per
