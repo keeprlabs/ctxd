@@ -699,6 +699,7 @@ dependencies = [
  "biscuit-auth",
  "chrono",
  "ctxd-core",
+ "hex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

@@ -6,7 +6,8 @@
 //!
 //! For v0.1: grant/verify/attenuate. Revocation is v0.2. v0.3 adds the
 //! [`state::CaveatState`] trait for budget + approval-style stateful
-//! caveats.
+//! caveats, plus third-party-signed attenuation blocks (see
+//! [`CapEngine::attenuate_with_block`] and [`CapEngine::verify_multi`]).
 
 pub mod state;
 
@@ -15,7 +16,16 @@ use biscuit_auth::macros::*;
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
+
+// Re-exports so callers don't have to depend on `biscuit_auth` directly to
+// pass third-party authority keys around. The two types are opaque from the
+// outside and are only ever produced/consumed by the helper functions in
+// this crate.
+pub use biscuit_auth::{
+    KeyPair as BiscuitKeyPair, PrivateKey as BiscuitPrivateKey, PublicKey as BiscuitPublicKey,
+};
 
 /// Errors from the capability engine.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +57,13 @@ pub enum Operation {
     Search,
     /// Admin operations (mint tokens, etc.).
     Admin,
+    /// Federation peer-handshake / replication (v0.3). A token bearing
+    /// `right(<subject_glob>, "peer")` authorizes the holder to participate
+    /// in federation under that scope — handshake, replication and ack.
+    Peer,
+    /// Subscribe to events (v0.3 federation). A separate operation from
+    /// `Read` so a peer cap can grant streaming without bulk-read.
+    Subscribe,
 }
 
 impl std::fmt::Display for Operation {
@@ -57,8 +74,31 @@ impl std::fmt::Display for Operation {
             Self::Subjects => write!(f, "subjects"),
             Self::Search => write!(f, "search"),
             Self::Admin => write!(f, "admin"),
+            Self::Peer => write!(f, "peer"),
+            Self::Subscribe => write!(f, "subscribe"),
         }
     }
+}
+
+/// A constraint that can be added to a capability via a third-party block.
+///
+/// `Caveat` is a small, declarative description of what an attenuating
+/// authority wants to *narrow* on the underlying token. It is converted
+/// to biscuit datalog inside [`CapEngine::attenuate_with_block`].
+///
+/// Each variant *narrows* — never widens — the token. The verifier
+/// enforces this by requiring every block's checks to pass.
+#[derive(Debug, Clone)]
+pub enum Caveat {
+    /// Restrict the subjects the bearer can act on. Acts as a prefix
+    /// match (`/work/**` allows `/work/a` and `/work/a/b` but not
+    /// `/home/x`).
+    SubjectPrefix(String),
+    /// Restrict the operations the bearer may perform to this set.
+    OperationsAtMost(Vec<Operation>),
+    /// Hard expiry — after this instant, the token must not authorize
+    /// anything.
+    ExpiresAt(DateTime<Utc>),
 }
 
 /// Validate a string is safe for interpolation into biscuit datalog.
@@ -318,6 +358,153 @@ impl CapEngine {
         Ok(attenuated.to_vec()?)
     }
 
+    /// Attenuate a token by appending a *third-party signed block*.
+    ///
+    /// Unlike [`Self::attenuate`], the appended block is signed with
+    /// `authority_key` rather than the next biscuit-internal block
+    /// keypair. This lets a downstream authority (B in `A → B → C`)
+    /// add caveats that the verifier can attribute to B's pubkey
+    /// using the `trusting <pubkey>` datalog clause.
+    ///
+    /// Each entry in `caveats` becomes a datalog `check if …` line in
+    /// the third-party block. The block also emits a stable
+    /// `attenuated_by("<pubkey-hex>")` fact so the verifier can confirm
+    /// the chain in a single query without parsing block-internal
+    /// signatures.
+    ///
+    /// The new token must subsequently be verified with
+    /// [`Self::verify_multi`] using a trust set that contains the
+    /// authority's public key — otherwise the third-party block's
+    /// checks won't apply and the token will look like a plain
+    /// (unattenuated) version on the wire.
+    pub fn attenuate_with_block(
+        &self,
+        cap: &[u8],
+        authority_key: &PrivateKey,
+        caveats: &[Caveat],
+    ) -> Result<Vec<u8>, CapError> {
+        let biscuit = Biscuit::from(cap, self.root_keypair.public())?;
+        let request = biscuit.third_party_request()?;
+
+        let block_builder = build_caveat_block(authority_key, caveats)?;
+        let block = request.create_block(authority_key, block_builder)?;
+        let next = biscuit.append_third_party(KeyPair::from(authority_key).public(), block)?;
+        Ok(next.to_vec()?)
+    }
+
+    /// Verify a token, additionally trusting third-party blocks signed
+    /// by any of the public keys in `trusted_authorities`.
+    ///
+    /// The check is symmetric to [`Self::verify`]: we evaluate
+    /// `right("<subject>", "<op>") trusting authority, <pk1>, <pk2>…`
+    /// and require an `allow` from the authorizer. If a block is
+    /// missing from the trust set, its caveats still apply *only if*
+    /// they evaluate against the authority block — meaning a missing
+    /// authority results in a *loud fail* on any subject/op the third
+    /// party narrowed (rather than silently widening).
+    ///
+    /// `subject` and `op` follow the same rules as [`Self::verify`].
+    pub fn verify_multi(
+        &self,
+        cap: &[u8],
+        trusted_authorities: &[PublicKey],
+        subject: &str,
+        op: Operation,
+    ) -> Result<(), CapError> {
+        validate_datalog_safe(subject, "subject")?;
+        let biscuit = Biscuit::from(cap, self.root_keypair.public())?;
+        let op_str = op.to_string();
+        let now = Utc::now().timestamp();
+
+        // Loud-fail rule: every third-party block in the token must be
+        // backed by a public key in `trusted_authorities`. A missing
+        // authority means the verifier cannot evaluate that block's
+        // caveats, which would silently widen — so we reject upfront.
+        // (Biscuit-internal "first-party" blocks have `None` for the
+        // external key and are always trusted via the authority chain.)
+        for ext in biscuit.external_public_keys().into_iter().flatten() {
+            if !trusted_authorities.contains(&ext) {
+                return Err(CapError::Denied(format!(
+                    "third-party block signed by {} is not in the trust set",
+                    hex::encode(ext.to_bytes())
+                )));
+            }
+        }
+
+        // Build the authorizer datalog with one named scope param per
+        // trusted authority pubkey, plus an `allow` policy that trusts
+        // the authority block + every named external key.
+        let mut scope_params: HashMap<String, PublicKey> = HashMap::new();
+        let mut trusting_clause = String::from("authority");
+        for (i, pk) in trusted_authorities.iter().enumerate() {
+            let name = format!("ext{i}");
+            scope_params.insert(name.clone(), *pk);
+            trusting_clause.push_str(&format!(", {{{name}}}"));
+        }
+
+        // We emit:
+        //   resource("…"); operation("…"); time(…);
+        //   allow if right("<subj>", "<op>") trusting <authority + ext keys>;
+        //   allow if right("/**",   "<op>") trusting <authority + ext keys>;
+        //
+        // …followed by glob-fallback re-authorization (mirrors
+        // `verify`'s pattern) for prefix/wildcard matches the simple
+        // datalog can't express directly.
+        let direct_code = format!(
+            r#"
+            time({now});
+            resource("{subject}");
+            operation("{op_str}");
+            allow if right("{subject}", "{op_str}") trusting {trusting_clause};
+            allow if right("/**", "{op_str}") trusting {trusting_clause};
+            "#
+        );
+        let auth_builder = AuthorizerBuilder::new().code_with_params(
+            &direct_code,
+            HashMap::new(),
+            scope_params.clone(),
+        )?;
+        let mut authorizer = auth_builder.build(&biscuit)?;
+        if authorizer.authorize().is_ok() {
+            return Ok(());
+        }
+
+        // Fallback: extract `right` facts and do glob matching, then
+        // re-authorize with an injected `right(<subj>, <op>)` fact.
+        // Same authority+external trust set as the direct path so
+        // third-party blocks remain in scope.
+        let trusting_for_inject = trusting_clause.clone();
+        let mut query_auth = biscuit.authorizer()?;
+        let facts: Vec<(String, String)> =
+            query_auth.query(rule!("data($sub, $op) <- right($sub, $op)"))?;
+        for (pattern, fact_op) in &facts {
+            if fact_op == &op_str && glob_match_subject(pattern, subject) {
+                let final_code = format!(
+                    r#"
+                    time({now});
+                    resource("{subject}");
+                    operation("{op_str}");
+                    right("{subject}", "{op_str}");
+                    allow if right("{subject}", "{op_str}") trusting {trusting_for_inject};
+                    "#
+                );
+                let final_builder = AuthorizerBuilder::new().code_with_params(
+                    &final_code,
+                    HashMap::new(),
+                    scope_params,
+                )?;
+                let mut final_auth = final_builder.build(&biscuit)?;
+                final_auth.authorize()?;
+                return Ok(());
+            }
+        }
+
+        Err(CapError::Denied(format!(
+            "no matching right for '{op_str}' on '{subject}' under trust set of {} authorities",
+            trusted_authorities.len()
+        )))
+    }
+
     /// Encode a token to base64 for transport.
     pub fn token_to_base64(token: &[u8]) -> String {
         use base64::Engine;
@@ -369,6 +556,44 @@ impl CapEngine {
         }
         self.verify(token, subject, operation, event_type)
     }
+}
+
+/// Translate a slice of [`Caveat`]s into a third-party-signed
+/// [`BlockBuilder`]. Each caveat becomes one or more datalog `check if`
+/// lines plus a stable `attenuated_by(<pubkey-hex>)` fact identifying
+/// the signing authority.
+fn build_caveat_block(
+    authority_key: &PrivateKey,
+    caveats: &[Caveat],
+) -> Result<BlockBuilder, CapError> {
+    let pk_hex = hex::encode(KeyPair::from(authority_key).public().to_bytes());
+    let mut code = String::new();
+    code.push_str(&format!("attenuated_by(\"{pk_hex}\");\n"));
+
+    for caveat in caveats {
+        match caveat {
+            Caveat::SubjectPrefix(prefix) => {
+                validate_datalog_safe(prefix, "subject_prefix")?;
+                let normalized = prefix.replace("/**", "").replace("/*", "");
+                code.push_str(&format!(
+                    "check if resource($res), $res.starts_with(\"{normalized}\");\n"
+                ));
+            }
+            Caveat::OperationsAtMost(ops) => {
+                let parts: Vec<String> = ops.iter().map(|o| format!("\"{o}\"")).collect();
+                let set = parts.join(", ");
+                code.push_str(&format!(
+                    "check if operation($op), [{set}].contains($op);\n"
+                ));
+            }
+            Caveat::ExpiresAt(t) => {
+                let secs = t.timestamp();
+                code.push_str(&format!("check if time($time), $time <= {secs};\n"));
+            }
+        }
+    }
+
+    BlockBuilder::new().code(&code).map_err(CapError::from)
 }
 
 /// Check if a subject matches a glob pattern.
