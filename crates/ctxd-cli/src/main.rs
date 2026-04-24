@@ -14,7 +14,6 @@ use ctxd_mcp::CtxdMcpServer;
 use ctxd_store::EventStore;
 use opentelemetry::trace::TracerProvider;
 use protocol::{ProtocolClient, ProtocolServer};
-use rmcp::ServiceExt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +35,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the ctxd daemon (HTTP + MCP over stdio + wire protocol).
+    /// Start the ctxd daemon (HTTP admin + wire protocol + MCP transports).
+    ///
+    /// MCP can be served over up to three transports concurrently:
+    ///
+    /// * `--mcp-stdio` — newline-delimited JSON-RPC on stdin/stdout
+    ///   (default on; the only transport Claude Desktop currently uses).
+    /// * `--mcp-sse <addr>` — legacy MCP SSE: `GET /sse` opens an event
+    ///   stream, `POST /messages?sessionId=…` carries JSON-RPC.
+    /// * `--mcp-http <addr>` — modern streamable HTTP: a single `/mcp`
+    ///   endpoint per the MCP 2025-03-26 spec.
+    ///
+    /// On the HTTP transports, capability tokens may be presented as
+    /// either an `Authorization: Bearer <base64-biscuit>` header or a
+    /// per-call `token` argument. The header wins when both are
+    /// present. With `--require-auth`, every `tools/call` over the
+    /// HTTP transports must present a token (header or arg) — calls
+    /// without one are rejected with 401.
     Serve {
         /// Address to bind the HTTP admin API.
         #[arg(long, default_value = "127.0.0.1:7777")]
@@ -49,6 +64,23 @@ enum Commands {
         /// Run MCP server on stdio (for Claude Desktop / mcp-inspector).
         #[arg(long, default_value_t = true)]
         mcp_stdio: bool,
+
+        /// Bind a legacy MCP SSE transport at this address (e.g.
+        /// `127.0.0.1:7779`). Disabled by default.
+        #[arg(long)]
+        mcp_sse: Option<String>,
+
+        /// Bind a streamable-HTTP MCP transport at this address (e.g.
+        /// `127.0.0.1:7780`). Disabled by default.
+        #[arg(long)]
+        mcp_http: Option<String>,
+
+        /// Require every `tools/call` on the HTTP transports to carry
+        /// a capability token. Calls without one return 401. Stdio is
+        /// unaffected — that transport keeps the legacy "open by
+        /// default" behaviour for local-subprocess clients.
+        #[arg(long, default_value_t = false)]
+        require_auth: bool,
     },
 
     /// Append an event to the store.
@@ -306,6 +338,9 @@ async fn main() -> Result<()> {
             bind,
             wire_bind,
             mcp_stdio,
+            mcp_sse,
+            mcp_http,
+            require_auth,
         } => {
             let addr: SocketAddr = bind.parse().context("invalid bind address")?;
             let wire_addr: SocketAddr = wire_bind.parse().context("invalid wire bind address")?;
@@ -371,17 +406,101 @@ async fn main() -> Result<()> {
                 }
             });
 
-            if mcp_stdio {
-                let mcp_server = CtxdMcpServer::new(store, cap_engine, format!("ctxd://{addr}"));
-                tracing::info!("MCP server on stdio ready");
-                let transport = rmcp::transport::io::stdio();
-                let running = mcp_server
-                    .serve(transport)
-                    .await
-                    .context("MCP server failed to start")?;
-                let _ = running.waiting().await;
+            // Build the shared MCP server. Each transport gets its own
+            // logical clone (CtxdMcpServer is cheap to clone — store +
+            // cap engine are Arc-backed).
+            let mcp_server = CtxdMcpServer::new(
+                store.clone(),
+                cap_engine.clone(),
+                format!("ctxd://{addr}"),
+            );
+
+            // Auth policy applies to HTTP transports only. Stdio is
+            // local-subprocess and keeps the legacy "open by default"
+            // behaviour for backwards compatibility.
+            let policy = if require_auth {
+                ctxd_mcp::auth::AuthPolicy::Required
             } else {
-                let _ = tokio::join!(http_handle, wire_handle);
+                ctxd_mcp::auth::AuthPolicy::Optional
+            };
+
+            // Shared cancellation token so SIGTERM / Ctrl-C tears every
+            // transport down. The CLI doesn't (yet) wire signal handling
+            // explicitly — the parent's cancellation propagates via
+            // tokio's main exit.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+
+            let mut sse_handle: Option<tokio::task::JoinHandle<()>> = None;
+            if let Some(sse_bind) = mcp_sse {
+                let sse_addr: SocketAddr =
+                    sse_bind.parse().context("invalid --mcp-sse address")?;
+                let server_clone = mcp_server.clone();
+                let shutdown_clone = shutdown.clone();
+                sse_handle = Some(tokio::spawn(async move {
+                    if let Err(e) = ctxd_mcp::transport::run_sse(
+                        server_clone,
+                        sse_addr,
+                        policy,
+                        shutdown_clone,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "SSE transport ended");
+                    }
+                }));
+            }
+
+            let mut http_mcp_handle: Option<tokio::task::JoinHandle<()>> = None;
+            if let Some(http_bind) = mcp_http {
+                let http_addr: SocketAddr =
+                    http_bind.parse().context("invalid --mcp-http address")?;
+                let server_clone = mcp_server.clone();
+                let shutdown_clone = shutdown.clone();
+                http_mcp_handle = Some(tokio::spawn(async move {
+                    if let Err(e) = ctxd_mcp::transport::run_streamable_http(
+                        server_clone,
+                        http_addr,
+                        policy,
+                        shutdown_clone,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "streamable-HTTP transport ended");
+                    }
+                }));
+            }
+
+            // Stdio is special: when it disconnects, only its task ends.
+            // Sibling transports keep running. We spawn it on a task so
+            // we can join all transports symmetrically.
+            let stdio_handle = if mcp_stdio {
+                let server_clone = mcp_server.clone();
+                Some(tokio::spawn(async move {
+                    tracing::info!("MCP server on stdio ready");
+                    if let Err(e) = ctxd_mcp::transport::run_stdio(server_clone).await {
+                        tracing::error!(error = %e, "stdio transport ended");
+                    }
+                }))
+            } else {
+                None
+            };
+
+            // Wait on whichever transports we started. The HTTP admin
+            // API is always running; we always join its handle. The
+            // wire protocol is also always running. MCP transports are
+            // optional — join when present.
+            let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![http_handle, wire_handle];
+            if let Some(h) = stdio_handle {
+                handles.push(h);
+            }
+            if let Some(h) = sse_handle {
+                handles.push(h);
+            }
+            if let Some(h) = http_mcp_handle {
+                handles.push(h);
+            }
+            for h in handles {
+                let _ = h.await;
             }
         }
 
