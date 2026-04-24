@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ctxd_cap::state::{ApprovalDecision, CaveatState, PendingApproval};
 use ctxd_cap::{CapEngine, Operation};
 use ctxd_cli::federation;
 use ctxd_cli::protocol;
@@ -11,6 +12,7 @@ use ctxd_core::signing::EventSigner;
 use ctxd_core::subject::Subject;
 use ctxd_http::build_router;
 use ctxd_mcp::CtxdMcpServer;
+use ctxd_store::caveat_state::SqliteCaveatState;
 use ctxd_store::EventStore;
 use opentelemetry::trace::TracerProvider;
 use protocol::{ProtocolClient, ProtocolServer};
@@ -172,6 +174,19 @@ enum Commands {
         force: bool,
     },
 
+    /// Decide a pending human-approval request (v0.3 `HumanApprovalRequired`).
+    ///
+    /// Reads the approval row from the database and updates it. The
+    /// daemon's verifier task wakes up on the next poll/notify pass.
+    Approve {
+        /// Approval id (the UUIDv7 the daemon emitted at request time).
+        #[arg(long)]
+        id: String,
+        /// Decision to record: `allow` or `deny`.
+        #[arg(long)]
+        decision: String,
+    },
+
     /// Connect to a running ctxd daemon via the wire protocol.
     Connect {
         /// Address of the daemon's wire protocol endpoint.
@@ -301,6 +316,18 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Build the v0.3 stateful-caveat backing once and share it across
+    // every transport that needs to enforce budgets / approvals.
+    // SQLite-backed so values survive a restart.
+    let caveat_state: Arc<dyn CaveatState> = Arc::new(SqliteCaveatState::new(store.clone()));
+
+    // PendingApproval broadcast: any task that emits a new approval
+    // request can publish here so a future notifier adapter (Slack,
+    // email) can subscribe. The daemon itself does not consume the
+    // channel — it's a side-channel for adapters.
+    let (pending_approval_tx, _pending_approval_rx) =
+        tokio::sync::broadcast::channel::<PendingApproval>(64);
+
     match cli.command {
         Commands::Serve {
             bind,
@@ -310,8 +337,11 @@ async fn main() -> Result<()> {
             let addr: SocketAddr = bind.parse().context("invalid bind address")?;
             let wire_addr: SocketAddr = wire_bind.parse().context("invalid wire bind address")?;
             tracing::info!("starting ctxd daemon on {addr}");
+            // Keep the broadcast sender alive for the lifetime of `serve`
+            // so future adapters can `.subscribe()` at any point.
+            let _approval_tx = pending_approval_tx.clone();
 
-            let router = build_router(store.clone(), cap_engine.clone());
+            let router = build_router(store.clone(), cap_engine.clone(), caveat_state.clone());
             let http_handle = tokio::spawn(async move {
                 let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
                 tracing::info!("HTTP admin API listening on {addr}");
@@ -372,7 +402,12 @@ async fn main() -> Result<()> {
             });
 
             if mcp_stdio {
-                let mcp_server = CtxdMcpServer::new(store, cap_engine, format!("ctxd://{addr}"));
+                let mcp_server = CtxdMcpServer::new(
+                    store,
+                    cap_engine,
+                    caveat_state.clone(),
+                    format!("ctxd://{addr}"),
+                );
                 tracing::info!("MCP server on stdio ready");
                 let transport = rmcp::transport::io::stdio();
                 let running = mcp_server
@@ -759,6 +794,34 @@ async fn main() -> Result<()> {
                     "events_considered": report.considered,
                     "events_rewritten": report.rewritten,
                     "batches_committed": report.batches_committed,
+                }))?
+            );
+        }
+
+        Commands::Approve { id, decision } => {
+            let dec = match decision.to_ascii_lowercase().as_str() {
+                "allow" => ApprovalDecision::Allow,
+                "deny" => ApprovalDecision::Deny,
+                other => anyhow::bail!("--decision must be 'allow' or 'deny', got '{other}'"),
+            };
+            // The CLI talks to the daemon's database directly: it
+            // doesn't make sense to require the daemon be running
+            // (ops scenario: emergency deny while serve is down).
+            caveat_state
+                .approval_decide(&id, dec)
+                .await
+                .context("failed to record decision")?;
+            tracing::info!(approval_id = %id, decision = ?dec, "approval decided via CLI");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "approval_id": id,
+                    "decision": match dec {
+                        ApprovalDecision::Allow => "allow",
+                        ApprovalDecision::Deny => "deny",
+                        ApprovalDecision::Pending => "pending",
+                    },
+                    "status": "ok",
                 }))?
             );
         }

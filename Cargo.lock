@@ -821,6 +821,7 @@ dependencies = [
  "ctxd-mcp",
  "ctxd-store",
  "ctxd-store-core",
+ "ctxd-store-sqlite",
  "hex",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -875,11 +876,13 @@ dependencies = [
  "ctxd-cap",
  "ctxd-core",
  "ctxd-store",
+ "http-body-util",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower 0.5.3",
  "tracing",
 ]
 

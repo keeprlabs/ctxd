@@ -41,3 +41,4 @@ tracing-opentelemetry = "0.29"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+ctxd-store-sqlite = { path = "../ctxd-store-sqlite" }
