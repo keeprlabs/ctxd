@@ -34,7 +34,7 @@ pub enum StoreError {
 
 /// The main event store. Owns a SQLite connection pool and provides
 /// append/read operations with hash chain verification.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EventStore {
     pool: SqlitePool,
     /// Optional Ed25519 signing key for event signatures.
@@ -658,6 +658,14 @@ impl EventStore {
         crate::views::graph::GraphView::new(self.pool.clone())
     }
 
+    /// Access the underlying connection pool. Exposed so that the
+    /// `Store` trait impl in [`crate::store_trait`] can perform extra
+    /// queries without re-opening a connection.
+    #[doc(hidden)]
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Get the state of a subject at a specific point in time.
     /// Returns events for this subject with time <= as_of, ordered by seq ASC.
     pub async fn read_at(
@@ -818,13 +826,11 @@ mod tests {
         );
 
         // The event_parents side table should have two rows for this event.
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM event_parents WHERE event_id = ?",
-        )
-        .bind(stored.id.to_string())
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_parents WHERE event_id = ?")
+            .bind(stored.id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
         assert_eq!(count.0, 2);
     }
 

@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
-use ctxd_store::EventStore;
+use ctxd_store_sqlite::EventStore;
 
 fn make_event(subject: &str, index: usize) -> Event {
     Event::new(

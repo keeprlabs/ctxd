@@ -789,9 +789,34 @@ dependencies = [
 name = "ctxd-store"
 version = "0.1.0"
 dependencies = [
+ "ctxd-store-core",
+ "ctxd-store-sqlite",
+]
+
+[[package]]
+name = "ctxd-store-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ctxd-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ctxd-store-sqlite"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
  "chrono",
  "criterion",
  "ctxd-core",
+ "ctxd-store-core",
  "instant-distance",
  "serde",
  "serde_json",

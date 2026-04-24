@@ -1,28 +1,15 @@
 [package]
 name = "ctxd-store"
-description = "SQLite-backed event store with materialized views for ctxd"
+description = "Back-compat re-export shim for ctxd-store-sqlite; new code should depend on ctxd-store-core + a concrete backend."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ctxd-core = { path = "../ctxd-core" }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-chrono = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-instant-distance = "0.6"
-
-[dev-dependencies]
-tempfile = { workspace = true }
-tokio = { workspace = true }
-uuid = { workspace = true }
-criterion = { version = "0.5", features = ["async_tokio"] }
-
-[[bench]]
-name = "store_bench"
-harness = false
+# v0.3: `ctxd-store` is now a back-compat shim re-exporting the default
+# SQLite backend. Downstream crates that want runtime-selectable backends
+# should depend on `ctxd-store-core` (the trait) directly; this shim keeps
+# pre-v0.3 `use ctxd_store::EventStore` imports working while we migrate
+# call sites.
+ctxd-store-sqlite = { path = "../ctxd-store-sqlite" }
+ctxd-store-core = { path = "../ctxd-store-core" }

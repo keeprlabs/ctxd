@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/ctxd-core",
+    "crates/ctxd-store-core",
+    "crates/ctxd-store-sqlite",
     "crates/ctxd-store",
     "crates/ctxd-cap",
     "crates/ctxd-mcp",
