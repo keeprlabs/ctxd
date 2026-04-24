@@ -67,7 +67,7 @@ Poll for events since a timestamp. This is the v0.1 polling mechanism. Real-time
 
 Returns: JSON array of Event objects newer than `since`.
 
-### ctx_entities (v0.2)
+### ctx_entities
 
 Query the graph view for entities.
 
@@ -80,7 +80,7 @@ Query the graph view for entities.
 
 Returns: JSON array of Entity objects.
 
-### ctx_related (v0.2)
+### ctx_related
 
 Query the graph view for relationships.
 
@@ -92,7 +92,7 @@ Query the graph view for relationships.
 
 Returns: JSON array of `{ "relationship": {...}, "entity": {...} }` pairs.
 
-### ctx_timeline (v0.2)
+### ctx_timeline
 
 Query historical state at a point in time.
 

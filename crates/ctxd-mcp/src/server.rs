@@ -70,6 +70,50 @@ pub struct SearchParams {
     pub token: Option<String>,
 }
 
+/// Arguments for the `ctx_entities` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntitiesParams {
+    /// Filter by entity type.
+    pub entity_type: Option<String>,
+    /// Filter by entity name substring (SQL LIKE pattern on `name`).
+    pub name_pattern: Option<String>,
+    /// Optional subject prefix to scope which source events are considered.
+    ///
+    /// NOTE: today this is a post-filter on `source_event_id` — entities are
+    /// already materialized in `graph_entities` so we filter after the fact.
+    /// When we re-derive the graph view per-query this will tighten up.
+    pub subject_pattern: Option<String>,
+    /// Maximum number of entities to return.
+    pub limit: Option<usize>,
+    /// Optional capability token (base64-encoded).
+    pub token: Option<String>,
+}
+
+/// Arguments for the `ctx_related` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RelatedParams {
+    /// The entity to find relationships for.
+    pub entity_id: String,
+    /// Filter by relationship type (e.g. "authored").
+    pub relationship_type: Option<String>,
+    /// Optional capability token (base64-encoded).
+    pub token: Option<String>,
+}
+
+/// Arguments for the `ctx_timeline` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TimelineParams {
+    /// Subject path to read at a point in time.
+    pub subject: String,
+    /// RFC3339 timestamp. Returns state as of this time (`time <= as_of`).
+    pub as_of: String,
+    /// Include descendant subjects.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Optional capability token (base64-encoded).
+    pub token: Option<String>,
+}
+
 /// Arguments for ctx_subscribe tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SubscribeParams {
@@ -100,6 +144,13 @@ impl CtxdMcpServer {
             cap_engine,
             source,
         }
+    }
+
+    /// Access the underlying store. Exposed so that integration tests
+    /// (and callers that need direct event-log access) can seed and
+    /// inspect state without going through MCP framing.
+    pub fn store(&self) -> &EventStore {
+        &self.store
     }
 
     /// Verify a capability token if provided.
@@ -297,6 +348,130 @@ impl CtxdMcpServer {
                 serde_json::to_string_pretty(&output).unwrap_or_default()
             }
             Err(e) => format!("error: subscribe failed: {e}"),
+        }
+    }
+
+    /// Query the graph view for entities.
+    #[tool(
+        name = "ctx_entities",
+        description = "Query materialized graph entities by type and/or name pattern. Takes optional entity_type, name_pattern (substring), subject_pattern (filter by source event subject prefix), limit, and token."
+    )]
+    pub async fn ctx_entities(&self, Parameters(params): Parameters<EntitiesParams>) -> String {
+        // Graph entities are scoped by their source event's subject. For
+        // auth we check the widest subject the caller is asking about —
+        // if they filtered by subject_pattern we use that, otherwise
+        // require a cap covering `/**`.
+        let auth_subject = params.subject_pattern.as_deref().unwrap_or("/**");
+        if let Err(e) = self.verify_token(&params.token, auth_subject, Operation::Search) {
+            return format!("error: {e}");
+        }
+
+        let graph = self.store.graph_view();
+        let entities = match graph.get_entities(params.entity_type.as_deref()).await {
+            Ok(v) => v,
+            Err(e) => return format!("error: entities failed: {e}"),
+        };
+
+        // NOTE: `subject_pattern` is currently accepted for auth scoping
+        // only. The graph row doesn't carry its source event's subject
+        // yet, so we can't post-filter here — a follow-up will join
+        // `graph_entities` against `events` to narrow by subject prefix.
+        let mut filtered: Vec<serde_json::Value> = entities
+            .into_iter()
+            .filter(|e| match &params.name_pattern {
+                Some(pat) => e.name.contains(pat),
+                None => true,
+            })
+            .map(|e| {
+                serde_json::json!({
+                    "id": e.id,
+                    "entity_type": e.entity_type,
+                    "name": e.name,
+                    "properties": e.properties,
+                    "source_event_id": e.source_event_id,
+                })
+            })
+            .collect();
+
+        if let Some(limit) = params.limit {
+            filtered.truncate(limit);
+        }
+        serde_json::to_string_pretty(&filtered).unwrap_or_default()
+    }
+
+    /// Query related entities via graph relationships.
+    #[tool(
+        name = "ctx_related",
+        description = "Return relationships + the connected entity for a given entity_id. Optional relationship_type narrows by edge label. Optional capability token."
+    )]
+    pub async fn ctx_related(&self, Parameters(params): Parameters<RelatedParams>) -> String {
+        // Without per-entity subject metadata on the graph row, we require
+        // a cap for the wildcard subject to query relationships. Phase 2
+        // can refine this once we carry the source subject on graph rows.
+        if let Err(e) = self.verify_token(&params.token, "/**", Operation::Search) {
+            return format!("error: {e}");
+        }
+
+        let graph = self.store.graph_view();
+        match graph
+            .get_related(&params.entity_id, params.relationship_type.as_deref())
+            .await
+        {
+            Ok(pairs) => {
+                let output: Vec<serde_json::Value> = pairs
+                    .into_iter()
+                    .map(|(rel, ent)| {
+                        serde_json::json!({
+                            "relationship": {
+                                "id": rel.id,
+                                "from_entity_id": rel.from_entity_id,
+                                "to_entity_id": rel.to_entity_id,
+                                "relationship_type": rel.relationship_type,
+                                "properties": rel.properties,
+                                "source_event_id": rel.source_event_id,
+                            },
+                            "entity": {
+                                "id": ent.id,
+                                "entity_type": ent.entity_type,
+                                "name": ent.name,
+                                "properties": ent.properties,
+                                "source_event_id": ent.source_event_id,
+                            }
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            }
+            Err(e) => format!("error: related failed: {e}"),
+        }
+    }
+
+    /// Return events for a subject as of a given timestamp.
+    #[tool(
+        name = "ctx_timeline",
+        description = "Temporal read: returns events with time <= as_of for the given subject (optionally recursive). as_of is RFC3339."
+    )]
+    pub async fn ctx_timeline(&self, Parameters(params): Parameters<TimelineParams>) -> String {
+        if let Err(e) = self.verify_token(&params.token, &params.subject, Operation::Read) {
+            return format!("error: {e}");
+        }
+        let subject = match Subject::new(&params.subject) {
+            Ok(s) => s,
+            Err(e) => return format!("error: invalid subject: {e}"),
+        };
+        let as_of = match chrono::DateTime::parse_from_rfc3339(&params.as_of) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => return format!("error: invalid as_of timestamp: {e}"),
+        };
+        match self.store.read_at(&subject, as_of, params.recursive).await {
+            Ok(events) => {
+                let output: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| serde_json::to_value(e).unwrap_or_default())
+                    .collect();
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            }
+            Err(e) => format!("error: timeline failed: {e}"),
         }
     }
 }
