@@ -279,6 +279,24 @@ impl InMemoryCaveatState {
             .or_insert_with(|| Arc::new(Notify::new()))
             .clone())
     }
+
+    /// Test helper: return the id of any pending approval, or `None`.
+    ///
+    /// Integration tests (`approval_request_then_*.rs`) drive
+    /// `verify_with_state` in a spawned task and then need to fish
+    /// the just-generated approval id back out — this scan is the
+    /// simplest way to do it without exposing internal storage.
+    /// Production code should never need this.
+    pub fn test_first_pending_approval(&self) -> Option<String> {
+        let g = self.approvals.lock().ok()?;
+        g.iter().find_map(|(id, dec)| {
+            if *dec == ApprovalDecision::Pending {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[async_trait]
