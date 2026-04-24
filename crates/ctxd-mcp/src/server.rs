@@ -3,10 +3,12 @@
 use ctxd_cap::{CapEngine, Operation};
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
+use ctxd_embed::Embedder;
 use ctxd_store::EventStore;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Arguments for ctx_write tool.
@@ -68,6 +70,9 @@ pub struct SearchParams {
     pub k: Option<usize>,
     /// Optional capability token (base64-encoded).
     pub token: Option<String>,
+    /// Search mode: `fts`, `vector`, or `hybrid`. Default: `hybrid`
+    /// when an embedder is configured, `fts` otherwise.
+    pub search_mode: Option<String>,
 }
 
 /// Arguments for the `ctx_entities` tool.
@@ -134,6 +139,9 @@ pub struct CtxdMcpServer {
     store: EventStore,
     cap_engine: Arc<CapEngine>,
     source: String,
+    /// Optional embedder used by `ctx_search` in `vector` and
+    /// `hybrid` modes. When `None`, those modes degrade to `fts`.
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl CtxdMcpServer {
@@ -143,7 +151,21 @@ impl CtxdMcpServer {
             store,
             cap_engine,
             source,
+            embedder: None,
         }
+    }
+
+    /// Install an embedder. Subsequent `ctx_search` calls will
+    /// default to hybrid mode and accept `vector` / `hybrid` mode
+    /// requests.
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Borrow the configured embedder, if any.
+    pub fn embedder(&self) -> Option<&Arc<dyn Embedder>> {
+        self.embedder.as_ref()
     }
 
     /// Access the underlying store. Exposed so that integration tests
@@ -168,6 +190,216 @@ impl CtxdMcpServer {
         }
         Ok(())
     }
+
+    /// Render a Vec<Event> as the existing JSON-pretty output.
+    fn events_to_json(events: &[Event]) -> String {
+        let v: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap_or_default())
+            .collect();
+        serde_json::to_string_pretty(&v).unwrap_or_default()
+    }
+
+    /// Run a pure-FTS search and return JSON output.
+    async fn run_fts_only<F>(&self, query: &str, k: usize, prefix_filter: &F) -> String
+    where
+        F: Fn(&Event) -> bool,
+    {
+        match self.store.search(query, Some(k)).await {
+            Ok(events) => {
+                let filtered: Vec<Event> =
+                    events.into_iter().filter(prefix_filter).take(k).collect();
+                Self::events_to_json(&filtered)
+            }
+            Err(e) => format!("error: search failed: {e}"),
+        }
+    }
+
+    /// Embed `query` with the configured embedder and run vector search.
+    async fn run_vector_only<F>(&self, query: &str, k: usize, prefix_filter: &F) -> String
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let embedder = match &self.embedder {
+            Some(e) => e,
+            None => return "error: vector search requires an embedder".to_string(),
+        };
+        let qvec = match embedder.embed(query).await {
+            Ok(v) => v,
+            Err(e) => return format!("error: embed failed: {e}"),
+        };
+        // Pull more than k from the vector index so the
+        // post-filter (subject_pattern) can still surface k.
+        let pull = k.saturating_mul(4).max(k);
+        let hits = match self.store.vector_search_impl(&qvec, pull).await {
+            Ok(h) => h,
+            Err(e) => return format!("error: vector search failed: {e}"),
+        };
+        let events = match self
+            .events_for_ids(hits.iter().map(|h| h.event_id.as_str()))
+            .await
+        {
+            Ok(m) => {
+                let mut out = Vec::with_capacity(hits.len());
+                for h in hits {
+                    if let Some(ev) = m.get(h.event_id.as_str()) {
+                        if prefix_filter(ev) {
+                            out.push(ev.clone());
+                            if out.len() >= k {
+                                break;
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            Err(e) => return format!("error: vector lookup failed: {e}"),
+        };
+        Self::events_to_json(&events)
+    }
+
+    /// Hybrid: union FTS + vector results via RRF, then return events.
+    async fn run_hybrid<F>(&self, query: &str, k: usize, prefix_filter: &F) -> String
+    where
+        F: Fn(&Event) -> bool,
+    {
+        // We over-pull from each side so RRF has enough candidates
+        // to find docs in both lists.
+        let pull = k.saturating_mul(4).max(20);
+        let fts_events = match self.store.search(query, Some(pull)).await {
+            Ok(v) => v,
+            Err(e) => return format!("error: fts failed: {e}"),
+        };
+        let fts_ids: Vec<String> = fts_events.iter().map(|e| e.id.to_string()).collect();
+        let vec_ids: Vec<String> = match &self.embedder {
+            Some(embedder) => match embedder.embed(query).await {
+                Ok(qvec) => match self.store.vector_search_impl(&qvec, pull).await {
+                    Ok(hits) => hits.into_iter().map(|h| h.event_id).collect(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "hybrid: vector path failed; using FTS only");
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "hybrid: embed failed; using FTS only");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let lists: &[&[String]] = &[fts_ids.as_slice(), vec_ids.as_slice()];
+        let fused = reciprocal_rank_fusion(lists, k.saturating_mul(2).max(k));
+        // Resolve fused ids -> Events. Prefer the FTS-result events
+        // we already have to avoid a second SQL round-trip; fall back
+        // to per-id lookup for vector-only ids.
+        let mut have: HashMap<String, Event> = fts_events
+            .into_iter()
+            .map(|e| (e.id.to_string(), e))
+            .collect();
+        let need: Vec<&str> = fused
+            .iter()
+            .filter(|id| !have.contains_key(id.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !need.is_empty() {
+            match self.events_for_ids(need.into_iter()).await {
+                Ok(m) => {
+                    for (k, v) in m {
+                        have.insert(k, v);
+                    }
+                }
+                Err(e) => return format!("error: hybrid lookup failed: {e}"),
+            }
+        }
+        let mut out = Vec::with_capacity(k);
+        for id in fused {
+            if let Some(ev) = have.remove(&id) {
+                if prefix_filter(&ev) {
+                    out.push(ev);
+                    if out.len() >= k {
+                        break;
+                    }
+                }
+            }
+        }
+        Self::events_to_json(&out)
+    }
+
+    /// Look up a batch of events by id. Returns a `HashMap` keyed
+    /// by stringified UUID. Missing ids are silently dropped.
+    async fn events_for_ids<'a, I>(&self, ids: I) -> Result<HashMap<String, Event>, String>
+    where
+        I: Iterator<Item = &'a str>,
+    {
+        let ids: Vec<String> = ids.map(|s| s.to_string()).collect();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // We don't have a "get by id" on the store yet; do a recursive
+        // read from root and filter. For typical k≤50 this is the
+        // simplest correct path; an `events_by_ids` helper is a
+        // worthwhile follow-up.
+        let root = match Subject::new("/") {
+            Ok(s) => s,
+            Err(e) => return Err(format!("invalid root subject: {e}")),
+        };
+        let all = match self.store.read(&root, true).await {
+            Ok(v) => v,
+            Err(e) => return Err(format!("read failed: {e}")),
+        };
+        let mut by_id: HashMap<String, Event> = HashMap::with_capacity(ids.len());
+        for ev in all {
+            let s = ev.id.to_string();
+            if ids.iter().any(|i| i == &s) {
+                by_id.insert(s, ev);
+            }
+        }
+        Ok(by_id)
+    }
+}
+
+/// Search mode selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Fts,
+    Vector,
+    Hybrid,
+}
+
+/// RRF constant from the original 2009 Cormack/Clarke/Buettcher
+/// paper. The value bounds the score contribution from very low
+/// ranks; 60 is the convention everyone (Elastic, Vespa, Anserini)
+/// has settled on. We expose it as a constant so the choice is
+/// auditable from a single line. See
+/// `docs/decisions/015-hybrid-search-rrf.md` for rationale.
+const RRF_K_CONST: f32 = 60.0;
+
+/// Reciprocal Rank Fusion over multiple ranked id lists.
+///
+/// For each id, sums `1 / (RRF_K_CONST + rank_i)` across every
+/// list it appears in. Returns ids sorted by descending fused
+/// score, taking at most `k`.
+fn reciprocal_rank_fusion(lists: &[&[String]], k: usize) -> Vec<String> {
+    let mut scores: HashMap<&str, f32> = HashMap::new();
+    for list in lists {
+        for (rank, id) in list.iter().enumerate() {
+            let s = scores.entry(id.as_str()).or_insert(0.0);
+            // Ranks are 0-indexed in our slice but the RRF formula
+            // is conventionally 1-indexed — `rank + 1` matches the paper.
+            *s += 1.0 / (RRF_K_CONST + (rank as f32 + 1.0));
+        }
+    }
+    let mut by_score: Vec<(&str, f32)> = scores.into_iter().collect();
+    by_score.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    by_score
+        .into_iter()
+        .take(k)
+        .map(|(s, _)| s.to_string())
+        .collect()
 }
 
 #[tool_router(server_handler)]
@@ -276,39 +508,49 @@ impl CtxdMcpServer {
         }
     }
 
-    /// Full-text search over context events.
+    /// Full-text / vector / hybrid search over context events.
     #[tool(
         name = "ctx_search",
-        description = "Full-text search over context events. Takes query (string), optional subject_pattern (prefix filter), optional k (max results, default 10), and optional token."
+        description = "Search context events. `search_mode` is `fts` (default when no embedder), `vector` (embed query, k-NN over the HNSW index), or `hybrid` (RRF fusion of FTS + vector, default when an embedder is configured). Takes query, optional subject_pattern, k (default 10), search_mode, and token."
     )]
-    async fn ctx_search(&self, Parameters(params): Parameters<SearchParams>) -> String {
-        // Use subject_pattern for token verification if provided, otherwise use wildcard
+    pub async fn ctx_search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         let subject_for_auth = params.subject_pattern.as_deref().unwrap_or("/**");
         if let Err(e) = self.verify_token(&params.token, subject_for_auth, Operation::Search) {
             return format!("error: {e}");
         }
 
         let k = params.k.unwrap_or(10);
-
-        match self.store.search(&params.query, Some(k)).await {
-            Ok(events) => {
-                let filtered: Vec<&ctxd_core::event::Event> =
-                    if let Some(ref pattern) = params.subject_pattern {
-                        events
-                            .iter()
-                            .filter(|e| e.subject.as_str().starts_with(pattern.as_str()))
-                            .take(k)
-                            .collect()
-                    } else {
-                        events.iter().take(k).collect()
-                    };
-                let output: Vec<serde_json::Value> = filtered
-                    .iter()
-                    .map(|e| serde_json::to_value(e).unwrap_or_default())
-                    .collect();
-                serde_json::to_string_pretty(&output).unwrap_or_default()
+        let mode = match params.search_mode.as_deref() {
+            Some("fts") => SearchMode::Fts,
+            Some("vector") => SearchMode::Vector,
+            Some("hybrid") => SearchMode::Hybrid,
+            Some(other) => {
+                return format!(
+                    "error: unknown search_mode '{other}' (expected fts|vector|hybrid)"
+                );
             }
-            Err(e) => format!("error: search failed: {e}"),
+            None => {
+                if self.embedder.is_some() {
+                    SearchMode::Hybrid
+                } else {
+                    SearchMode::Fts
+                }
+            }
+        };
+
+        // Helper: filter events by subject_pattern when set.
+        let pattern = params.subject_pattern.clone();
+        let prefix_filter = move |e: &Event| -> bool {
+            match &pattern {
+                Some(p) => e.subject.as_str().starts_with(p.as_str()),
+                None => true,
+            }
+        };
+
+        match mode {
+            SearchMode::Fts => self.run_fts_only(&params.query, k, &prefix_filter).await,
+            SearchMode::Vector => self.run_vector_only(&params.query, k, &prefix_filter).await,
+            SearchMode::Hybrid => self.run_hybrid(&params.query, k, &prefix_filter).await,
         }
     }
 

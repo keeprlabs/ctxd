@@ -357,6 +357,18 @@ async fn main() -> Result<()> {
             // Install on the store so `append` auto-embeds when the
             // event has indexable text.
             store.set_embedder(embedder_arc.clone());
+            // Open the persisted HNSW index. The dimensions match
+            // the active embedder so a previously-persisted index
+            // built with a different model is detected as a
+            // dimension mismatch and rebuilt.
+            let vec_cfg = ctxd_store::views::vector::VectorIndexConfig {
+                dimensions: embedder_arc.dimensions(),
+                ..Default::default()
+            };
+            let _vec_idx = store
+                .ensure_vector_index(vec_cfg)
+                .await
+                .context("failed to open HNSW vector index")?;
 
             let router = build_router(store.clone(), cap_engine.clone());
             let http_handle = tokio::spawn(async move {
@@ -419,7 +431,8 @@ async fn main() -> Result<()> {
             });
 
             if mcp_stdio {
-                let mcp_server = CtxdMcpServer::new(store, cap_engine, format!("ctxd://{addr}"));
+                let mcp_server = CtxdMcpServer::new(store, cap_engine, format!("ctxd://{addr}"))
+                    .with_embedder(embedder_arc.clone());
                 tracing::info!("MCP server on stdio ready");
                 let transport = rmcp::transport::io::stdio();
                 let running = mcp_server

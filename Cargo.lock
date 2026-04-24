@@ -936,9 +936,11 @@ dependencies = [
 name = "ctxd-mcp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "ctxd-cap",
  "ctxd-core",
+ "ctxd-embed",
  "ctxd-store",
  "rmcp",
  "schemars",
