@@ -409,11 +409,8 @@ async fn main() -> Result<()> {
             // Build the shared MCP server. Each transport gets its own
             // logical clone (CtxdMcpServer is cheap to clone — store +
             // cap engine are Arc-backed).
-            let mcp_server = CtxdMcpServer::new(
-                store.clone(),
-                cap_engine.clone(),
-                format!("ctxd://{addr}"),
-            );
+            let mcp_server =
+                CtxdMcpServer::new(store.clone(), cap_engine.clone(), format!("ctxd://{addr}"));
 
             // Auth policy applies to HTTP transports only. Stdio is
             // local-subprocess and keeps the legacy "open by default"
@@ -432,18 +429,13 @@ async fn main() -> Result<()> {
 
             let mut sse_handle: Option<tokio::task::JoinHandle<()>> = None;
             if let Some(sse_bind) = mcp_sse {
-                let sse_addr: SocketAddr =
-                    sse_bind.parse().context("invalid --mcp-sse address")?;
+                let sse_addr: SocketAddr = sse_bind.parse().context("invalid --mcp-sse address")?;
                 let server_clone = mcp_server.clone();
                 let shutdown_clone = shutdown.clone();
                 sse_handle = Some(tokio::spawn(async move {
-                    if let Err(e) = ctxd_mcp::transport::run_sse(
-                        server_clone,
-                        sse_addr,
-                        policy,
-                        shutdown_clone,
-                    )
-                    .await
+                    if let Err(e) =
+                        ctxd_mcp::transport::run_sse(server_clone, sse_addr, policy, shutdown_clone)
+                            .await
                     {
                         tracing::error!(error = %e, "SSE transport ended");
                     }

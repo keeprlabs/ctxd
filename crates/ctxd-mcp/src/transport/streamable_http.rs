@@ -83,10 +83,7 @@ pub async fn run_streamable_http(
 
     let app = Router::new()
         .nest_service("/mcp", service)
-        .layer(axum::middleware::from_fn_with_state(
-            auth_cfg,
-            auth_layer,
-        ));
+        .layer(axum::middleware::from_fn_with_state(auth_cfg, auth_layer));
 
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     let serve_fut = axum::serve(listener, make_service)

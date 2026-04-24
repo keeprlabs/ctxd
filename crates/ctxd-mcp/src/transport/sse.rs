@@ -107,10 +107,7 @@ pub async fn run_sse(
         .route("/sse", get(sse_handler))
         .route("/messages", post(messages_handler))
         .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(
-            auth_cfg,
-            auth_layer,
-        ));
+        .layer(axum::middleware::from_fn_with_state(auth_cfg, auth_layer));
 
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     let serve_fut = axum::serve(listener, make_service)
@@ -125,10 +122,7 @@ pub async fn run_sse(
 /// `GET /sse`: open a session and emit an `endpoint` event followed by
 /// any server→client messages produced by tool calls posted to
 /// `/messages?sessionId=…`.
-async fn sse_handler(
-    State(state): State<SseState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn sse_handler(State(state): State<SseState>, headers: HeaderMap) -> impl IntoResponse {
     // Tracing: client connection. We don't have remote_addr at hand here
     // because axum middleware already consumed the ConnectInfo extraction
     // earlier (its `from_fn_with_state` does not propagate by default for
@@ -140,8 +134,7 @@ async fn sse_handler(
     // response stream. rmcp's `serve_directly` runs the handler against
     // a transport built from these.
     let (in_tx, in_rx) = mpsc::channel::<RxJsonRpcMessage<RoleServer>>(64);
-    let (out_tx, out_rx) =
-        mpsc::channel::<TxJsonRpcMessage<RoleServer>>(64);
+    let (out_tx, out_rx) = mpsc::channel::<TxJsonRpcMessage<RoleServer>>(64);
 
     state
         .sessions
@@ -169,7 +162,10 @@ async fn sse_handler(
             _ = running.waiting() => {}
             _ = cancel.cancelled() => {}
         }
-        sessions_for_cleanup.write().await.remove(&session_for_cleanup);
+        sessions_for_cleanup
+            .write()
+            .await
+            .remove(&session_for_cleanup);
         tracing::debug!(session_id = %session_for_cleanup, "SSE session ended");
     });
 

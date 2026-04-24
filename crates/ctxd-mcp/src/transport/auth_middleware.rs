@@ -112,11 +112,7 @@ pub async fn auth_layer(
             tool_name = ?tool_name,
             "rejecting unauthenticated tool call (require-auth on)"
         );
-        return (
-            StatusCode::UNAUTHORIZED,
-            "Missing capability token",
-        )
-            .into_response();
+        return (StatusCode::UNAUTHORIZED, "Missing capability token").into_response();
     }
 
     tracing::info!(
@@ -164,16 +160,28 @@ fn rewrite_token_in_jsonrpc(
     let body_token_present = json_has_token_arg(&value);
 
     if let Some(header_tok) = header_token {
+        let mut mutated = false;
         match &mut value {
             serde_json::Value::Array(items) => {
                 for item in items.iter_mut() {
-                    inject_token(item, header_tok);
+                    if inject_token(item, header_tok) {
+                        mutated = true;
+                    }
                 }
             }
             obj @ serde_json::Value::Object(_) => {
-                inject_token(obj, header_tok);
+                if inject_token(obj, header_tok) {
+                    mutated = true;
+                }
             }
             _ => {}
+        }
+        if !mutated {
+            // Header was supplied but the body wasn't a `tools/call`
+            // we know how to rewrite — pass through verbatim so we
+            // don't perturb byte-for-byte equality the caller may
+            // depend on (e.g. signed body envelopes).
+            return (bytes.to_vec(), tool_name, body_token_present);
         }
         let bytes = match serde_json::to_vec(&value) {
             Ok(v) => v,
@@ -199,18 +207,21 @@ fn extract_tool_name(value: &serde_json::Value) -> Option<String> {
     Some(name.to_string())
 }
 
-fn inject_token(value: &mut serde_json::Value, header_token: &str) {
+/// Inject `header_token` into a JSON-RPC object's
+/// `params.arguments.token` field. Returns `true` when a mutation
+/// actually happened, `false` otherwise.
+fn inject_token(value: &mut serde_json::Value, header_token: &str) -> bool {
     let Some(obj) = value.as_object_mut() else {
-        return;
+        return false;
     };
     if obj.get("method").and_then(|v| v.as_str()) != Some("tools/call") {
-        return;
+        return false;
     }
     let Some(params) = obj.get_mut("params") else {
-        return;
+        return false;
     };
     let Some(params_obj) = params.as_object_mut() else {
-        return;
+        return false;
     };
     let arguments = params_obj
         .entry("arguments")
@@ -221,7 +232,9 @@ fn inject_token(value: &mut serde_json::Value, header_token: &str) {
             "token".to_string(),
             serde_json::Value::String(header_token.to_string()),
         );
+        return true;
     }
+    false
 }
 
 fn json_has_token_arg(value: &serde_json::Value) -> bool {

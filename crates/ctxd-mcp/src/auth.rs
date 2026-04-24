@@ -120,10 +120,7 @@ mod tests {
 
     #[test]
     fn bearer_simple() {
-        assert_eq!(
-            extract_bearer_token("Bearer abc"),
-            Some("abc".to_string())
-        );
+        assert_eq!(extract_bearer_token("Bearer abc"), Some("abc".to_string()));
     }
 
     #[test]
