@@ -41,6 +41,41 @@ pub enum CapError {
     /// Base64 decoding error.
     #[error("base64 error: {0}")]
     Base64(String),
+
+    /// A `BudgetLimit` caveat declared a cap that has been exceeded by
+    /// the cumulative cost of all prior verifies plus this one.
+    #[error("budget exceeded for {currency}: {spent} > {limit}")]
+    BudgetExceeded {
+        /// Currency code declared on the caveat.
+        currency: String,
+        /// Cumulative spend (post-increment) in micro-units.
+        spent: i64,
+        /// Declared cap in micro-units.
+        limit: i64,
+    },
+
+    /// A `HumanApprovalRequired` caveat was satisfied with an explicit
+    /// `Deny` decision.
+    #[error("approval denied: {approval_id}")]
+    ApprovalDenied {
+        /// The approval id that was denied.
+        approval_id: String,
+    },
+
+    /// A `HumanApprovalRequired` caveat was not decided within the
+    /// verifier's timeout.
+    #[error("approval timed out: {approval_id}")]
+    ApprovalTimeout {
+        /// The approval id that timed out.
+        approval_id: String,
+    },
+
+    /// The token requires human approval but no [`state::CaveatState`]
+    /// was supplied to [`CapEngine::verify_with_state`]. We refuse to
+    /// silently downgrade — surfacing this lets callers fix their
+    /// wiring rather than ship an unenforced caveat.
+    #[error("token carries requires_approval but no CaveatState was provided to enforce it")]
+    ApprovalStateMissing,
 }
 
 /// The operations that can be authorized.
