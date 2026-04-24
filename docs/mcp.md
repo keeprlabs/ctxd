@@ -151,6 +151,24 @@ When no token is provided, the operation is allowed. This is the default for loc
 
 Tokens are base64-encoded biscuit tokens. Mint them with `ctxd grant` or `POST /v1/grant`.
 
+### Stateful caveats can block on human approval (v0.3)
+
+If a token carries a `requires_approval(<op>)` caveat (see
+[`HumanApprovalRequired`](capabilities.md#human-approval-required)),
+the verifier will pause the MCP tool call until a human decides via
+`ctxd approve <id> --decision allow|deny` or
+`POST /v1/approvals/:id/decide`. The MCP server uses a
+**5-minute timeout by default**.
+
+**Clients should set generous tool-call timeouts.** A read-only tool
+returning in 200 ms is normal; a `ctx_write` against a token gated
+by approval can legitimately take minutes. If your MCP client has a
+tool-call timeout below the daemon's `DEFAULT_APPROVAL_TIMEOUT`
+(`5 * 60s`), bump it. Otherwise the client will give up before the
+daemon times out and you'll see spurious "request cancelled" errors.
+
+Budget caveats are evaluated synchronously and never block.
+
 ## Error handling
 
 Tool calls never fail at the MCP protocol level. Errors are returned as content in the tool result:
@@ -158,5 +176,8 @@ Tool calls never fail at the MCP protocol level. Errors are returned as content 
 - Authorization failures: `"error: authorization denied: ..."`
 - Invalid subjects: `"error: invalid subject: ..."`
 - Store errors: `"error: read failed: ..."` / `"error: write failed: ..."`
+- Budget exhausted (v0.3): `"error: budget exceeded for USD: 11000 > 10000"`
+- Approval denied (v0.3): `"error: approval denied: <id>"`
+- Approval timeout (v0.3): `"error: approval timed out: <id>"`
 
 The MCP client (Claude, Cursor) will see these as text content and can interpret them.
