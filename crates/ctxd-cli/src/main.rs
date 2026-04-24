@@ -287,7 +287,7 @@ async fn main() -> Result<()> {
                         signer
                     }
                 };
-                event.signature = Some(signer.sign(&event));
+                event.signature = Some(signer.sign(&event).context("failed to sign event")?);
             }
 
             let stored = store.append(event).await.context("write failed")?;
