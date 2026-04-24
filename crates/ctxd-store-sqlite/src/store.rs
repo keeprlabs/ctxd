@@ -427,7 +427,11 @@ impl EventStore {
                 .await?;
         }
 
-        // Update KV view
+        // Update KV view under the federation LWW rule (ADR 006):
+        // overwrite the row only when the incoming event has a strictly
+        // greater `(time, event_id)` tuple. UUIDv7 ids are
+        // lexicographically monotonic in their embedded ms timestamp,
+        // so the same SQL works as a deterministic tiebreak.
         sqlx::query(
             r#"
             INSERT INTO kv_view (subject, event_id, data, updated_at)
@@ -436,6 +440,7 @@ impl EventStore {
                 event_id = excluded.event_id,
                 data = excluded.data,
                 updated_at = excluded.updated_at
+            WHERE (excluded.updated_at, excluded.event_id) > (kv_view.updated_at, kv_view.event_id)
             "#,
         )
         .bind(&subject)
