@@ -753,6 +753,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "ctxd-adapter-core",
  "ctxd-core",
@@ -763,6 +764,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

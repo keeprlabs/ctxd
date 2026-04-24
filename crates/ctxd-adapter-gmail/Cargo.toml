@@ -26,10 +26,17 @@ hmac = "0.12"
 sha2 = { workspace = true }
 rand = "0.8"
 
+# Encoding (Gmail body parts are base64url)
+base64 = "0.22"
+
+# Embedded sqlite for sync cursor + idempotency state
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 wiremock = "0.6"
 serde_json = { workspace = true }
 async-trait = "0.1"
+base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
