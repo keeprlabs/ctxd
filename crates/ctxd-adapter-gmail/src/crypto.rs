@@ -20,7 +20,7 @@
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Nonce,
 };
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
@@ -100,12 +100,12 @@ pub fn encrypt(master_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoErr
     OsRng.fill_bytes(&mut nonce_bytes);
 
     let aes_key = derive_aes_key(master_key, &salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|_| CryptoError::KeyDerivation)?;
+    let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad: AEAD_AAD,
@@ -136,12 +136,13 @@ pub fn decrypt(master_key: &[u8], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let ciphertext = &blob[SALT_LEN + NONCE_LEN..];
 
     let aes_key = derive_aes_key(master_key, salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|_| CryptoError::KeyDerivation)?;
+    let nonce_arr: [u8; NONCE_LEN] = nonce_bytes.try_into().map_err(|_| CryptoError::Truncated)?;
+    let nonce = Nonce::from(nonce_arr);
 
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad: AEAD_AAD,
