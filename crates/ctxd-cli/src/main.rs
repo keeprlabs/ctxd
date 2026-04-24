@@ -1,12 +1,11 @@
 //! ctxd — context substrate daemon for AI agents.
 
-mod protocol;
-mod query;
-mod rate_limit;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ctxd_cap::{CapEngine, Operation};
+use ctxd_cli::federation;
+use ctxd_cli::protocol;
+use ctxd_cli::query;
 use ctxd_core::event::Event;
 use ctxd_core::signing::EventSigner;
 use ctxd_core::subject::Subject;
@@ -188,20 +187,31 @@ enum Commands {
 /// Federation peer management actions.
 #[derive(Subcommand)]
 enum PeerAction {
-    /// Register a peer locally.
+    /// Register a peer locally and (when `--url` is set) perform the
+    /// `PeerHello` ↔ `PeerWelcome` handshake against it.
+    ///
+    /// When `--public-key` is provided we verify the welcome's pubkey
+    /// matches; otherwise we accept whatever the remote returns. Use
+    /// `--auto-accept` to skip the handshake (manual enrollment) — the
+    /// peer is still recorded but no cap exchange happens.
     Add {
         /// Local identifier for the peer (often the remote's pubkey hex).
         #[arg(long)]
         peer_id: String,
-        /// URL to dial (e.g. `tcp://host:port`).
+        /// URL to dial (e.g. `127.0.0.1:7778`).
         #[arg(long)]
         url: String,
-        /// Remote's Ed25519 public key, 64 hex chars (32 bytes).
+        /// Remote's Ed25519 public key, 64 hex chars (32 bytes). Optional
+        /// when handshaking — we'll accept whatever the welcome carries.
         #[arg(long)]
-        public_key: String,
+        public_key: Option<String>,
         /// Comma-separated subject globs to grant this peer.
         #[arg(long, default_value = "/**")]
         subjects: String,
+        /// Skip the handshake and just record the peer locally. Useful
+        /// for offline enrollment or test fixtures. Requires `--public-key`.
+        #[arg(long, default_value_t = false)]
+        manual: bool,
     },
     /// List all registered peers.
     List,
@@ -308,8 +318,53 @@ async fn main() -> Result<()> {
                 axum::serve(listener, router).await.unwrap();
             });
 
-            // Spawn wire protocol server (MessagePack over TCP).
+            // Bootstrap federation. Requires a local signing key — create
+            // one if absent so federation always has a stable identity.
+            let signing_bytes = match store.get_metadata("signing_key").await? {
+                Some(b) => b,
+                None => {
+                    let signer = ctxd_core::signing::EventSigner::new();
+                    store
+                        .set_metadata("signing_key", &signer.secret_key_bytes())
+                        .await?;
+                    store
+                        .set_metadata("signing_public_key", &signer.public_key_bytes())
+                        .await?;
+                    signer.secret_key_bytes()
+                }
+            };
+            let signer = ctxd_core::signing::EventSigner::from_bytes(&signing_bytes)
+                .map_err(|e| anyhow::anyhow!("bad signing key: {e}"))?;
+            let local_peer_id = hex::encode(signer.public_key_bytes());
+            tracing::info!(local_peer_id = %local_peer_id, "federation identity ready");
+
+            // Spawn wire protocol server (MessagePack over TCP) with
+            // federation attached.
             let wire_server = ProtocolServer::new(store.clone(), cap_engine.clone(), wire_addr);
+            let event_tx_for_fed = wire_server.event_sender();
+            let fed = std::sync::Arc::new(federation::PeerManager::new(
+                std::sync::Arc::new(store.clone()),
+                cap_engine.clone(),
+                local_peer_id,
+                signing_bytes,
+                event_tx_for_fed,
+                federation::AutoAcceptPolicy::from_env(),
+            ));
+            // Re-enroll persisted peers so outbound replication can
+            // dial them without manual `peer add` after restart.
+            for p in store.peer_list_impl().await? {
+                fed.enroll(federation::EnrolledPeer {
+                    peer_id: p.peer_id.clone(),
+                    remote_pubkey: p.public_key,
+                    remote_grants_us: p.granted_subjects.clone(),
+                    we_grant_remote: p.granted_subjects,
+                    cap_from_remote: None,
+                    cap_for_remote: None,
+                })
+                .await;
+            }
+            let _replication_handle = fed.start_replication_tasks();
+            let wire_server = wire_server.with_federation(fed.clone());
             let wire_handle = tokio::spawn(async move {
                 if let Err(e) = wire_server.run().await {
                     tracing::error!("Wire protocol server error: {e}");
@@ -504,32 +559,96 @@ async fn main() -> Result<()> {
                     url,
                     public_key,
                     subjects,
+                    manual,
                 } => {
-                    let pk_bytes = hex::decode(&public_key).context("invalid hex public key")?;
-                    if pk_bytes.len() != 32 {
-                        anyhow::bail!(
-                            "public key must be 32 bytes (64 hex chars); got {}",
-                            pk_bytes.len()
-                        );
-                    }
                     let granted: Vec<String> = subjects
                         .split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
-                    let peer = Peer {
-                        peer_id: peer_id.clone(),
-                        url,
-                        public_key: pk_bytes,
-                        granted_subjects: granted,
-                        trust_level: serde_json::json!({"auto_accept": false}),
-                        added_at: chrono::Utc::now(),
-                    };
-                    store
-                        .peer_add_impl(peer)
-                        .await
-                        .context("failed to add peer")?;
-                    println!("peer {peer_id} added");
+
+                    if manual {
+                        // Offline enrollment: just record the peer row.
+                        // public_key is required.
+                        let pk_hex = public_key.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("--public-key is required when --manual")
+                        })?;
+                        let pk_bytes = hex::decode(pk_hex).context("invalid hex public key")?;
+                        if pk_bytes.len() != 32 {
+                            anyhow::bail!(
+                                "public key must be 32 bytes (64 hex chars); got {}",
+                                pk_bytes.len()
+                            );
+                        }
+                        let peer = Peer {
+                            peer_id: peer_id.clone(),
+                            url,
+                            public_key: pk_bytes,
+                            granted_subjects: granted,
+                            trust_level: serde_json::json!({"auto_accept": false}),
+                            added_at: chrono::Utc::now(),
+                        };
+                        store
+                            .peer_add_impl(peer)
+                            .await
+                            .context("failed to add peer")?;
+                        println!("peer {peer_id} added (manual)");
+                    } else {
+                        // Real handshake: dial the URL via PeerManager and
+                        // perform PeerHello → PeerWelcome.
+                        use ctxd_cli::federation::{AutoAcceptPolicy, PeerManager};
+                        // Local signing key is required for outbound
+                        // handshake (we sign our pubkey assertion in
+                        // PeerHello). Auto-create one if missing.
+                        let signing_bytes = match store.get_metadata("signing_key").await? {
+                            Some(b) => b,
+                            None => {
+                                let signer = ctxd_core::signing::EventSigner::new();
+                                store
+                                    .set_metadata("signing_key", &signer.secret_key_bytes())
+                                    .await?;
+                                store
+                                    .set_metadata("signing_public_key", &signer.public_key_bytes())
+                                    .await?;
+                                signer.secret_key_bytes()
+                            }
+                        };
+                        let signer = ctxd_core::signing::EventSigner::from_bytes(&signing_bytes)
+                            .map_err(|e| anyhow::anyhow!("bad signing key: {e}"))?;
+                        let local_pid = hex::encode(signer.public_key_bytes());
+                        let (event_tx, _) =
+                            tokio::sync::broadcast::channel::<protocol::BroadcastEvent>(64);
+                        let mgr = std::sync::Arc::new(PeerManager::new(
+                            std::sync::Arc::new(store.clone()),
+                            cap_engine.clone(),
+                            local_pid,
+                            signing_bytes,
+                            event_tx,
+                            AutoAcceptPolicy::from_env(),
+                        ));
+                        let enrolled = mgr
+                            .handshake_outbound(&peer_id, &url, &granted)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
+                        if let Some(expected) = public_key {
+                            let actual = hex::encode(&enrolled.remote_pubkey);
+                            if !actual.eq_ignore_ascii_case(&expected) {
+                                anyhow::bail!(
+                                    "remote pubkey {actual} does not match expected {expected}"
+                                );
+                            }
+                        }
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "peer_id": enrolled.peer_id,
+                                "remote_pubkey": hex::encode(&enrolled.remote_pubkey),
+                                "remote_grants_us": enrolled.remote_grants_us,
+                                "we_grant_remote": enrolled.we_grant_remote,
+                                "handshake": "ok",
+                            }))?
+                        );
+                    }
                 }
                 PeerAction::List => {
                     let peers = store

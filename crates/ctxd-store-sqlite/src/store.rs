@@ -328,30 +328,46 @@ impl EventStore {
     ///
     /// Computes and sets the predecessor hash based on the last event
     /// for the same subject tree. Updates materialized views.
+    ///
+    /// Federation note: if the event arrives with a non-`None`
+    /// `predecessorhash` we treat it as authoritative (the originating
+    /// peer computed it) and skip recomputation. The signature over the
+    /// canonical form binds the predecessorhash, so any tampering breaks
+    /// signature verification at the inbound checkpoint.
     #[tracing::instrument(skip(self, event), fields(subject = %event.subject))]
     pub async fn append(&self, mut event: Event) -> Result<Event, StoreError> {
-        // Compute predecessor hash from the last event in this subject's chain
-        let last_event = self.last_event_for_subject(event.subject.as_str()).await?;
-        if let Some(ref prev) = last_event {
-            let hash = PredecessorHash::compute(prev).map_err(StoreError::Serialization)?;
-            event.predecessorhash = Some(hash.to_string());
+        // Compute predecessor hash from the last event in this subject's
+        // chain — but only if the caller hasn't supplied one. Replicated
+        // events come with their origin's predecessorhash baked into
+        // their signature; recomputing would invalidate the signature.
+        if event.predecessorhash.is_none() {
+            let last_event = self.last_event_for_subject(event.subject.as_str()).await?;
+            if let Some(ref prev) = last_event {
+                let hash = PredecessorHash::compute(prev).map_err(StoreError::Serialization)?;
+                event.predecessorhash = Some(hash.to_string());
+            }
         }
 
-        // Sign the event if a signing key is available. Signing failures
-        // (malformed key bytes or serialization errors) are logged via tracing
-        // and the event is appended unsigned — we do not want a misconfigured
-        // key to block writes. If stricter semantics are needed, call sites
-        // should pre-validate the key before setting it.
-        if let Some(ref key) = self.signing_key {
-            match EventSigner::from_bytes(key) {
-                Ok(signer) => match signer.sign(&event) {
-                    Ok(sig) => event.signature = Some(sig),
+        // Sign the event if a signing key is available AND the event
+        // is not already signed. Replicated events arrive pre-signed by
+        // their origin peer; we must NOT re-sign with the local key
+        // because that would invalidate cross-peer signature
+        // verification. Signing failures (malformed key bytes or
+        // serialization errors) are logged via tracing and the event
+        // is appended unsigned — we do not want a misconfigured key to
+        // block writes.
+        if event.signature.is_none() {
+            if let Some(ref key) = self.signing_key {
+                match EventSigner::from_bytes(key) {
+                    Ok(signer) => match signer.sign(&event) {
+                        Ok(sig) => event.signature = Some(sig),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to sign event; appending unsigned");
+                        }
+                    },
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to sign event; appending unsigned");
+                        tracing::warn!(error = %e, "invalid signing key bytes; appending unsigned");
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "invalid signing key bytes; appending unsigned");
                 }
             }
         }
@@ -411,7 +427,11 @@ impl EventStore {
                 .await?;
         }
 
-        // Update KV view
+        // Update KV view under the federation LWW rule (ADR 006):
+        // overwrite the row only when the incoming event has a strictly
+        // greater `(time, event_id)` tuple. UUIDv7 ids are
+        // lexicographically monotonic in their embedded ms timestamp,
+        // so the same SQL works as a deterministic tiebreak.
         sqlx::query(
             r#"
             INSERT INTO kv_view (subject, event_id, data, updated_at)
@@ -420,6 +440,7 @@ impl EventStore {
                 event_id = excluded.event_id,
                 data = excluded.data,
                 updated_at = excluded.updated_at
+            WHERE (excluded.updated_at, excluded.event_id) > (kv_view.updated_at, kv_view.event_id)
             "#,
         )
         .bind(&subject)

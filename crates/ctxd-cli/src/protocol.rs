@@ -8,6 +8,7 @@
 //! - `REVOKE <cap_id>` — stub (v0.2)
 //! - `PING` — health check
 
+use crate::federation::PeerManager;
 use crate::rate_limit::RateLimiter;
 use ctxd_cap::{CapEngine, Operation};
 use ctxd_core::event::Event;
@@ -146,11 +147,24 @@ pub enum Response {
     EndOfStream,
 }
 
-/// Broadcast event for SUB fan-out.
+/// Broadcast event for SUB fan-out and federation replay.
+///
+/// `origin_peer_id` carries the peer-id of the daemon that *originally*
+/// published the event (locally produced events use the local
+/// daemon's peer_id; replicated-in events carry the origin from the
+/// `PeerReplicate` envelope). Federation's outbound replicator uses
+/// this for the loop-guard rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastEvent {
+    /// Subject of the event.
     pub subject: String,
+    /// JSON-serialized event payload.
     pub event: serde_json::Value,
+    /// Origin peer id. Defaults to empty string for local PUB; the
+    /// federation receiver overrides this with the inbound
+    /// `PeerReplicate.origin_peer_id` before re-broadcasting.
+    #[serde(default)]
+    pub origin_peer_id: String,
 }
 
 /// The wire protocol TCP server.
@@ -163,6 +177,12 @@ pub struct ProtocolServer {
     /// when tokens carry a rate_limit_ops_per_sec fact.
     #[allow(dead_code)]
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Optional federation manager. When set, federation Request
+    /// variants are dispatched here instead of returning the legacy
+    /// "not yet wired" error. When None, federation requests still
+    /// produce a structured error so callers can detect the daemon
+    /// has federation off.
+    federation: Option<Arc<PeerManager>>,
 }
 
 impl ProtocolServer {
@@ -175,23 +195,45 @@ impl ProtocolServer {
             addr,
             event_tx,
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
+            federation: None,
         }
     }
 
+    /// Attach a federation manager to this server. Federation requests
+    /// (`PeerHello`, `PeerReplicate`, `PeerCursorRequest`, …) will be
+    /// dispatched to it.
+    pub fn with_federation(mut self, fed: Arc<PeerManager>) -> Self {
+        self.federation = Some(fed);
+        self
+    }
+
     /// Get a broadcast sender for publishing events from other parts of the system.
-    #[allow(dead_code)]
     pub fn event_sender(&self) -> broadcast::Sender<BroadcastEvent> {
         self.event_tx.clone()
     }
 
-    /// Run the protocol server, accepting TCP connections.
+    /// Run the protocol server, accepting TCP connections. Binds the
+    /// server's stored address. For tests that need ephemeral-port
+    /// orchestration, see [`Self::run_with_listener`].
     pub async fn run(self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.addr).await?;
-        tracing::info!("Wire protocol server listening on {}", self.addr);
+        self.run_with_listener(listener).await
+    }
+
+    /// Run the protocol server with a pre-bound listener. Used by
+    /// federation integration tests that pick an ephemeral port via
+    /// `TcpListener::bind("127.0.0.1:0")` and then read `local_addr()`
+    /// without releasing the socket.
+    pub async fn run_with_listener(self, listener: TcpListener) -> anyhow::Result<()> {
+        tracing::info!(
+            "Wire protocol server listening on {}",
+            listener.local_addr()?
+        );
 
         let store = Arc::new(self.store);
         let cap_engine = self.cap_engine;
         let event_tx = self.event_tx;
+        let federation = self.federation;
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -200,9 +242,12 @@ impl ProtocolServer {
             let store = Arc::clone(&store);
             let cap_engine = Arc::clone(&cap_engine);
             let event_tx = event_tx.clone();
+            let federation = federation.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, store, cap_engine, event_tx).await {
+                if let Err(e) =
+                    handle_connection(stream, store, cap_engine, event_tx, federation).await
+                {
                     tracing::warn!("Wire protocol connection error from {peer}: {e}");
                 }
             });
@@ -242,11 +287,12 @@ async fn send_response(stream: &mut TcpStream, response: &Response) -> anyhow::R
 }
 
 /// Handle a single TCP connection.
-async fn handle_connection(
+pub(crate) async fn handle_connection(
     mut stream: TcpStream,
     store: Arc<EventStore>,
     cap_engine: Arc<CapEngine>,
     event_tx: broadcast::Sender<BroadcastEvent>,
+    federation: Option<Arc<PeerManager>>,
 ) -> anyhow::Result<()> {
     loop {
         let frame = match read_frame(&mut stream).await? {
@@ -319,22 +365,96 @@ async fn handle_connection(
                 .await?;
             }
 
-            // Federation verbs — wire-level types in place; the connection
-            // handler in `federation.rs` will own these in the follow-up
-            // sub-task. For now we return a structured error so peers
-            // (and tests) can detect that the receiver is federation-aware
-            // but not yet handling the verb.
-            Request::PeerHello { .. }
-            | Request::PeerWelcome { .. }
-            | Request::PeerReplicate { .. }
-            | Request::PeerAck { .. }
-            | Request::PeerCursorRequest { .. }
-            | Request::PeerCursor { .. }
-            | Request::PeerFetchEvents { .. } => {
+            // Federation verbs. Dispatch to `PeerManager` if attached,
+            // otherwise return a structured error.
+            Request::PeerHello {
+                peer_id,
+                public_key,
+                offered_cap,
+                subjects,
+            } => {
+                let response = match federation.as_ref() {
+                    Some(fed) => match fed
+                        .handle_peer_hello(&peer_id, &public_key, &offered_cap, &subjects)
+                        .await
+                    {
+                        Ok(data) => Response::Ok { data },
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                    None => Response::Error {
+                        message: "federation not enabled on this daemon".into(),
+                    },
+                };
+                send_response(&mut stream, &response).await?;
+            }
+
+            Request::PeerReplicate {
+                origin_peer_id,
+                event,
+            } => {
+                let response = match federation.as_ref() {
+                    Some(fed) => match fed.handle_peer_replicate(&origin_peer_id, event).await {
+                        Ok(data) => Response::Ok { data },
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                    None => Response::Error {
+                        message: "federation not enabled on this daemon".into(),
+                    },
+                };
+                send_response(&mut stream, &response).await?;
+            }
+
+            Request::PeerCursorRequest {
+                peer_id,
+                subject_pattern,
+            } => {
+                let response = match federation.as_ref() {
+                    Some(fed) => match fed
+                        .handle_peer_cursor_request(&peer_id, &subject_pattern)
+                        .await
+                    {
+                        Ok(data) => Response::Ok { data },
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                    None => Response::Error {
+                        message: "federation not enabled on this daemon".into(),
+                    },
+                };
+                send_response(&mut stream, &response).await?;
+            }
+
+            Request::PeerFetchEvents { event_ids } => {
+                let response = match federation.as_ref() {
+                    Some(fed) => match fed.handle_peer_fetch_events(&event_ids).await {
+                        Ok(data) => Response::Ok { data },
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                    None => Response::Error {
+                        message: "federation not enabled on this daemon".into(),
+                    },
+                };
+                send_response(&mut stream, &response).await?;
+            }
+
+            // PeerWelcome, PeerAck, PeerCursor are response-shaped — a
+            // peer should not be sending us these as the head of a
+            // request. We respond with a clear error rather than trying
+            // to interpret them.
+            Request::PeerWelcome { .. } | Request::PeerAck { .. } | Request::PeerCursor { .. } => {
                 send_response(
                     &mut stream,
                     &Response::Error {
-                        message: "federation protocol handler not yet wired (Phase 2D)".to_string(),
+                        message:
+                            "PeerWelcome/PeerAck/PeerCursor are response variants, not requests"
+                                .into(),
                     },
                 )
                 .await?;
@@ -362,10 +482,14 @@ async fn handle_pub(
     let stored = store.append(event).await?;
     let event_json = serde_json::to_value(&stored)?;
 
-    // Broadcast to subscribers (ignore errors if no receivers).
+    // Broadcast to subscribers (ignore errors if no receivers). Origin
+    // is empty here — `handle_pub` is the local-PUB path; federation
+    // receivers tag inbound events with their actual origin via the
+    // `PeerReplicate` envelope before re-broadcasting.
     let _ = event_tx.send(BroadcastEvent {
         subject: subject.to_string(),
         event: event_json.clone(),
+        origin_peer_id: String::new(),
     });
 
     Ok(Response::Ok { data: event_json })
@@ -737,7 +861,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let store = Arc::new(server_store);
             let (event_tx, _) = broadcast::channel(1024);
-            handle_connection(stream, store, server_cap, event_tx)
+            handle_connection(stream, store, server_cap, event_tx, None)
                 .await
                 .unwrap();
         });
@@ -792,7 +916,7 @@ mod tests {
                 let c = Arc::clone(&cap_clone);
                 let tx = event_tx_clone.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, s, c, tx).await;
+                    let _ = handle_connection(stream, s, c, tx, None).await;
                 });
             }
         });
@@ -847,7 +971,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let store = Arc::new(server_store);
             let (event_tx, _) = broadcast::channel(1024);
-            handle_connection(stream, store, server_cap, event_tx)
+            handle_connection(stream, store, server_cap, event_tx, None)
                 .await
                 .unwrap();
         });
