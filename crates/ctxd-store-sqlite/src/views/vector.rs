@@ -111,8 +111,11 @@ pub struct VectorIndexConfig {
     /// requires an upfront cap; we default to 1M which is plenty
     /// for v0.3 single-node deployments.
     pub max_elements: usize,
-    /// Maximum graph layer (`max_layer` in HNSW). 16 matches the
-    /// hnsw_rs example for ~1M elements.
+    /// Maximum graph layer (`max_layer` in HNSW). MUST be 16 if
+    /// the index will ever be dumped to disk: `hnsw_rs` 0.3
+    /// rejects dumps where `nb_layer != NB_LAYER_MAX (=16)`. We
+    /// default to 16 and surface this constraint here so callers
+    /// don't accidentally tune it down and break persistence.
     pub max_nb_layers: usize,
 }
 
@@ -310,6 +313,12 @@ impl VectorIndex {
             });
         }
 
+        // Pre-validate the graph file's magic bytes ourselves —
+        // hnsw_rs::HnswIo::init internally `.unwrap()`s
+        // `load_description`, so feeding it a malformed graph
+        // panics. Reading the first 4 bytes lets us catch torn or
+        // foreign graph files cleanly.
+        check_graph_magic(&storage.graph_path())?;
         // Load HNSW. The returned `Hnsw` borrows from the `HnswIo`,
         // so we leak the loader to grant it `'static`. There is at
         // most one leak per process lifetime per index instance —
@@ -530,6 +539,30 @@ impl VectorIndex {
     }
 }
 
+/// Pre-validate that `path` begins with one of `hnsw_rs`'s
+/// `MAGICDESCR_*` headers. Returns `Err` for any other content
+/// (truncated, foreign, or zeroed file). Cheap — reads 4 bytes.
+fn check_graph_magic(path: &Path) -> Result<(), VectorError> {
+    // hnsw_rs hardcodes these magic constants in
+    // `hnsw_rs::hnswio` for graph format versions 2/3/4. Bumping
+    // hnsw_rs across major versions may require updating this
+    // list — covered by the persist+reopen integration test.
+    const MAGICDESCR_2: u32 = 0x002a677f;
+    const MAGICDESCR_3: u32 = 0x002a6771;
+    const MAGICDESCR_4: u32 = 0x002a6779;
+    let mut f = fs::File::open(path).map_err(|e| VectorError::Io(format!("open graph: {e}")))?;
+    let mut buf = [0u8; 4];
+    f.read_exact(&mut buf)
+        .map_err(|e| VectorError::Io(format!("read graph magic: {e}")))?;
+    let magic = u32::from_ne_bytes(buf);
+    match magic {
+        MAGICDESCR_2 | MAGICDESCR_3 | MAGICDESCR_4 => Ok(()),
+        _ => Err(VectorError::Io(format!(
+            "graph file magic 0x{magic:08x} not recognized"
+        ))),
+    }
+}
+
 /// Write a file atomically (write to tmp, fsync, rename). Avoids
 /// torn writes if the process dies mid-flush.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VectorError> {
@@ -596,7 +629,8 @@ mod tests {
             dimensions: dims,
             flush_every_n_inserts: 10_000, // disable in unit tests
             max_elements: 1024,
-            max_nb_layers: 8,
+            // hnsw_rs's dump requires nb_layer == NB_LAYER_MAX (16)
+            max_nb_layers: 16,
         }
     }
 
