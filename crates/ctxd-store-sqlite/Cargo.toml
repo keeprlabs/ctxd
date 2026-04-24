@@ -25,6 +25,8 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }
 ctxd-store-core = { path = "../ctxd-store-core", features = ["testsuite"] }
+sha2 = { workspace = true }
+hex = "0.4"
 
 [[bench]]
 name = "store_bench"

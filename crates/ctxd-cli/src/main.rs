@@ -143,6 +143,26 @@ enum Commands {
         recursive: bool,
     },
 
+    /// Migrate an existing ctxd database to the current schema version.
+    ///
+    /// v0.3 migration re-computes predecessor hashes and signatures under
+    /// the v0.3 canonical form (which includes the new `parents` and
+    /// `attestation` fields even when empty). Writes are applied in
+    /// transactional batches of 1000 rows.
+    Migrate {
+        /// Target schema version (currently only `0.3` is supported).
+        #[arg(long, default_value = "0.3")]
+        to: String,
+
+        /// Report what would change without writing anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Re-run migration even if the database is already at the target version.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
     /// Connect to a running ctxd daemon via the wire protocol.
     Connect {
         /// Address of the daemon's wire protocol endpoint.
@@ -421,6 +441,34 @@ async fn main() -> Result<()> {
                 .await
                 .context("subjects failed")?;
             println!("{}", serde_json::to_string_pretty(&subjects)?);
+        }
+
+        Commands::Migrate { to, dry_run, force } => {
+            if to != "0.3" {
+                anyhow::bail!(
+                    "unsupported migration target: {to} (only '0.3' is supported in this release)"
+                );
+            }
+            // If a signing key was stored during earlier writes, we use it
+            // to re-sign events that were previously signed. If no key is
+            // stored, migration still rewrites hashes but leaves
+            // signatures alone.
+            let signing_key = store.get_metadata("signing_key").await?;
+            let report =
+                ctxd_store::migrate::migrate_to_v03(&store, signing_key.as_deref(), dry_run, force)
+                    .await
+                    .context("migration failed")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "target": to,
+                    "dry_run": report.dry_run,
+                    "already_migrated": report.already_migrated,
+                    "events_considered": report.considered,
+                    "events_rewritten": report.rewritten,
+                    "batches_committed": report.batches_committed,
+                }))?
+            );
         }
 
         Commands::Connect { addr, action } => {
