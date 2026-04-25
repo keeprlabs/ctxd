@@ -20,6 +20,11 @@ path = "src/main.rs"
 default = ["openai", "ollama"]
 openai = ["ctxd-embed/openai"]
 ollama = ["ctxd-embed/ollama"]
+# Optional storage backends. Default `serve` always uses the inlined
+# SQLite path; non-default backends are gated so the binary stays
+# small for operators who don't need them.
+storage-postgres = ["dep:ctxd-store-postgres"]
+storage-duckdb-object = ["dep:ctxd-store-duckobj"]
 
 [dependencies]
 ctxd-core = { path = "../ctxd-core" }
@@ -29,6 +34,9 @@ ctxd-cap = { path = "../ctxd-cap" }
 ctxd-mcp = { path = "../ctxd-mcp", features = ["http-transports"] }
 ctxd-http = { path = "../ctxd-http" }
 ctxd-embed = { path = "../ctxd-embed" }
+# Optional alternate backends — gated by feature flags above.
+ctxd-store-postgres = { path = "../ctxd-store-postgres", optional = true }
+ctxd-store-duckobj = { path = "../ctxd-store-duckobj", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

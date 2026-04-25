@@ -1095,6 +1095,8 @@ dependencies = [
  "ctxd-mcp",
  "ctxd-store",
  "ctxd-store-core",
+ "ctxd-store-duckobj",
+ "ctxd-store-postgres",
  "ctxd-store-sqlite",
  "hex",
  "opentelemetry",
