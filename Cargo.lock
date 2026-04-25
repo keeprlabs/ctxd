@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-adapter-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-adapter-fs"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-adapter-github"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-adapter-gmail"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-cap"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-embed"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-http"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "axum 0.8.9",
  "chrono",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-mcp"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-store"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ctxd-store-core",
  "ctxd-store-sqlite",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-store-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-store-duckobj"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-store-postgres"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-store-sqlite"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
