@@ -1,0 +1,35 @@
+[package]
+name = "ctxd-store-postgres"
+description = "Postgres-backed event store for ctxd implementing the Store trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctxd-core = { path = "../ctxd-core" }
+ctxd-store-core = { path = "../ctxd-store-core" }
+ctxd-cap = { path = "../ctxd-cap" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "json",
+    "chrono",
+    "uuid",
+    "macros",
+] }
+instant-distance = "0.6"
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }
+ctxd-store-core = { path = "../ctxd-store-core", features = ["testsuite"] }
+sha2 = { workspace = true }
+hex = "0.4"
