@@ -18,7 +18,7 @@ ctxd-core = { path = "../ctxd-core" }
 ctxd-store = { path = "../ctxd-store" }
 ctxd-store-core = { path = "../ctxd-store-core" }
 ctxd-cap = { path = "../ctxd-cap" }
-ctxd-mcp = { path = "../ctxd-mcp" }
+ctxd-mcp = { path = "../ctxd-mcp", features = ["http-transports"] }
 ctxd-http = { path = "../ctxd-http" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,6 +30,7 @@ tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "1", features = ["server", "transport-io"] }
 axum = "0.8"
+tokio-util = "0.7"
 rmp-serde = "1"
 uuid = { workspace = true }
 chrono = { workspace = true }
