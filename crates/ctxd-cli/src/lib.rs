@@ -11,3 +11,4 @@ pub mod federation;
 pub mod protocol;
 pub mod query;
 pub mod rate_limit;
+pub mod storage_selector;

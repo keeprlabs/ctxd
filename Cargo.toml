@@ -5,6 +5,7 @@ members = [
     "crates/ctxd-store-core",
     "crates/ctxd-store-sqlite",
     "crates/ctxd-store-postgres",
+    "crates/ctxd-store-duckobj",
     "crates/ctxd-store",
     "crates/ctxd-cap",
     "crates/ctxd-embed",

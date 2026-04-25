@@ -104,6 +104,21 @@ enum Commands {
         /// `OPENAI_API_KEY` env if unset. Never logged.
         #[arg(long = "embedder-api-key")]
         embedder_api_key: Option<String>,
+
+        /// Storage backend: `sqlite` (default), `postgres`, or
+        /// `duckdb-object`. The non-default backends require their
+        /// matching Cargo feature (`storage-postgres`,
+        /// `storage-duckdb-object`). For backwards-compat, the
+        /// always-on baseline path keeps using `--db <file>` for
+        /// SQLite; `--storage-uri` is consumed for non-default kinds.
+        #[arg(long = "storage", default_value = "sqlite")]
+        storage: String,
+
+        /// URI for the selected backend. `postgres://...` for the
+        /// Postgres backend, `file:///abs/path` (or a bare path) for
+        /// the duckdb-object backend's local-fs mode.
+        #[arg(long = "storage-uri")]
+        storage_uri: Option<String>,
     },
 
     /// Append an event to the store.
@@ -393,7 +408,36 @@ async fn main() -> Result<()> {
             embedder_model,
             embedder_url,
             embedder_api_key,
+            storage,
+            storage_uri,
         } => {
+            // Backend selection. The default sqlite path runs the
+            // full daemon (HTTP admin + wire + MCP + federation)
+            // because the legacy concrete-typed call sites still
+            // require `EventStore`. Non-sqlite backends are
+            // routed through the trait-based `select_store` path
+            // and serve a minimal HTTP admin only — federation /
+            // MCP / wire-protocol over `dyn Store` is queued for
+            // v0.4 (see ADR 019).
+            use ctxd_cli::storage_selector::{select_store, StorageKind, StorageSpec};
+            let kind = StorageKind::parse(&storage).map_err(|e| anyhow::anyhow!(e))?;
+            if kind != StorageKind::Sqlite {
+                let spec = StorageSpec {
+                    kind,
+                    sqlite_path: None,
+                    uri: storage_uri.clone(),
+                };
+                let dyn_store = select_store(&spec)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("select_store: {e}"))?;
+                tracing::warn!(
+                    backend = ?kind,
+                    "non-sqlite --storage selected; running minimal HTTP admin only \
+                     (wire/federation/MCP over dyn Store is v0.4 — see ADR 019)"
+                );
+                return run_minimal_serve(bind, dyn_store).await;
+            }
+            let _ = storage_uri; // unused for sqlite default path
             let addr: SocketAddr = bind.parse().context("invalid bind address")?;
             let wire_addr: SocketAddr = wire_bind.parse().context("invalid wire bind address")?;
             tracing::info!("starting ctxd daemon on {addr}");
@@ -1118,4 +1162,105 @@ fn init_tracing() -> OtelGuard {
 
         OtelGuard { provider: None }
     }
+}
+
+/// Minimal serve path used when `--storage` selects a non-SQLite backend.
+///
+/// Only the HTTP admin's `/health` and a small read-only window over
+/// the trait surface are exposed. Wire protocol, federation, and MCP
+/// transports require concrete `EventStore` plumbing in v0.3; once
+/// those are migrated to `dyn Store` (v0.4 per ADR 019), this
+/// fallback collapses into the main `Serve` flow.
+async fn run_minimal_serve(
+    bind: String,
+    store: std::sync::Arc<dyn ctxd_store_core::Store>,
+) -> Result<()> {
+    use axum::extract::{Query as AxumQuery, State as AxumState};
+    use axum::routing::{get, post};
+    use axum::Json;
+    use std::collections::HashMap;
+    let addr: SocketAddr = bind.parse().context("invalid bind address")?;
+    let app_state = store.clone();
+    let router = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async { Json(serde_json::json!({"ok": true, "mode": "minimal"})) }),
+        )
+        .route(
+            "/v1/append",
+            post(
+                |AxumState(s): AxumState<std::sync::Arc<dyn ctxd_store_core::Store>>,
+                 Json(body): Json<serde_json::Value>| async move {
+                    let subject = body
+                        .get("subject")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("/")
+                        .to_string();
+                    let event_type = body
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("event")
+                        .to_string();
+                    let data = body.get("data").cloned().unwrap_or(serde_json::json!({}));
+                    let subject = match Subject::new(&subject) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": e.to_string()})),
+                            );
+                        }
+                    };
+                    let event = Event::new("ctxd://minimal".to_string(), subject, event_type, data);
+                    match s.append(event).await {
+                        Ok(stored) => (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({"id": stored.id.to_string()})),
+                        ),
+                        Err(e) => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": e.to_string()})),
+                        ),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/read",
+            get(
+                |AxumState(s): AxumState<std::sync::Arc<dyn ctxd_store_core::Store>>,
+                 AxumQuery(q): AxumQuery<HashMap<String, String>>| async move {
+                    let subject = q.get("subject").cloned().unwrap_or_else(|| "/".to_string());
+                    let recursive = q
+                        .get("recursive")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                    let subject = match Subject::new(&subject) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": e.to_string()})),
+                            );
+                        }
+                    };
+                    match s.read(&subject, recursive).await {
+                        Ok(events) => (axum::http::StatusCode::OK, Json(serde_json::json!(events))),
+                        Err(e) => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": e.to_string()})),
+                        ),
+                    }
+                },
+            ),
+        )
+        .with_state(app_state);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("bind minimal admin")?;
+    tracing::info!("minimal HTTP admin listening on {addr}");
+    axum::serve(listener, router)
+        .await
+        .context("minimal serve")?;
+    Ok(())
 }
