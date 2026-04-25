@@ -43,16 +43,33 @@ Returns: JSON array of subject path strings.
 
 ### ctx_search
 
-Full-text search over event data.
+Full-text, vector, or hybrid search over event data.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `query` | string | yes | FTS5 search query (e.g., `"enterprise plan"`) |
+| `query` | string | yes | Search query (FTS5 syntax for `fts`/`hybrid`; free text for `vector`) |
 | `subject_pattern` | string | no | Only search under this subject prefix |
 | `k` | integer | no | Max results to return (default: 10) |
+| `search_mode` | string | no | `fts`, `vector`, or `hybrid`. Default: `hybrid` when an embedder is configured, `fts` otherwise. |
 | `token` | string | no | Base64-encoded capability token |
 
-Returns: JSON array of matching Event objects, ranked by FTS5 relevance. The `k` limit is applied at the database level (not in application code).
+Returns: JSON array of matching Event objects.
+
+Mode semantics:
+
+- `fts` — SQLite FTS5 over event data. Fast exact-token matching;
+  works without any embedder.
+- `vector` — k-NN over the persisted HNSW index, using the
+  configured embedder to embed the query. Requires `--embedder
+  openai|ollama` at startup. Best for semantic recall when the
+  query and corpus share meaning but not surface words.
+- `hybrid` — runs both FTS and vector searches and fuses the
+  rankings via Reciprocal Rank Fusion (RRF, k=60 per the 2009
+  paper). Strictly recall-superior to either mode alone in
+  exchange for ~`fts_latency + vector_latency` wall-clock.
+
+See `docs/embeddings.md` for setup, and
+`docs/decisions/015-hybrid-search-rrf.md` for the RRF rationale.
 
 ### ctx_subscribe
 

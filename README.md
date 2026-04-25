@@ -52,11 +52,17 @@ ctxd subjects
 # Mint a capability token scoped to /work/acme, read-only
 ctxd grant --subject "/work/acme/**" --operations "read,subjects"
 
-# Start the daemon
+# Start the daemon (FTS-only — embedder optional)
 ctxd serve
 # HTTP admin on 127.0.0.1:7777
 # Wire protocol on 127.0.0.1:7778
 # MCP on stdio (for Claude Desktop)
+
+# Or with semantic + hybrid search via OpenAI:
+export OPENAI_API_KEY=sk-...
+ctxd serve --embedder openai
+# Subsequent ctx_search calls default to hybrid (FTS + vector + RRF).
+# See docs/embeddings.md for Ollama and other providers.
 ```
 
 ## Connect Claude Desktop
