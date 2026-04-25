@@ -5,6 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Real OpenAI-hosted embedder. Pulls in `reqwest` so the default
+# build of ctxd-embed stays free of TLS/HTTP transitive deps.
+openai = ["dep:reqwest"]
+# Local Ollama-hosted embedder. Same justification as `openai` —
+# binaries pick whichever providers they need.
+ollama = ["dep:reqwest"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -12,6 +21,9 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
+# Optional: feature-gated HTTP client for real embedder backends.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+wiremock = "0.6"

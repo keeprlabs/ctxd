@@ -6,6 +6,7 @@
 //! exists purely so `use ctxd_cli::federation::PeerManager` works
 //! from those tests.
 
+pub mod embedder;
 pub mod federation;
 pub mod protocol;
 pub mod query;

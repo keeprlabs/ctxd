@@ -83,6 +83,27 @@ enum Commands {
         /// default" behaviour for local-subprocess clients.
         #[arg(long, default_value_t = false)]
         require_auth: bool,
+
+        /// Embedder backend: `null` (default — zero vectors),
+        /// `openai`, or `ollama`. Real backends require the
+        /// matching feature flag at compile time.
+        #[arg(long = "embedder", default_value = "null")]
+        embedder: String,
+
+        /// Override the embedder model. Provider-specific defaults
+        /// apply when unset (`text-embedding-3-small` for OpenAI,
+        /// `nomic-embed-text` for Ollama).
+        #[arg(long = "embedder-model")]
+        embedder_model: Option<String>,
+
+        /// Override the embedder base URL.
+        #[arg(long = "embedder-url")]
+        embedder_url: Option<String>,
+
+        /// API key for the embedder (OpenAI only). Falls back to
+        /// `OPENAI_API_KEY` env if unset. Never logged.
+        #[arg(long = "embedder-api-key")]
+        embedder_api_key: Option<String>,
     },
 
     /// Append an event to the store.
@@ -330,7 +351,7 @@ async fn main() -> Result<()> {
     let _otel_guard = init_tracing();
 
     let cli = Cli::parse();
-    let store = EventStore::open(&cli.db)
+    let mut store = EventStore::open(&cli.db)
         .await
         .context("failed to open event store")?;
     // Load or create the root capability key, persisted in the database
@@ -368,6 +389,10 @@ async fn main() -> Result<()> {
             mcp_sse,
             mcp_http,
             require_auth,
+            embedder,
+            embedder_model,
+            embedder_url,
+            embedder_api_key,
         } => {
             let addr: SocketAddr = bind.parse().context("invalid bind address")?;
             let wire_addr: SocketAddr = wire_bind.parse().context("invalid wire bind address")?;
@@ -375,6 +400,40 @@ async fn main() -> Result<()> {
             // Keep the broadcast sender alive for the lifetime of `serve`
             // so future adapters can `.subscribe()` at any point.
             let _approval_tx = pending_approval_tx.clone();
+
+            // Construct the embedder up front so we fail loudly on
+            // misconfiguration rather than at first auto-embed.
+            let choice = ctxd_cli::embedder::EmbedderChoice::parse(&embedder)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let embed_opts = ctxd_cli::embedder::EmbedderOpts {
+                model: embedder_model,
+                url: embedder_url,
+                api_key: embedder_api_key,
+                dimensions: None,
+            };
+            let embedder_arc = ctxd_cli::embedder::build_embedder(choice, embed_opts)
+                .context("failed to construct embedder")?;
+            tracing::info!(
+                kind = %embedder_arc.kind(),
+                model = embedder_arc.model(),
+                dimensions = embedder_arc.dimensions(),
+                "embedder ready"
+            );
+            // Install on the store so `append` auto-embeds when the
+            // event has indexable text.
+            store.set_embedder(embedder_arc.clone());
+            // Open the persisted HNSW index. The dimensions match
+            // the active embedder so a previously-persisted index
+            // built with a different model is detected as a
+            // dimension mismatch and rebuilt.
+            let vec_cfg = ctxd_store::views::vector::VectorIndexConfig {
+                dimensions: embedder_arc.dimensions(),
+                ..Default::default()
+            };
+            let _vec_idx = store
+                .ensure_vector_index(vec_cfg)
+                .await
+                .context("failed to open HNSW vector index")?;
 
             let router = build_router(store.clone(), cap_engine.clone(), caveat_state.clone());
             let http_handle = tokio::spawn(async move {
@@ -438,13 +497,15 @@ async fn main() -> Result<()> {
 
             // Build the shared MCP server. Each transport gets its own
             // logical clone (CtxdMcpServer is cheap to clone — store +
-            // cap engine + caveat state are Arc-backed).
+            // cap engine + caveat state are Arc-backed). The embedder
+            // is attached so ctx_search can do vector + hybrid modes.
             let mcp_server = CtxdMcpServer::new(
                 store.clone(),
                 cap_engine.clone(),
                 caveat_state.clone(),
                 format!("ctxd://{addr}"),
-            );
+            )
+            .with_embedder(embedder_arc.clone());
 
             // Auth policy applies to HTTP transports only. Stdio is
             // local-subprocess and keeps the legacy "open by default"

@@ -4,8 +4,10 @@ use ctxd_core::event::Event;
 use ctxd_core::hash::PredecessorHash;
 use ctxd_core::signing::EventSigner;
 use ctxd_core::subject::Subject;
+use ctxd_embed::Embedder;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Errors from the event store.
 #[derive(Debug, thiserror::Error)]
@@ -34,11 +36,34 @@ pub enum StoreError {
 
 /// The main event store. Owns a SQLite connection pool and provides
 /// append/read operations with hash chain verification.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EventStore {
     pool: SqlitePool,
     /// Optional Ed25519 signing key for event signatures.
     signing_key: Option<Vec<u8>>,
+    /// Optional pluggable embedder. When set, [`EventStore::append`]
+    /// auto-embeds the event's textual payload, persists the vector
+    /// in `vector_embeddings`, and inserts it into the HNSW index.
+    embedder: Option<Arc<dyn Embedder>>,
+    /// Persisted HNSW index. `None` until the index has been opened
+    /// with [`EventStore::open_with_index`] (or built lazily by
+    /// [`EventStore::ensure_vector_index`]). All vector writes flow
+    /// through here so concurrent searches can run lock-free.
+    vector_index: Option<Arc<crate::views::vector::VectorIndex>>,
+    /// Path to the underlying database file (None for in-memory).
+    /// Used to derive the `<db>.hnsw` index path.
+    db_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for EventStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventStore")
+            .field("has_signing_key", &self.signing_key.is_some())
+            .field("has_embedder", &self.embedder.is_some())
+            .field("has_vector_index", &self.vector_index.is_some())
+            .field("db_path", &self.db_path)
+            .finish()
+    }
 }
 
 impl EventStore {
@@ -52,6 +77,9 @@ impl EventStore {
         let store = Self {
             pool,
             signing_key: None,
+            embedder: None,
+            vector_index: None,
+            db_path: Some(path.to_path_buf()),
         };
         store.initialize().await?;
         Ok(store)
@@ -66,9 +94,136 @@ impl EventStore {
         let store = Self {
             pool,
             signing_key: None,
+            embedder: None,
+            vector_index: None,
+            db_path: None,
         };
         store.initialize().await?;
         Ok(store)
+    }
+
+    /// Install an embedder. Subsequent [`EventStore::append`] calls
+    /// will auto-embed events with indexable text. Failures to embed
+    /// log a warning but do NOT fail the append — embeddings are a
+    /// best-effort view, the event log is the source of truth.
+    pub fn set_embedder(&mut self, embedder: Arc<dyn Embedder>) {
+        self.embedder = Some(embedder);
+    }
+
+    /// Borrow the configured embedder, if any.
+    pub fn embedder(&self) -> Option<&Arc<dyn Embedder>> {
+        self.embedder.as_ref()
+    }
+
+    /// Borrow the in-memory vector index, if one has been opened.
+    pub fn vector_index(&self) -> Option<&Arc<crate::views::vector::VectorIndex>> {
+        self.vector_index.as_ref()
+    }
+
+    /// Path to the underlying database file (None when in-memory).
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    /// Lazily open the persisted HNSW vector index. Idempotent —
+    /// returns the cached handle on subsequent calls.
+    ///
+    /// The index lives at `<db>.hnsw.{graph,data,meta,map}` next to
+    /// the SQLite file. If the on-disk artifacts are missing or
+    /// corrupt, a fresh in-memory index is returned and the caller
+    /// is expected to repopulate it from `vector_embeddings`.
+    pub async fn ensure_vector_index(
+        &mut self,
+        cfg: crate::views::vector::VectorIndexConfig,
+    ) -> Result<Arc<crate::views::vector::VectorIndex>, StoreError> {
+        if let Some(idx) = &self.vector_index {
+            return Ok(idx.clone());
+        }
+        let (idx, status) = match self.db_path.as_deref() {
+            Some(path) => crate::views::vector::VectorIndex::open_persistent(path, cfg.clone())
+                .map_err(|e| {
+                    StoreError::Database(sqlx::Error::Protocol(format!("vector index open: {e}")))
+                })?,
+            None => (
+                crate::views::vector::VectorIndex::open_in_memory(cfg.clone()),
+                crate::views::vector::OpenStatus::RebuildRequired,
+            ),
+        };
+        let arc = Arc::new(idx);
+        // If we couldn't load from disk OR if the SQL row count
+        // disagrees with the loaded element count, rebuild from
+        // scratch. The rebuild scans `vector_embeddings`.
+        let row_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vector_embeddings")
+            .fetch_one(&self.pool)
+            .await?;
+        let needs_rebuild = matches!(status, crate::views::vector::OpenStatus::RebuildRequired)
+            || (row_count.0 as usize) != arc.len();
+        if needs_rebuild {
+            tracing::info!(
+                rows = row_count.0,
+                index_count = arc.len(),
+                "rebuilding HNSW vector index from vector_embeddings"
+            );
+            self.rebuild_vector_index(arc.as_ref(), cfg.dimensions)
+                .await?;
+        }
+        self.vector_index = Some(arc.clone());
+        Ok(arc)
+    }
+
+    /// Rebuild `idx` by streaming vectors out of `vector_embeddings`.
+    /// Vectors with mismatched dimensions are skipped and logged.
+    async fn rebuild_vector_index(
+        &self,
+        idx: &crate::views::vector::VectorIndex,
+        expected_dims: usize,
+    ) -> Result<(), StoreError> {
+        let rows: Vec<(String, i64, Vec<u8>)> =
+            sqlx::query_as("SELECT event_id, dimensions, vector FROM vector_embeddings")
+                .fetch_all(&self.pool)
+                .await?;
+        // Decode all vectors first so the rebuild can run in a tight
+        // CPU-bound loop without holding any DB connections.
+        let mut decoded: Vec<(String, Vec<f32>)> = Vec::with_capacity(rows.len());
+        for (event_id, dims, bytes) in rows {
+            if (dims as usize) != expected_dims {
+                tracing::warn!(
+                    event_id = %event_id,
+                    expected = expected_dims,
+                    got = dims,
+                    "vector dimensions mismatch the configured embedder; skipping"
+                );
+                continue;
+            }
+            if bytes.len() != (dims as usize) * 4 {
+                tracing::warn!(
+                    event_id = %event_id,
+                    "vector_embeddings blob has wrong byte length; skipping"
+                );
+                continue;
+            }
+            let mut v = Vec::with_capacity(dims as usize);
+            for chunk in bytes.chunks_exact(4) {
+                let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                v.push(f32::from_le_bytes(arr));
+            }
+            decoded.push((event_id, v));
+        }
+        // hand the iterator to rebuild_from. We pre-materialized so
+        // the borrows fit the &str/&[f32] signature.
+        let pairs: Vec<(&str, &[f32])> = decoded
+            .iter()
+            .map(|(e, v)| (e.as_str(), v.as_slice()))
+            .collect();
+        idx.rebuild_from(pairs).map_err(|e| {
+            StoreError::Database(sqlx::Error::Protocol(format!("rebuild_from: {e}")))
+        })?;
+        // Persist once after the rebuild so a subsequent crash
+        // doesn't rebuild from SQL again.
+        if let Err(e) = idx.flush() {
+            tracing::warn!(error = %e, "post-rebuild flush failed; will retry on next flush");
+        }
+        Ok(())
     }
 
     /// Create tables and indexes.
@@ -467,6 +622,50 @@ impl EventStore {
 
         tx.commit().await?;
 
+        // Auto-embed AFTER the canonical row is durable. Failure
+        // here logs but never fails the append — embeddings are a
+        // best-effort materialized view; the event log is the
+        // source of truth.
+        if let Some(embedder) = &self.embedder {
+            if let Some(text) = indexable_text(&event) {
+                let dims = embedder.dimensions();
+                match embedder.embed(&text).await {
+                    Ok(vec) => {
+                        if vec.len() != dims {
+                            tracing::warn!(
+                                event_id = %id,
+                                expected = dims,
+                                got = vec.len(),
+                                "embedder returned wrong-dimensional vector; skipping"
+                            );
+                        } else {
+                            // Persist to SQL first (canonical store).
+                            if let Err(e) =
+                                self.vector_upsert_impl(&id, embedder.model(), &vec).await
+                            {
+                                tracing::warn!(
+                                    event_id = %id,
+                                    error = %e,
+                                    "failed to persist embedding"
+                                );
+                            } else if let Some(idx) = &self.vector_index {
+                                if let Err(e) = idx.upsert(&id, &vec) {
+                                    tracing::warn!(
+                                        event_id = %id,
+                                        error = %e,
+                                        "failed to insert embedding into HNSW"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(event_id = %id, error = %e, "embedder failed; skipping");
+                    }
+                }
+            }
+        }
+
         Ok(event)
     }
 
@@ -791,6 +990,33 @@ impl EventStore {
             Some(r) => Ok(Some(r.into_event()?)),
             None => Ok(None),
         }
+    }
+}
+
+/// Extract a free-text representation of `event` to feed into an
+/// embedder. Returns `None` if the event has no text-like content
+/// (binary blobs, empty payloads).
+///
+/// The current rule: prepend the subject (gives semantic anchor),
+/// then concatenate every string-valued field of the JSON payload
+/// (top-level only — avoids quadratic cost on deeply nested data).
+fn indexable_text(event: &Event) -> Option<String> {
+    let mut parts: Vec<String> = vec![event.subject.as_str().to_string()];
+    if let serde_json::Value::Object(map) = &event.data {
+        for (_, v) in map {
+            match v {
+                serde_json::Value::String(s) if !s.is_empty() => parts.push(s.clone()),
+                serde_json::Value::Number(n) => parts.push(n.to_string()),
+                serde_json::Value::Bool(b) => parts.push(b.to_string()),
+                _ => {}
+            }
+        }
+    }
+    let joined = parts.join(" ").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
     }
 }
 

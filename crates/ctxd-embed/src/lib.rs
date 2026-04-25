@@ -14,12 +14,26 @@
 //! - [`EmbedderKind`] — an enum describing which backend is active,
 //!   for logging and human-readable config output.
 //!
-//! Real backends (`OpenAiEmbedder`, `OllamaEmbedder`) live in
-//! follow-up commits behind feature flags so a default build stays
-//! lean. See `docs/plans/v0.3-progress.md` for the Phase 4 deferral
-//! plan.
+//! Real backends:
+//!
+//! - [`openai::OpenAiEmbedder`] (behind `feature = "openai"`) — talks
+//!   to OpenAI's `/v1/embeddings` endpoint with retry-after-aware
+//!   exponential backoff and the OpenAI 256-input batch cap.
+//! - [`ollama::OllamaEmbedder`] (behind `feature = "ollama"`) —
+//!   talks to a locally-running Ollama daemon over its
+//!   `/api/embeddings` endpoint. No auth, no batch endpoint —
+//!   batched calls fan out per-text in-process.
 
 use async_trait::async_trait;
+
+#[cfg(feature = "openai")]
+pub mod openai;
+
+#[cfg(feature = "ollama")]
+pub mod ollama;
+
+#[cfg(any(feature = "openai", feature = "ollama"))]
+mod retry;
 
 /// Errors surfaced by an [`Embedder`].
 #[derive(Debug, thiserror::Error)]

@@ -11,6 +11,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ctxd_cap::state::{CaveatState, InMemoryCaveatState};
 use ctxd_cap::CapEngine;
 use ctxd_mcp::auth::AuthPolicy;
 use ctxd_mcp::CtxdMcpServer;
@@ -23,7 +24,13 @@ use tokio_util::sync::CancellationToken;
 pub async fn make_server() -> (CtxdMcpServer, Arc<CapEngine>) {
     let store = EventStore::open_memory().await.expect("open store");
     let cap_engine = Arc::new(CapEngine::new());
-    let server = CtxdMcpServer::new(store, cap_engine.clone(), "ctxd://test".to_string());
+    let caveat_state: Arc<dyn CaveatState> = Arc::new(InMemoryCaveatState::new());
+    let server = CtxdMcpServer::new(
+        store,
+        cap_engine.clone(),
+        caveat_state,
+        "ctxd://test".to_string(),
+    );
     (server, cap_engine)
 }
 

@@ -11,6 +11,7 @@
 
 mod common;
 
+use ctxd_cap::state::{CaveatState, InMemoryCaveatState};
 use ctxd_cap::CapEngine;
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
@@ -24,7 +25,13 @@ use tokio::time::{Duration, Instant};
 async fn three_transports_share_one_server_without_blocking() {
     let store = EventStore::open_memory().await.expect("open store");
     let cap = Arc::new(CapEngine::new());
-    let server = CtxdMcpServer::new(store.clone(), cap.clone(), "ctxd://test".into());
+    let caveat_state: Arc<dyn CaveatState> = Arc::new(InMemoryCaveatState::new());
+    let server = CtxdMcpServer::new(
+        store.clone(),
+        cap.clone(),
+        caveat_state,
+        "ctxd://test".into(),
+    );
 
     let (http_addr, http_cancel) =
         common::spawn_streamable_http(server.clone(), AuthPolicy::Optional).await;
