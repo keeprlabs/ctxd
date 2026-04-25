@@ -1,21 +1,21 @@
 //! ctxd — context substrate daemon for AI agents.
 
-mod protocol;
-mod query;
-mod rate_limit;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use ctxd_cap::state::{ApprovalDecision, CaveatState, PendingApproval};
 use ctxd_cap::{CapEngine, Operation};
+use ctxd_cli::federation;
+use ctxd_cli::protocol;
+use ctxd_cli::query;
 use ctxd_core::event::Event;
 use ctxd_core::signing::EventSigner;
 use ctxd_core::subject::Subject;
 use ctxd_http::build_router;
 use ctxd_mcp::CtxdMcpServer;
+use ctxd_store::caveat_state::SqliteCaveatState;
 use ctxd_store::EventStore;
 use opentelemetry::trace::TracerProvider;
 use protocol::{ProtocolClient, ProtocolServer};
-use rmcp::ServiceExt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,7 +37,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the ctxd daemon (HTTP + MCP over stdio + wire protocol).
+    /// Start the ctxd daemon (HTTP admin + wire protocol + MCP transports).
+    ///
+    /// MCP can be served over up to three transports concurrently:
+    ///
+    /// * `--mcp-stdio` — newline-delimited JSON-RPC on stdin/stdout
+    ///   (default on; the only transport Claude Desktop currently uses).
+    /// * `--mcp-sse <addr>` — legacy MCP SSE: `GET /sse` opens an event
+    ///   stream, `POST /messages?sessionId=…` carries JSON-RPC.
+    /// * `--mcp-http <addr>` — modern streamable HTTP: a single `/mcp`
+    ///   endpoint per the MCP 2025-03-26 spec.
+    ///
+    /// On the HTTP transports, capability tokens may be presented as
+    /// either an `Authorization: Bearer <base64-biscuit>` header or a
+    /// per-call `token` argument. The header wins when both are
+    /// present. With `--require-auth`, every `tools/call` over the
+    /// HTTP transports must present a token (header or arg) — calls
+    /// without one are rejected with 401.
     Serve {
         /// Address to bind the HTTP admin API.
         #[arg(long, default_value = "127.0.0.1:7777")]
@@ -50,6 +66,59 @@ enum Commands {
         /// Run MCP server on stdio (for Claude Desktop / mcp-inspector).
         #[arg(long, default_value_t = true)]
         mcp_stdio: bool,
+
+        /// Bind a legacy MCP SSE transport at this address (e.g.
+        /// `127.0.0.1:7779`). Disabled by default.
+        #[arg(long)]
+        mcp_sse: Option<String>,
+
+        /// Bind a streamable-HTTP MCP transport at this address (e.g.
+        /// `127.0.0.1:7780`). Disabled by default.
+        #[arg(long)]
+        mcp_http: Option<String>,
+
+        /// Require every `tools/call` on the HTTP transports to carry
+        /// a capability token. Calls without one return 401. Stdio is
+        /// unaffected — that transport keeps the legacy "open by
+        /// default" behaviour for local-subprocess clients.
+        #[arg(long, default_value_t = false)]
+        require_auth: bool,
+
+        /// Embedder backend: `null` (default — zero vectors),
+        /// `openai`, or `ollama`. Real backends require the
+        /// matching feature flag at compile time.
+        #[arg(long = "embedder", default_value = "null")]
+        embedder: String,
+
+        /// Override the embedder model. Provider-specific defaults
+        /// apply when unset (`text-embedding-3-small` for OpenAI,
+        /// `nomic-embed-text` for Ollama).
+        #[arg(long = "embedder-model")]
+        embedder_model: Option<String>,
+
+        /// Override the embedder base URL.
+        #[arg(long = "embedder-url")]
+        embedder_url: Option<String>,
+
+        /// API key for the embedder (OpenAI only). Falls back to
+        /// `OPENAI_API_KEY` env if unset. Never logged.
+        #[arg(long = "embedder-api-key")]
+        embedder_api_key: Option<String>,
+
+        /// Storage backend: `sqlite` (default), `postgres`, or
+        /// `duckdb-object`. The non-default backends require their
+        /// matching Cargo feature (`storage-postgres`,
+        /// `storage-duckdb-object`). For backwards-compat, the
+        /// always-on baseline path keeps using `--db <file>` for
+        /// SQLite; `--storage-uri` is consumed for non-default kinds.
+        #[arg(long = "storage", default_value = "sqlite")]
+        storage: String,
+
+        /// URI for the selected backend. `postgres://...` for the
+        /// Postgres backend, `file:///abs/path` (or a bare path) for
+        /// the duckdb-object backend's local-fs mode.
+        #[arg(long = "storage-uri")]
+        storage_uri: Option<String>,
     },
 
     /// Append an event to the store.
@@ -143,6 +212,49 @@ enum Commands {
         recursive: bool,
     },
 
+    /// Federation peer management (v0.3).
+    ///
+    /// `peer add` records a peer's public key + dial URL + granted
+    /// subject globs in the local store. Actual replication is wired
+    /// via the `ctxd-cli/src/federation.rs` PeerManager (Phase 2D).
+    Peer {
+        #[command(subcommand)]
+        action: PeerAction,
+    },
+
+    /// Migrate an existing ctxd database to the current schema version.
+    ///
+    /// v0.3 migration re-computes predecessor hashes and signatures under
+    /// the v0.3 canonical form (which includes the new `parents` and
+    /// `attestation` fields even when empty). Writes are applied in
+    /// transactional batches of 1000 rows.
+    Migrate {
+        /// Target schema version (currently only `0.3` is supported).
+        #[arg(long, default_value = "0.3")]
+        to: String,
+
+        /// Report what would change without writing anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Re-run migration even if the database is already at the target version.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Decide a pending human-approval request (v0.3 `HumanApprovalRequired`).
+    ///
+    /// Reads the approval row from the database and updates it. The
+    /// daemon's verifier task wakes up on the next poll/notify pass.
+    Approve {
+        /// Approval id (the UUIDv7 the daemon emitted at request time).
+        #[arg(long)]
+        id: String,
+        /// Decision to record: `allow` or `deny`.
+        #[arg(long)]
+        decision: String,
+    },
+
     /// Connect to a running ctxd daemon via the wire protocol.
     Connect {
         /// Address of the daemon's wire protocol endpoint.
@@ -152,6 +264,60 @@ enum Commands {
         /// Command to send: ping, pub, query, grant.
         #[command(subcommand)]
         action: ConnectAction,
+    },
+}
+
+/// Federation peer management actions.
+#[derive(Subcommand)]
+enum PeerAction {
+    /// Register a peer locally and (when `--url` is set) perform the
+    /// `PeerHello` ↔ `PeerWelcome` handshake against it.
+    ///
+    /// When `--public-key` is provided we verify the welcome's pubkey
+    /// matches; otherwise we accept whatever the remote returns. Use
+    /// `--auto-accept` to skip the handshake (manual enrollment) — the
+    /// peer is still recorded but no cap exchange happens.
+    Add {
+        /// Local identifier for the peer (often the remote's pubkey hex).
+        #[arg(long)]
+        peer_id: String,
+        /// URL to dial (e.g. `127.0.0.1:7778`).
+        #[arg(long)]
+        url: String,
+        /// Remote's Ed25519 public key, 64 hex chars (32 bytes). Optional
+        /// when handshaking — we'll accept whatever the welcome carries.
+        #[arg(long)]
+        public_key: Option<String>,
+        /// Comma-separated subject globs to grant this peer.
+        #[arg(long, default_value = "/**")]
+        subjects: String,
+        /// Skip the handshake and just record the peer locally. Useful
+        /// for offline enrollment or test fixtures. Requires `--public-key`.
+        #[arg(long, default_value_t = false)]
+        manual: bool,
+    },
+    /// List all registered peers.
+    List,
+    /// Show federation status for a peer (cursors, last contact).
+    Status {
+        /// Peer id to inspect.
+        #[arg(long)]
+        peer_id: String,
+    },
+    /// Remove a peer. Also removes any replication cursors.
+    Remove {
+        /// Peer id to remove.
+        #[arg(long)]
+        peer_id: String,
+    },
+    /// Update the subject globs granted to an existing peer.
+    Grant {
+        /// Peer id to grant.
+        #[arg(long)]
+        peer_id: String,
+        /// Comma-separated subject globs.
+        #[arg(long)]
+        subjects: String,
     },
 }
 
@@ -200,7 +366,7 @@ async fn main() -> Result<()> {
     let _otel_guard = init_tracing();
 
     let cli = Cli::parse();
-    let store = EventStore::open(&cli.db)
+    let mut store = EventStore::open(&cli.db)
         .await
         .context("failed to open event store")?;
     // Load or create the root capability key, persisted in the database
@@ -218,42 +384,254 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Build the v0.3 stateful-caveat backing once and share it across
+    // every transport that needs to enforce budgets / approvals.
+    // SQLite-backed so values survive a restart.
+    let caveat_state: Arc<dyn CaveatState> = Arc::new(SqliteCaveatState::new(store.clone()));
+
+    // PendingApproval broadcast: any task that emits a new approval
+    // request can publish here so a future notifier adapter (Slack,
+    // email) can subscribe. The daemon itself does not consume the
+    // channel — it's a side-channel for adapters.
+    let (pending_approval_tx, _pending_approval_rx) =
+        tokio::sync::broadcast::channel::<PendingApproval>(64);
+
     match cli.command {
         Commands::Serve {
             bind,
             wire_bind,
             mcp_stdio,
+            mcp_sse,
+            mcp_http,
+            require_auth,
+            embedder,
+            embedder_model,
+            embedder_url,
+            embedder_api_key,
+            storage,
+            storage_uri,
         } => {
+            // Backend selection. The default sqlite path runs the
+            // full daemon (HTTP admin + wire + MCP + federation)
+            // because the legacy concrete-typed call sites still
+            // require `EventStore`. Non-sqlite backends are
+            // routed through the trait-based `select_store` path
+            // and serve a minimal HTTP admin only — federation /
+            // MCP / wire-protocol over `dyn Store` is queued for
+            // v0.4 (see ADR 019).
+            use ctxd_cli::storage_selector::{select_store, StorageKind, StorageSpec};
+            let kind = StorageKind::parse(&storage).map_err(|e| anyhow::anyhow!(e))?;
+            if kind != StorageKind::Sqlite {
+                let spec = StorageSpec {
+                    kind,
+                    sqlite_path: None,
+                    uri: storage_uri.clone(),
+                };
+                let dyn_store = select_store(&spec)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("select_store: {e}"))?;
+                tracing::warn!(
+                    backend = ?kind,
+                    "non-sqlite --storage selected; running minimal HTTP admin only \
+                     (wire/federation/MCP over dyn Store is v0.4 — see ADR 019)"
+                );
+                return run_minimal_serve(bind, dyn_store).await;
+            }
+            let _ = storage_uri; // unused for sqlite default path
             let addr: SocketAddr = bind.parse().context("invalid bind address")?;
             let wire_addr: SocketAddr = wire_bind.parse().context("invalid wire bind address")?;
             tracing::info!("starting ctxd daemon on {addr}");
+            // Keep the broadcast sender alive for the lifetime of `serve`
+            // so future adapters can `.subscribe()` at any point.
+            let _approval_tx = pending_approval_tx.clone();
 
-            let router = build_router(store.clone(), cap_engine.clone());
+            // Construct the embedder up front so we fail loudly on
+            // misconfiguration rather than at first auto-embed.
+            let choice = ctxd_cli::embedder::EmbedderChoice::parse(&embedder)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let embed_opts = ctxd_cli::embedder::EmbedderOpts {
+                model: embedder_model,
+                url: embedder_url,
+                api_key: embedder_api_key,
+                dimensions: None,
+            };
+            let embedder_arc = ctxd_cli::embedder::build_embedder(choice, embed_opts)
+                .context("failed to construct embedder")?;
+            tracing::info!(
+                kind = %embedder_arc.kind(),
+                model = embedder_arc.model(),
+                dimensions = embedder_arc.dimensions(),
+                "embedder ready"
+            );
+            // Install on the store so `append` auto-embeds when the
+            // event has indexable text.
+            store.set_embedder(embedder_arc.clone());
+            // Open the persisted HNSW index. The dimensions match
+            // the active embedder so a previously-persisted index
+            // built with a different model is detected as a
+            // dimension mismatch and rebuilt.
+            let vec_cfg = ctxd_store::views::vector::VectorIndexConfig {
+                dimensions: embedder_arc.dimensions(),
+                ..Default::default()
+            };
+            let _vec_idx = store
+                .ensure_vector_index(vec_cfg)
+                .await
+                .context("failed to open HNSW vector index")?;
+
+            let router = build_router(store.clone(), cap_engine.clone(), caveat_state.clone());
             let http_handle = tokio::spawn(async move {
                 let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
                 tracing::info!("HTTP admin API listening on {addr}");
                 axum::serve(listener, router).await.unwrap();
             });
 
-            // Spawn wire protocol server (MessagePack over TCP).
+            // Bootstrap federation. Requires a local signing key — create
+            // one if absent so federation always has a stable identity.
+            let signing_bytes = match store.get_metadata("signing_key").await? {
+                Some(b) => b,
+                None => {
+                    let signer = ctxd_core::signing::EventSigner::new();
+                    store
+                        .set_metadata("signing_key", &signer.secret_key_bytes())
+                        .await?;
+                    store
+                        .set_metadata("signing_public_key", &signer.public_key_bytes())
+                        .await?;
+                    signer.secret_key_bytes()
+                }
+            };
+            let signer = ctxd_core::signing::EventSigner::from_bytes(&signing_bytes)
+                .map_err(|e| anyhow::anyhow!("bad signing key: {e}"))?;
+            let local_peer_id = hex::encode(signer.public_key_bytes());
+            tracing::info!(local_peer_id = %local_peer_id, "federation identity ready");
+
+            // Spawn wire protocol server (MessagePack over TCP) with
+            // federation attached.
             let wire_server = ProtocolServer::new(store.clone(), cap_engine.clone(), wire_addr);
+            let event_tx_for_fed = wire_server.event_sender();
+            let fed = std::sync::Arc::new(federation::PeerManager::new(
+                std::sync::Arc::new(store.clone()),
+                cap_engine.clone(),
+                local_peer_id,
+                signing_bytes,
+                event_tx_for_fed,
+                federation::AutoAcceptPolicy::from_env(),
+            ));
+            // Re-enroll persisted peers so outbound replication can
+            // dial them without manual `peer add` after restart.
+            for p in store.peer_list_impl().await? {
+                fed.enroll(federation::EnrolledPeer {
+                    peer_id: p.peer_id.clone(),
+                    remote_pubkey: p.public_key,
+                    remote_grants_us: p.granted_subjects.clone(),
+                    we_grant_remote: p.granted_subjects,
+                    cap_from_remote: None,
+                    cap_for_remote: None,
+                })
+                .await;
+            }
+            let _replication_handle = fed.start_replication_tasks();
+            let wire_server = wire_server.with_federation(fed.clone());
             let wire_handle = tokio::spawn(async move {
                 if let Err(e) = wire_server.run().await {
                     tracing::error!("Wire protocol server error: {e}");
                 }
             });
 
-            if mcp_stdio {
-                let mcp_server = CtxdMcpServer::new(store, cap_engine, format!("ctxd://{addr}"));
-                tracing::info!("MCP server on stdio ready");
-                let transport = rmcp::transport::io::stdio();
-                let running = mcp_server
-                    .serve(transport)
-                    .await
-                    .context("MCP server failed to start")?;
-                let _ = running.waiting().await;
+            // Build the shared MCP server. Each transport gets its own
+            // logical clone (CtxdMcpServer is cheap to clone — store +
+            // cap engine + caveat state are Arc-backed). The embedder
+            // is attached so ctx_search can do vector + hybrid modes.
+            let mcp_server = CtxdMcpServer::new(
+                store.clone(),
+                cap_engine.clone(),
+                caveat_state.clone(),
+                format!("ctxd://{addr}"),
+            )
+            .with_embedder(embedder_arc.clone());
+
+            // Auth policy applies to HTTP transports only. Stdio is
+            // local-subprocess and keeps the legacy "open by default"
+            // behaviour for backwards compatibility.
+            let policy = if require_auth {
+                ctxd_mcp::auth::AuthPolicy::Required
             } else {
-                let _ = tokio::join!(http_handle, wire_handle);
+                ctxd_mcp::auth::AuthPolicy::Optional
+            };
+
+            // Shared cancellation token so SIGTERM / Ctrl-C tears every
+            // transport down. The CLI doesn't (yet) wire signal handling
+            // explicitly — the parent's cancellation propagates via
+            // tokio's main exit.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+
+            let mut sse_handle: Option<tokio::task::JoinHandle<()>> = None;
+            if let Some(sse_bind) = mcp_sse {
+                let sse_addr: SocketAddr = sse_bind.parse().context("invalid --mcp-sse address")?;
+                let server_clone = mcp_server.clone();
+                let shutdown_clone = shutdown.clone();
+                sse_handle = Some(tokio::spawn(async move {
+                    if let Err(e) =
+                        ctxd_mcp::transport::run_sse(server_clone, sse_addr, policy, shutdown_clone)
+                            .await
+                    {
+                        tracing::error!(error = %e, "SSE transport ended");
+                    }
+                }));
+            }
+
+            let mut http_mcp_handle: Option<tokio::task::JoinHandle<()>> = None;
+            if let Some(http_bind) = mcp_http {
+                let http_addr: SocketAddr =
+                    http_bind.parse().context("invalid --mcp-http address")?;
+                let server_clone = mcp_server.clone();
+                let shutdown_clone = shutdown.clone();
+                http_mcp_handle = Some(tokio::spawn(async move {
+                    if let Err(e) = ctxd_mcp::transport::run_streamable_http(
+                        server_clone,
+                        http_addr,
+                        policy,
+                        shutdown_clone,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "streamable-HTTP transport ended");
+                    }
+                }));
+            }
+
+            // Stdio is special: when it disconnects, only its task ends.
+            // Sibling transports keep running. We spawn it on a task so
+            // we can join all transports symmetrically.
+            let stdio_handle = if mcp_stdio {
+                let server_clone = mcp_server.clone();
+                Some(tokio::spawn(async move {
+                    tracing::info!("MCP server on stdio ready");
+                    if let Err(e) = ctxd_mcp::transport::run_stdio(server_clone).await {
+                        tracing::error!(error = %e, "stdio transport ended");
+                    }
+                }))
+            } else {
+                None
+            };
+
+            // Wait on whichever transports we started. The HTTP admin
+            // API is always running; we always join its handle. The
+            // wire protocol is also always running. MCP transports are
+            // optional — join when present.
+            let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![http_handle, wire_handle];
+            if let Some(h) = stdio_handle {
+                handles.push(h);
+            }
+            if let Some(h) = sse_handle {
+                handles.push(h);
+            }
+            if let Some(h) = http_mcp_handle {
+                handles.push(h);
+            }
+            for h in handles {
+                let _ = h.await;
             }
         }
 
@@ -287,7 +665,7 @@ async fn main() -> Result<()> {
                         signer
                     }
                 };
-                event.signature = Some(signer.sign(&event));
+                event.signature = Some(signer.sign(&event).context("failed to sign event")?);
             }
 
             let stored = store.append(event).await.context("write failed")?;
@@ -423,6 +801,246 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&subjects)?);
         }
 
+        Commands::Peer { action } => {
+            use ctxd_store::core::{Peer, PeerCursor};
+            match action {
+                PeerAction::Add {
+                    peer_id,
+                    url,
+                    public_key,
+                    subjects,
+                    manual,
+                } => {
+                    let granted: Vec<String> = subjects
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    if manual {
+                        // Offline enrollment: just record the peer row.
+                        // public_key is required.
+                        let pk_hex = public_key.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("--public-key is required when --manual")
+                        })?;
+                        let pk_bytes = hex::decode(pk_hex).context("invalid hex public key")?;
+                        if pk_bytes.len() != 32 {
+                            anyhow::bail!(
+                                "public key must be 32 bytes (64 hex chars); got {}",
+                                pk_bytes.len()
+                            );
+                        }
+                        let peer = Peer {
+                            peer_id: peer_id.clone(),
+                            url,
+                            public_key: pk_bytes,
+                            granted_subjects: granted,
+                            trust_level: serde_json::json!({"auto_accept": false}),
+                            added_at: chrono::Utc::now(),
+                        };
+                        store
+                            .peer_add_impl(peer)
+                            .await
+                            .context("failed to add peer")?;
+                        println!("peer {peer_id} added (manual)");
+                    } else {
+                        // Real handshake: dial the URL via PeerManager and
+                        // perform PeerHello → PeerWelcome.
+                        use ctxd_cli::federation::{AutoAcceptPolicy, PeerManager};
+                        // Local signing key is required for outbound
+                        // handshake (we sign our pubkey assertion in
+                        // PeerHello). Auto-create one if missing.
+                        let signing_bytes = match store.get_metadata("signing_key").await? {
+                            Some(b) => b,
+                            None => {
+                                let signer = ctxd_core::signing::EventSigner::new();
+                                store
+                                    .set_metadata("signing_key", &signer.secret_key_bytes())
+                                    .await?;
+                                store
+                                    .set_metadata("signing_public_key", &signer.public_key_bytes())
+                                    .await?;
+                                signer.secret_key_bytes()
+                            }
+                        };
+                        let signer = ctxd_core::signing::EventSigner::from_bytes(&signing_bytes)
+                            .map_err(|e| anyhow::anyhow!("bad signing key: {e}"))?;
+                        let local_pid = hex::encode(signer.public_key_bytes());
+                        let (event_tx, _) =
+                            tokio::sync::broadcast::channel::<protocol::BroadcastEvent>(64);
+                        let mgr = std::sync::Arc::new(PeerManager::new(
+                            std::sync::Arc::new(store.clone()),
+                            cap_engine.clone(),
+                            local_pid,
+                            signing_bytes,
+                            event_tx,
+                            AutoAcceptPolicy::from_env(),
+                        ));
+                        let enrolled = mgr
+                            .handshake_outbound(&peer_id, &url, &granted)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
+                        if let Some(expected) = public_key {
+                            let actual = hex::encode(&enrolled.remote_pubkey);
+                            if !actual.eq_ignore_ascii_case(&expected) {
+                                anyhow::bail!(
+                                    "remote pubkey {actual} does not match expected {expected}"
+                                );
+                            }
+                        }
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "peer_id": enrolled.peer_id,
+                                "remote_pubkey": hex::encode(&enrolled.remote_pubkey),
+                                "remote_grants_us": enrolled.remote_grants_us,
+                                "we_grant_remote": enrolled.we_grant_remote,
+                                "handshake": "ok",
+                            }))?
+                        );
+                    }
+                }
+                PeerAction::List => {
+                    let peers = store
+                        .peer_list_impl()
+                        .await
+                        .context("failed to list peers")?;
+                    let out: Vec<_> = peers
+                        .into_iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "peer_id": p.peer_id,
+                                "url": p.url,
+                                "public_key": hex::encode(&p.public_key),
+                                "granted_subjects": p.granted_subjects,
+                                "trust_level": p.trust_level,
+                                "added_at": p.added_at.to_rfc3339(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                PeerAction::Status { peer_id } => {
+                    // Status report: the peer's cursors across all known
+                    // subject patterns. Today we don't track "last
+                    // contact" timestamps separately from cursors —
+                    // the cursor's `updated_at` is the closest thing.
+                    let peers = store
+                        .peer_list_impl()
+                        .await
+                        .context("failed to list peers")?;
+                    let peer = peers
+                        .into_iter()
+                        .find(|p| p.peer_id == peer_id)
+                        .ok_or_else(|| anyhow::anyhow!("peer not found: {peer_id}"))?;
+                    // Peer cursors are not enumerable by `peer_id` alone
+                    // in the trait; for now we just print the peer row.
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "peer_id": peer.peer_id,
+                            "url": peer.url,
+                            "granted_subjects": peer.granted_subjects,
+                            "note": "replication cursors are per-(peer, subject_pattern); inspect via peer_cursor_get once federation is wired (Phase 2D)",
+                        }))?
+                    );
+                }
+                PeerAction::Remove { peer_id } => {
+                    store
+                        .peer_remove_impl(&peer_id)
+                        .await
+                        .context("failed to remove peer")?;
+                    println!("peer {peer_id} removed");
+                }
+                PeerAction::Grant { peer_id, subjects } => {
+                    // Fetch, mutate, re-upsert — peer_add is idempotent.
+                    let peers = store
+                        .peer_list_impl()
+                        .await
+                        .context("failed to list peers")?;
+                    let mut peer = peers
+                        .into_iter()
+                        .find(|p| p.peer_id == peer_id)
+                        .ok_or_else(|| anyhow::anyhow!("peer not found: {peer_id}"))?;
+                    peer.granted_subjects = subjects
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    store
+                        .peer_add_impl(peer)
+                        .await
+                        .context("failed to update peer grant")?;
+                    // Reset any existing cursors for removed patterns
+                    // — cheap correctness: on next reconnect, we
+                    // resend from the beginning of retained patterns.
+                    let _ = PeerCursor {
+                        peer_id: peer_id.clone(),
+                        subject_pattern: "/**".to_string(),
+                        last_event_id: None,
+                        last_event_time: None,
+                    };
+                    println!("peer {peer_id} grant updated");
+                }
+            }
+        }
+
+        Commands::Migrate { to, dry_run, force } => {
+            if to != "0.3" {
+                anyhow::bail!(
+                    "unsupported migration target: {to} (only '0.3' is supported in this release)"
+                );
+            }
+            // If a signing key was stored during earlier writes, we use it
+            // to re-sign events that were previously signed. If no key is
+            // stored, migration still rewrites hashes but leaves
+            // signatures alone.
+            let signing_key = store.get_metadata("signing_key").await?;
+            let report =
+                ctxd_store::migrate::migrate_to_v03(&store, signing_key.as_deref(), dry_run, force)
+                    .await
+                    .context("migration failed")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "target": to,
+                    "dry_run": report.dry_run,
+                    "already_migrated": report.already_migrated,
+                    "events_considered": report.considered,
+                    "events_rewritten": report.rewritten,
+                    "batches_committed": report.batches_committed,
+                }))?
+            );
+        }
+
+        Commands::Approve { id, decision } => {
+            let dec = match decision.to_ascii_lowercase().as_str() {
+                "allow" => ApprovalDecision::Allow,
+                "deny" => ApprovalDecision::Deny,
+                other => anyhow::bail!("--decision must be 'allow' or 'deny', got '{other}'"),
+            };
+            // The CLI talks to the daemon's database directly: it
+            // doesn't make sense to require the daemon be running
+            // (ops scenario: emergency deny while serve is down).
+            caveat_state
+                .approval_decide(&id, dec)
+                .await
+                .context("failed to record decision")?;
+            tracing::info!(approval_id = %id, decision = ?dec, "approval decided via CLI");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "approval_id": id,
+                    "decision": match dec {
+                        ApprovalDecision::Allow => "allow",
+                        ApprovalDecision::Deny => "deny",
+                        ApprovalDecision::Pending => "pending",
+                    },
+                    "status": "ok",
+                }))?
+            );
+        }
+
         Commands::Connect { addr, action } => {
             let mut client = ProtocolClient::connect(&addr)
                 .await
@@ -544,4 +1162,105 @@ fn init_tracing() -> OtelGuard {
 
         OtelGuard { provider: None }
     }
+}
+
+/// Minimal serve path used when `--storage` selects a non-SQLite backend.
+///
+/// Only the HTTP admin's `/health` and a small read-only window over
+/// the trait surface are exposed. Wire protocol, federation, and MCP
+/// transports require concrete `EventStore` plumbing in v0.3; once
+/// those are migrated to `dyn Store` (v0.4 per ADR 019), this
+/// fallback collapses into the main `Serve` flow.
+async fn run_minimal_serve(
+    bind: String,
+    store: std::sync::Arc<dyn ctxd_store_core::Store>,
+) -> Result<()> {
+    use axum::extract::{Query as AxumQuery, State as AxumState};
+    use axum::routing::{get, post};
+    use axum::Json;
+    use std::collections::HashMap;
+    let addr: SocketAddr = bind.parse().context("invalid bind address")?;
+    let app_state = store.clone();
+    let router = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async { Json(serde_json::json!({"ok": true, "mode": "minimal"})) }),
+        )
+        .route(
+            "/v1/append",
+            post(
+                |AxumState(s): AxumState<std::sync::Arc<dyn ctxd_store_core::Store>>,
+                 Json(body): Json<serde_json::Value>| async move {
+                    let subject = body
+                        .get("subject")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("/")
+                        .to_string();
+                    let event_type = body
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("event")
+                        .to_string();
+                    let data = body.get("data").cloned().unwrap_or(serde_json::json!({}));
+                    let subject = match Subject::new(&subject) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": e.to_string()})),
+                            );
+                        }
+                    };
+                    let event = Event::new("ctxd://minimal".to_string(), subject, event_type, data);
+                    match s.append(event).await {
+                        Ok(stored) => (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({"id": stored.id.to_string()})),
+                        ),
+                        Err(e) => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": e.to_string()})),
+                        ),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/read",
+            get(
+                |AxumState(s): AxumState<std::sync::Arc<dyn ctxd_store_core::Store>>,
+                 AxumQuery(q): AxumQuery<HashMap<String, String>>| async move {
+                    let subject = q.get("subject").cloned().unwrap_or_else(|| "/".to_string());
+                    let recursive = q
+                        .get("recursive")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                    let subject = match Subject::new(&subject) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": e.to_string()})),
+                            );
+                        }
+                    };
+                    match s.read(&subject, recursive).await {
+                        Ok(events) => (axum::http::StatusCode::OK, Json(serde_json::json!(events))),
+                        Err(e) => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": e.to_string()})),
+                        ),
+                    }
+                },
+            ),
+        )
+        .with_state(app_state);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("bind minimal admin")?;
+    tracing::info!("minimal HTTP admin listening on {addr}");
+    axum::serve(listener, router)
+        .await
+        .context("minimal serve")?;
+    Ok(())
 }

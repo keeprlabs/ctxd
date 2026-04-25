@@ -14,7 +14,14 @@ use crate::subject::Subject;
 ///
 /// Required CloudEvents attributes: `specversion`, `id`, `source`, `type`.
 /// Optional CloudEvents attributes: `subject`, `time`, `datacontenttype`, `data`.
-/// ctxd extensions: `predecessorhash`, `signature`.
+/// ctxd extensions: `predecessorhash`, `signature`, `parents`, `attestation`.
+///
+/// # Canonical form (v0.3)
+///
+/// For hashing and signing purposes, the canonical form includes `parents`
+/// (always, as an array of UUID strings sorted lexicographically — empty
+/// array if none) and `attestation` (hex-encoded bytes if present, `null`
+/// otherwise). See [`crate::hash::PredecessorHash`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
     /// CloudEvents spec version. Always "1.0".
@@ -49,9 +56,55 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predecessorhash: Option<String>,
 
-    /// Ed25519 signature. Reserved for v0.2.
+    /// Ed25519 signature over the canonical form, hex-encoded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+
+    /// Parent event IDs, used to represent concurrent/branch merges in a
+    /// federated log. An empty vec means "no explicit parents" — the
+    /// event's only predecessor is the subject-chain predecessor given
+    /// by [`predecessorhash`](Self::predecessorhash).
+    ///
+    /// Serialized when non-empty; always included in canonical form
+    /// (sorted by id string; empty array when no parents).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<Uuid>,
+
+    /// Optional TEE (trusted execution environment) attestation payload.
+    ///
+    /// ctxd does not interpret this field — it is carried end-to-end
+    /// through federation replication and may be verified by an
+    /// operator-supplied hook on the consumer side. Serialized as a
+    /// hex-encoded string when present; always included in canonical
+    /// form (hex-encoded or `null`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "hex_bytes_opt"
+    )]
+    pub attestation: Option<Vec<u8>>,
+}
+
+/// Serde helper: encode `Option<Vec<u8>>` as an optional hex string.
+mod hex_bytes_opt {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => hex::encode(b).serialize(s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            Some(s) => hex::decode(&s)
+                .map(Some)
+                .map_err(|e| serde::de::Error::custom(format!("invalid hex attestation: {e}"))),
+            None => Ok(None),
+        }
+    }
 }
 
 impl Event {
@@ -59,6 +112,7 @@ impl Event {
     ///
     /// Sets `specversion` to "1.0", generates a UUIDv7 `id`,
     /// sets `time` to now, and `datacontenttype` to "application/json".
+    /// `parents` is empty and `attestation` is `None`.
     pub fn new(
         source: String,
         subject: Subject,
@@ -76,7 +130,21 @@ impl Event {
             data,
             predecessorhash: None,
             signature: None,
+            parents: Vec::new(),
+            attestation: None,
         }
+    }
+
+    /// Return the parent IDs sorted lexicographically by their string
+    /// representation, without mutating the event.
+    ///
+    /// This ordering is what the canonical form uses, so external code
+    /// that wants to reason about the canonical parent order can call
+    /// this helper instead of reimplementing the sort.
+    pub fn parents_sorted(&self) -> Vec<Uuid> {
+        let mut ps = self.parents.clone();
+        ps.sort_by_key(|a| a.to_string());
+        ps
     }
 }
 
@@ -102,6 +170,8 @@ mod tests {
         assert_eq!(event.event_type, deserialized.event_type);
         assert_eq!(event.data, deserialized.data);
         assert_eq!(event.specversion, "1.0");
+        assert!(deserialized.parents.is_empty());
+        assert!(deserialized.attestation.is_none());
     }
 
     #[test]
@@ -118,9 +188,11 @@ mod tests {
         assert_eq!(value["specversion"], "1.0");
         assert_eq!(value["type"], "demo");
         assert_eq!(value["datacontenttype"], "application/json");
-        // predecessorhash should be absent when None
+        // Optional fields should be absent when empty/None.
         assert!(value.get("predecessorhash").is_none());
         assert!(value.get("signature").is_none());
+        assert!(value.get("parents").is_none());
+        assert!(value.get("attestation").is_none());
     }
 
     #[test]
@@ -140,7 +212,6 @@ mod tests {
 
     #[test]
     fn event_with_large_data_payload() {
-        // Build a ~1MB JSON payload
         let large_string = "x".repeat(1_000_000);
         let data = serde_json::json!({"content": large_string});
         let subject = Subject::new("/test/large").unwrap();
@@ -171,7 +242,6 @@ mod tests {
         let deserialized: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.data, serde_json::Value::Null);
 
-        // Also test with empty object and empty array
         let event2 = Event::new(
             "ctxd://localhost".to_string(),
             Subject::new("/test/empty2").unwrap(),
@@ -191,5 +261,47 @@ mod tests {
         let json3 = serde_json::to_string(&event3).unwrap();
         let deser3: Event = serde_json::from_str(&json3).unwrap();
         assert_eq!(deser3.data, serde_json::json!([]));
+    }
+
+    #[test]
+    fn event_with_parents_and_attestation_roundtrips() {
+        let mut event = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/merge/test").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({"merge": true}),
+        );
+        event.parents = vec![Uuid::now_v7(), Uuid::now_v7()];
+        event.attestation = Some(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deser: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.parents, event.parents);
+        assert_eq!(
+            deser.attestation.as_deref(),
+            Some(&[0xde, 0xad, 0xbe, 0xefu8][..])
+        );
+
+        // Attestation should be serialized as hex
+        let value: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["attestation"], "deadbeef");
+        assert!(value["parents"].is_array());
+    }
+
+    #[test]
+    fn parents_sorted_is_lexicographic() {
+        let id_a = Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap();
+        let id_b = Uuid::parse_str("00000000-0000-7000-8000-000000000002").unwrap();
+        let id_c = Uuid::parse_str("00000000-0000-7000-8000-000000000003").unwrap();
+
+        let mut event = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/sort/test").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({}),
+        );
+        event.parents = vec![id_c, id_a, id_b];
+        let sorted = event.parents_sorted();
+        assert_eq!(sorted, vec![id_a, id_b, id_c]);
     }
 }

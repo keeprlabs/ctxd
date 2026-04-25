@@ -10,6 +10,15 @@
 //! alphabetically (via `BTreeMap`-backed ordering). The `predecessorhash` and
 //! `signature` fields are excluded from the canonical form to avoid circular
 //! dependencies.
+//!
+//! v0.3 additions:
+//! - `parents`: serialized as an array of UUID strings sorted lexicographically.
+//!   Empty array if the event has no explicit parents.
+//! - `attestation`: serialized as a hex-encoded string, or JSON `null` if absent.
+//!
+//! Both v0.3 fields are **always** present in canonical form, even when empty
+//! or `None`, so that the canonical form is stable across ctxd versions once
+//! an event is migrated to v0.3.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -83,6 +92,27 @@ fn canonical_form(event: &Event) -> Result<serde_json::Value, serde_json::Error>
         serde_json::to_value(&event.datacontenttype)?,
     );
     map.insert("data", event.data.clone());
+
+    // v0.3: parents — always present. Sorted lexicographically by id string
+    // so that two peers with the same parent set produce the same canonical
+    // form regardless of insertion order.
+    let parents_sorted: Vec<String> = {
+        let mut v: Vec<String> = event.parents.iter().map(|u| u.to_string()).collect();
+        v.sort();
+        v
+    };
+    map.insert("parents", serde_json::to_value(parents_sorted)?);
+
+    // v0.3: attestation — always present. Encoded as hex string when
+    // present, JSON null when absent. Unconditional inclusion means the
+    // canonical form is stable across v0.3 events regardless of whether
+    // they carry TEE attestation.
+    let attestation_val: serde_json::Value = match &event.attestation {
+        Some(bytes) => serde_json::Value::String(hex::encode(bytes)),
+        None => serde_json::Value::Null,
+    };
+    map.insert("attestation", attestation_val);
+
     serde_json::to_value(map)
 }
 
@@ -90,6 +120,7 @@ fn canonical_form(event: &Event) -> Result<serde_json::Value, serde_json::Error>
 mod tests {
     use super::*;
     use crate::subject::Subject;
+    use uuid::Uuid;
 
     #[test]
     fn hash_is_deterministic() {
@@ -122,6 +153,49 @@ mod tests {
 
         let h2 = PredecessorHash::compute(&event).unwrap();
         assert_eq!(h1, h2, "predecessor and signature must not affect hash");
+    }
+
+    #[test]
+    fn hash_includes_parents_and_attestation() {
+        let mut e1 = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/test/parents").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({"msg": "hello"}),
+        );
+        let h_empty = PredecessorHash::compute(&e1).unwrap();
+
+        e1.parents = vec![Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap()];
+        let h_with_parent = PredecessorHash::compute(&e1).unwrap();
+        assert_ne!(h_empty, h_with_parent, "parents must affect hash");
+
+        e1.attestation = Some(vec![1, 2, 3]);
+        let h_with_attest = PredecessorHash::compute(&e1).unwrap();
+        assert_ne!(h_with_parent, h_with_attest, "attestation must affect hash");
+    }
+
+    #[test]
+    fn hash_invariant_to_parent_order() {
+        let id_a = Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap();
+        let id_b = Uuid::parse_str("00000000-0000-7000-8000-000000000002").unwrap();
+
+        let mut e1 = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/test/order").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({}),
+        );
+        e1.parents = vec![id_a, id_b];
+        let h1 = PredecessorHash::compute(&e1).unwrap();
+
+        let mut e2 = e1.clone();
+        e2.parents = vec![id_b, id_a];
+        let h2 = PredecessorHash::compute(&e2).unwrap();
+
+        assert_eq!(
+            h1, h2,
+            "canonical form must be invariant to parent insertion order"
+        );
     }
 
     #[test]
@@ -162,7 +236,6 @@ mod tests {
         );
         e2.predecessorhash = Some(h1.to_string());
 
-        // Verify the chain link
         assert!(PredecessorHash::verify(
             &e1,
             e2.predecessorhash.as_ref().unwrap()
@@ -178,14 +251,14 @@ mod tests {
             serde_json::json!({}),
         );
         let hash = PredecessorHash::compute(&event).unwrap();
-        // SHA-256 produces 64 hex chars
         assert_eq!(hash.as_str().len(), 64);
         assert!(hash.as_str().chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    /// Hash stability test: hardcode an event with fixed fields and verify
-    /// the hash matches a known value. If this test fails, it means the
-    /// canonical form has changed, which would break existing hash chains.
+    /// Hash stability test: hardcode an event with fixed fields (including
+    /// v0.3 `parents` empty and `attestation` None) and verify the hash
+    /// matches a known value. If this test fails, it means the canonical
+    /// form has changed in a backwards-incompatible way.
     #[test]
     fn hash_stability_known_value() {
         use chrono::TimeZone;
@@ -201,13 +274,13 @@ mod tests {
             data: serde_json::json!({"key": "value", "number": 42}),
             predecessorhash: None,
             signature: None,
+            parents: Vec::new(),
+            attestation: None,
         };
 
         let hash = PredecessorHash::compute(&event).unwrap();
-        // Record the hash. If canonical form ever changes, this will break.
         let known_hash = hash.as_str().to_string();
 
-        // Verify it's stable across multiple computations
         for _ in 0..10 {
             let h = PredecessorHash::compute(&event).unwrap();
             assert_eq!(
@@ -217,7 +290,6 @@ mod tests {
             );
         }
 
-        // Also verify that changing predecessorhash/signature doesn't affect it
         let mut event2 = event.clone();
         event2.predecessorhash = Some("something".to_string());
         event2.signature = Some("sig".to_string());
@@ -235,13 +307,52 @@ mod tests {
         );
         let hash = PredecessorHash::compute(&event).unwrap();
 
-        // Tamper with the data
         let mut tampered = event;
         tampered.data = serde_json::json!({"original": false});
 
         assert!(
             !PredecessorHash::verify(&tampered, hash.as_str()),
             "tampered event should not verify"
+        );
+    }
+
+    #[test]
+    fn hash_verify_rejects_tampered_parents() {
+        let mut event = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/test/tamper-parents").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({}),
+        );
+        event.parents = vec![Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap()];
+        let hash = PredecessorHash::compute(&event).unwrap();
+
+        let mut tampered = event;
+        tampered.parents = vec![Uuid::parse_str("00000000-0000-7000-8000-000000000002").unwrap()];
+
+        assert!(
+            !PredecessorHash::verify(&tampered, hash.as_str()),
+            "tampered parents should not verify"
+        );
+    }
+
+    #[test]
+    fn hash_verify_rejects_tampered_attestation() {
+        let mut event = Event::new(
+            "ctxd://localhost".to_string(),
+            Subject::new("/test/tamper-attest").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({}),
+        );
+        event.attestation = Some(vec![0xaa, 0xbb]);
+        let hash = PredecessorHash::compute(&event).unwrap();
+
+        let mut tampered = event;
+        tampered.attestation = Some(vec![0xcc, 0xdd]);
+
+        assert!(
+            !PredecessorHash::verify(&tampered, hash.as_str()),
+            "tampered attestation should not verify"
         );
     }
 }

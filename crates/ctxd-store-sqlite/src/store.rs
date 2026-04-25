@@ -4,8 +4,10 @@ use ctxd_core::event::Event;
 use ctxd_core::hash::PredecessorHash;
 use ctxd_core::signing::EventSigner;
 use ctxd_core::subject::Subject;
+use ctxd_embed::Embedder;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Errors from the event store.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,29 @@ pub struct EventStore {
     pool: SqlitePool,
     /// Optional Ed25519 signing key for event signatures.
     signing_key: Option<Vec<u8>>,
+    /// Optional pluggable embedder. When set, [`EventStore::append`]
+    /// auto-embeds the event's textual payload, persists the vector
+    /// in `vector_embeddings`, and inserts it into the HNSW index.
+    embedder: Option<Arc<dyn Embedder>>,
+    /// Persisted HNSW index. `None` until the index has been opened
+    /// with [`EventStore::open_with_index`] (or built lazily by
+    /// [`EventStore::ensure_vector_index`]). All vector writes flow
+    /// through here so concurrent searches can run lock-free.
+    vector_index: Option<Arc<crate::views::vector::VectorIndex>>,
+    /// Path to the underlying database file (None for in-memory).
+    /// Used to derive the `<db>.hnsw` index path.
+    db_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for EventStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventStore")
+            .field("has_signing_key", &self.signing_key.is_some())
+            .field("has_embedder", &self.embedder.is_some())
+            .field("has_vector_index", &self.vector_index.is_some())
+            .field("db_path", &self.db_path)
+            .finish()
+    }
 }
 
 impl EventStore {
@@ -52,6 +77,9 @@ impl EventStore {
         let store = Self {
             pool,
             signing_key: None,
+            embedder: None,
+            vector_index: None,
+            db_path: Some(path.to_path_buf()),
         };
         store.initialize().await?;
         Ok(store)
@@ -66,12 +94,144 @@ impl EventStore {
         let store = Self {
             pool,
             signing_key: None,
+            embedder: None,
+            vector_index: None,
+            db_path: None,
         };
         store.initialize().await?;
         Ok(store)
     }
 
+    /// Install an embedder. Subsequent [`EventStore::append`] calls
+    /// will auto-embed events with indexable text. Failures to embed
+    /// log a warning but do NOT fail the append — embeddings are a
+    /// best-effort view, the event log is the source of truth.
+    pub fn set_embedder(&mut self, embedder: Arc<dyn Embedder>) {
+        self.embedder = Some(embedder);
+    }
+
+    /// Borrow the configured embedder, if any.
+    pub fn embedder(&self) -> Option<&Arc<dyn Embedder>> {
+        self.embedder.as_ref()
+    }
+
+    /// Borrow the in-memory vector index, if one has been opened.
+    pub fn vector_index(&self) -> Option<&Arc<crate::views::vector::VectorIndex>> {
+        self.vector_index.as_ref()
+    }
+
+    /// Path to the underlying database file (None when in-memory).
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    /// Lazily open the persisted HNSW vector index. Idempotent —
+    /// returns the cached handle on subsequent calls.
+    ///
+    /// The index lives at `<db>.hnsw.{graph,data,meta,map}` next to
+    /// the SQLite file. If the on-disk artifacts are missing or
+    /// corrupt, a fresh in-memory index is returned and the caller
+    /// is expected to repopulate it from `vector_embeddings`.
+    pub async fn ensure_vector_index(
+        &mut self,
+        cfg: crate::views::vector::VectorIndexConfig,
+    ) -> Result<Arc<crate::views::vector::VectorIndex>, StoreError> {
+        if let Some(idx) = &self.vector_index {
+            return Ok(idx.clone());
+        }
+        let (idx, status) = match self.db_path.as_deref() {
+            Some(path) => crate::views::vector::VectorIndex::open_persistent(path, cfg.clone())
+                .map_err(|e| {
+                    StoreError::Database(sqlx::Error::Protocol(format!("vector index open: {e}")))
+                })?,
+            None => (
+                crate::views::vector::VectorIndex::open_in_memory(cfg.clone()),
+                crate::views::vector::OpenStatus::RebuildRequired,
+            ),
+        };
+        let arc = Arc::new(idx);
+        // If we couldn't load from disk OR if the SQL row count
+        // disagrees with the loaded element count, rebuild from
+        // scratch. The rebuild scans `vector_embeddings`.
+        let row_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vector_embeddings")
+            .fetch_one(&self.pool)
+            .await?;
+        let needs_rebuild = matches!(status, crate::views::vector::OpenStatus::RebuildRequired)
+            || (row_count.0 as usize) != arc.len();
+        if needs_rebuild {
+            tracing::info!(
+                rows = row_count.0,
+                index_count = arc.len(),
+                "rebuilding HNSW vector index from vector_embeddings"
+            );
+            self.rebuild_vector_index(arc.as_ref(), cfg.dimensions)
+                .await?;
+        }
+        self.vector_index = Some(arc.clone());
+        Ok(arc)
+    }
+
+    /// Rebuild `idx` by streaming vectors out of `vector_embeddings`.
+    /// Vectors with mismatched dimensions are skipped and logged.
+    async fn rebuild_vector_index(
+        &self,
+        idx: &crate::views::vector::VectorIndex,
+        expected_dims: usize,
+    ) -> Result<(), StoreError> {
+        let rows: Vec<(String, i64, Vec<u8>)> =
+            sqlx::query_as("SELECT event_id, dimensions, vector FROM vector_embeddings")
+                .fetch_all(&self.pool)
+                .await?;
+        // Decode all vectors first so the rebuild can run in a tight
+        // CPU-bound loop without holding any DB connections.
+        let mut decoded: Vec<(String, Vec<f32>)> = Vec::with_capacity(rows.len());
+        for (event_id, dims, bytes) in rows {
+            if (dims as usize) != expected_dims {
+                tracing::warn!(
+                    event_id = %event_id,
+                    expected = expected_dims,
+                    got = dims,
+                    "vector dimensions mismatch the configured embedder; skipping"
+                );
+                continue;
+            }
+            if bytes.len() != (dims as usize) * 4 {
+                tracing::warn!(
+                    event_id = %event_id,
+                    "vector_embeddings blob has wrong byte length; skipping"
+                );
+                continue;
+            }
+            let mut v = Vec::with_capacity(dims as usize);
+            for chunk in bytes.chunks_exact(4) {
+                let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                v.push(f32::from_le_bytes(arr));
+            }
+            decoded.push((event_id, v));
+        }
+        // hand the iterator to rebuild_from. We pre-materialized so
+        // the borrows fit the &str/&[f32] signature.
+        let pairs: Vec<(&str, &[f32])> = decoded
+            .iter()
+            .map(|(e, v)| (e.as_str(), v.as_slice()))
+            .collect();
+        idx.rebuild_from(pairs).map_err(|e| {
+            StoreError::Database(sqlx::Error::Protocol(format!("rebuild_from: {e}")))
+        })?;
+        // Persist once after the rebuild so a subsequent crash
+        // doesn't rebuild from SQL again.
+        if let Err(e) = idx.flush() {
+            tracing::warn!(error = %e, "post-rebuild flush failed; will retry on next flush");
+        }
+        Ok(())
+    }
+
     /// Create tables and indexes.
+    ///
+    /// All schema migrations are additive. v0.3 adds `parents` and
+    /// `attestation` columns to `events` and introduces federation
+    /// (`peers`, `peer_cursors`, `event_parents`), budgets, approvals,
+    /// and vector embedding tables.
     async fn initialize(&self) -> Result<(), StoreError> {
         sqlx::query(
             r#"
@@ -86,7 +246,9 @@ impl EventStore {
                 data TEXT NOT NULL,
                 predecessorhash TEXT,
                 signature TEXT,
-                specversion TEXT NOT NULL DEFAULT '1.0'
+                specversion TEXT NOT NULL DEFAULT '1.0',
+                parents TEXT,
+                attestation BLOB
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_subject ON events(subject);
@@ -96,6 +258,23 @@ impl EventStore {
         )
         .execute(&self.pool)
         .await?;
+
+        // v0.3 additive migrations for pre-v0.3 databases. SQLite ignores
+        // duplicate ALTER TABLE on re-open because we swallow the error
+        // if the column already exists.
+        for alter in [
+            "ALTER TABLE events ADD COLUMN parents TEXT",
+            "ALTER TABLE events ADD COLUMN attestation BLOB",
+        ] {
+            if let Err(e) = sqlx::query(alter).execute(&self.pool).await {
+                // SQLite reports "duplicate column name" if the column is
+                // already there. Every other error is real.
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
 
         // Metadata table for daemon config (e.g., root capability key)
         sqlx::query(
@@ -191,6 +370,112 @@ impl EventStore {
         .execute(&self.pool)
         .await?;
 
+        // v0.3: event_parents. Normalized many-to-many side table for
+        // concurrent-branch parents. The `parents` column on events is the
+        // canonical form (sorted, comma-joined); this table exists so
+        // queries like "which events have parent X?" can use an index.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS event_parents (
+                event_id TEXT NOT NULL,
+                parent_id TEXT NOT NULL,
+                PRIMARY KEY (event_id, parent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_parents_parent ON event_parents(parent_id);
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v0.3: peers for federation. `public_key` is 32 raw Ed25519 bytes.
+        // `granted_subjects` is a JSON array of glob patterns this peer may
+        // receive. `trust_level` is a free-form JSON for future auto-accept
+        // policy.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS peers (
+                peer_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                granted_subjects TEXT NOT NULL DEFAULT '[]',
+                trust_level TEXT NOT NULL DEFAULT '{}',
+                added_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v0.3: peer_cursors for federation resume. Per-peer per-subject
+        // pattern cursor tracking the last event time/id we have exchanged.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS peer_cursors (
+                peer_id TEXT NOT NULL,
+                subject_pattern TEXT NOT NULL,
+                last_event_id TEXT,
+                last_event_time TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (peer_id, subject_pattern)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v0.3: token_budgets for BudgetLimit caveat. `currency` is a free
+        // ISO-style string (e.g. "USD_micro"). `spent` is monotonically
+        // increasing micro-units.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS token_budgets (
+                token_id TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                spent INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (token_id, currency)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v0.3: pending_approvals for HumanApprovalRequired caveat.
+        // Decisions: 'pending', 'allow', 'deny'.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_approvals (
+                approval_id TEXT PRIMARY KEY,
+                token_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                decision TEXT NOT NULL DEFAULT 'pending',
+                requested_at TEXT NOT NULL,
+                decided_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_approvals_decision ON pending_approvals(decision);
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v0.3: vector_embeddings. Raw vectors stored so a persisted HNSW
+        // index can be rebuilt on startup from SQLite alone.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS vector_embeddings (
+                event_id TEXT PRIMARY KEY,
+                model TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_vectors_model ON vector_embeddings(model);
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -198,19 +483,47 @@ impl EventStore {
     ///
     /// Computes and sets the predecessor hash based on the last event
     /// for the same subject tree. Updates materialized views.
+    ///
+    /// Federation note: if the event arrives with a non-`None`
+    /// `predecessorhash` we treat it as authoritative (the originating
+    /// peer computed it) and skip recomputation. The signature over the
+    /// canonical form binds the predecessorhash, so any tampering breaks
+    /// signature verification at the inbound checkpoint.
     #[tracing::instrument(skip(self, event), fields(subject = %event.subject))]
     pub async fn append(&self, mut event: Event) -> Result<Event, StoreError> {
-        // Compute predecessor hash from the last event in this subject's chain
-        let last_event = self.last_event_for_subject(event.subject.as_str()).await?;
-        if let Some(ref prev) = last_event {
-            let hash = PredecessorHash::compute(prev).map_err(StoreError::Serialization)?;
-            event.predecessorhash = Some(hash.to_string());
+        // Compute predecessor hash from the last event in this subject's
+        // chain — but only if the caller hasn't supplied one. Replicated
+        // events come with their origin's predecessorhash baked into
+        // their signature; recomputing would invalidate the signature.
+        if event.predecessorhash.is_none() {
+            let last_event = self.last_event_for_subject(event.subject.as_str()).await?;
+            if let Some(ref prev) = last_event {
+                let hash = PredecessorHash::compute(prev).map_err(StoreError::Serialization)?;
+                event.predecessorhash = Some(hash.to_string());
+            }
         }
 
-        // Sign the event if a signing key is available
-        if let Some(ref key) = self.signing_key {
-            if let Ok(signer) = EventSigner::from_bytes(key) {
-                event.signature = Some(signer.sign(&event));
+        // Sign the event if a signing key is available AND the event
+        // is not already signed. Replicated events arrive pre-signed by
+        // their origin peer; we must NOT re-sign with the local key
+        // because that would invalidate cross-peer signature
+        // verification. Signing failures (malformed key bytes or
+        // serialization errors) are logged via tracing and the event
+        // is appended unsigned — we do not want a misconfigured key to
+        // block writes.
+        if event.signature.is_none() {
+            if let Some(ref key) = self.signing_key {
+                match EventSigner::from_bytes(key) {
+                    Ok(signer) => match signer.sign(&event) {
+                        Ok(sig) => event.signature = Some(sig),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to sign event; appending unsigned");
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "invalid signing key bytes; appending unsigned");
+                    }
+                }
             }
         }
 
@@ -219,12 +532,28 @@ impl EventStore {
         let data = serde_json::to_string(&event.data)?;
         let time = event.time.to_rfc3339();
 
+        // Canonical parents column: sorted UUIDs joined by ",". Empty string
+        // is represented as NULL so a pre-v0.3 column (all-NULL) and a
+        // freshly-written v0.3 event with no parents look the same.
+        let parents_sorted = event.parents_sorted();
+        let parents_col: Option<String> = if parents_sorted.is_empty() {
+            None
+        } else {
+            Some(
+                parents_sorted
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
+
         let mut tx = self.pool.begin().await?;
 
         let result = sqlx::query(
             r#"
-            INSERT INTO events (id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&id)
@@ -237,12 +566,27 @@ impl EventStore {
         .bind(&event.predecessorhash)
         .bind(&event.signature)
         .bind(&event.specversion)
+        .bind(&parents_col)
+        .bind(event.attestation.as_deref())
         .execute(&mut *tx)
         .await?;
 
         let seq = result.last_insert_rowid();
 
-        // Update KV view
+        // Side-table for efficient parent lookups.
+        for parent in &parents_sorted {
+            sqlx::query("INSERT OR IGNORE INTO event_parents (event_id, parent_id) VALUES (?, ?)")
+                .bind(&id)
+                .bind(parent.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // Update KV view under the federation LWW rule (ADR 006):
+        // overwrite the row only when the incoming event has a strictly
+        // greater `(time, event_id)` tuple. UUIDv7 ids are
+        // lexicographically monotonic in their embedded ms timestamp,
+        // so the same SQL works as a deterministic tiebreak.
         sqlx::query(
             r#"
             INSERT INTO kv_view (subject, event_id, data, updated_at)
@@ -251,6 +595,7 @@ impl EventStore {
                 event_id = excluded.event_id,
                 data = excluded.data,
                 updated_at = excluded.updated_at
+            WHERE (excluded.updated_at, excluded.event_id) > (kv_view.updated_at, kv_view.event_id)
             "#,
         )
         .bind(&subject)
@@ -277,6 +622,50 @@ impl EventStore {
 
         tx.commit().await?;
 
+        // Auto-embed AFTER the canonical row is durable. Failure
+        // here logs but never fails the append — embeddings are a
+        // best-effort materialized view; the event log is the
+        // source of truth.
+        if let Some(embedder) = &self.embedder {
+            if let Some(text) = indexable_text(&event) {
+                let dims = embedder.dimensions();
+                match embedder.embed(&text).await {
+                    Ok(vec) => {
+                        if vec.len() != dims {
+                            tracing::warn!(
+                                event_id = %id,
+                                expected = dims,
+                                got = vec.len(),
+                                "embedder returned wrong-dimensional vector; skipping"
+                            );
+                        } else {
+                            // Persist to SQL first (canonical store).
+                            if let Err(e) =
+                                self.vector_upsert_impl(&id, embedder.model(), &vec).await
+                            {
+                                tracing::warn!(
+                                    event_id = %id,
+                                    error = %e,
+                                    "failed to persist embedding"
+                                );
+                            } else if let Some(idx) = &self.vector_index {
+                                if let Err(e) = idx.upsert(&id, &vec) {
+                                    tracing::warn!(
+                                        event_id = %id,
+                                        error = %e,
+                                        "failed to insert embedding into HNSW"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(event_id = %id, error = %e, "embedder failed; skipping");
+                    }
+                }
+            }
+        }
+
         Ok(event)
     }
 
@@ -290,7 +679,7 @@ impl EventStore {
                 format!("{}/%", subject.as_str())
             };
             sqlx::query_as::<_, EventRow>(
-                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE subject = ? OR subject LIKE ? ORDER BY seq ASC",
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE subject = ? OR subject LIKE ? ORDER BY seq ASC",
             )
             .bind(subject.as_str())
             .bind(&pattern)
@@ -298,7 +687,7 @@ impl EventStore {
             .await?
         } else {
             sqlx::query_as::<_, EventRow>(
-                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE subject = ? ORDER BY seq ASC",
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE subject = ? ORDER BY seq ASC",
             )
             .bind(subject.as_str())
             .fetch_all(&self.pool)
@@ -360,7 +749,7 @@ impl EventStore {
                 format!("{}/%", subject.as_str())
             };
             sqlx::query_as::<_, EventRow>(
-                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE (subject = ? OR subject LIKE ?) AND time > ? ORDER BY seq ASC",
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE (subject = ? OR subject LIKE ?) AND time > ? ORDER BY seq ASC",
             )
             .bind(subject.as_str())
             .bind(&pattern)
@@ -369,7 +758,7 @@ impl EventStore {
             .await?
         } else {
             sqlx::query_as::<_, EventRow>(
-                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE subject = ? AND time > ? ORDER BY seq ASC",
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE subject = ? AND time > ? ORDER BY seq ASC",
             )
             .bind(subject.as_str())
             .bind(&since_str)
@@ -389,7 +778,7 @@ impl EventStore {
     ) -> Result<Vec<Event>, StoreError> {
         let sql = if limit.is_some() {
             r#"
-            SELECT e.id, e.source, e.subject, e.event_type, e.time, e.datacontenttype, e.data, e.predecessorhash, e.signature, e.specversion
+            SELECT e.id, e.source, e.subject, e.event_type, e.time, e.datacontenttype, e.data, e.predecessorhash, e.signature, e.specversion, e.parents, e.attestation
             FROM events e
             JOIN fts_view f ON e.seq = f.rowid
             WHERE fts_view MATCH ?
@@ -398,7 +787,7 @@ impl EventStore {
             "#
         } else {
             r#"
-            SELECT e.id, e.source, e.subject, e.event_type, e.time, e.datacontenttype, e.data, e.predecessorhash, e.signature, e.specversion
+            SELECT e.id, e.source, e.subject, e.event_type, e.time, e.datacontenttype, e.data, e.predecessorhash, e.signature, e.specversion, e.parents, e.attestation
             FROM events e
             JOIN fts_view f ON e.seq = f.rowid
             WHERE fts_view MATCH ?
@@ -484,9 +873,50 @@ impl EventStore {
         Ok(row.is_some())
     }
 
+    /// List all approvals still in the `pending` state (v0.3
+    /// `HumanApprovalRequired` caveat).
+    ///
+    /// Returns lightweight JSON-shaped rows so the HTTP handler can
+    /// serialize them directly. Empty list is returned if the table is
+    /// empty or doesn't exist (older databases).
+    pub async fn pending_approvals_list(&self) -> Result<Vec<serde_json::Value>, StoreError> {
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT approval_id, token_id, operation, subject, requested_at
+            FROM pending_approvals
+            WHERE decision = 'pending'
+            ORDER BY requested_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(approval_id, token_id, operation, subject, requested_at)| {
+                    serde_json::json!({
+                        "approval_id": approval_id,
+                        "token_id": token_id,
+                        "operation": operation,
+                        "subject": subject,
+                        "requested_at": requested_at,
+                    })
+                },
+            )
+            .collect())
+    }
+
     /// Create a `GraphView` backed by the same connection pool.
     pub fn graph_view(&self) -> crate::views::graph::GraphView {
         crate::views::graph::GraphView::new(self.pool.clone())
+    }
+
+    /// Access the underlying connection pool. Exposed so that the
+    /// `Store` trait impl in [`crate::store_trait`] can perform extra
+    /// queries without re-opening a connection.
+    #[doc(hidden)]
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     /// Get the state of a subject at a specific point in time.
@@ -505,7 +935,7 @@ impl EventStore {
                 format!("{}/%", subject.as_str())
             };
             sqlx::query_as::<_, EventRow>(
-                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE (subject = ? OR subject LIKE ?) AND time <= ? ORDER BY seq ASC",
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE (subject = ? OR subject LIKE ?) AND time <= ? ORDER BY seq ASC",
             )
             .bind(subject.as_str())
             .bind(&pattern)
@@ -514,7 +944,7 @@ impl EventStore {
             .await?
         } else {
             sqlx::query_as::<_, EventRow>(
-                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE subject = ? AND time <= ? ORDER BY seq ASC",
+                "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE subject = ? AND time <= ? ORDER BY seq ASC",
             )
             .bind(subject.as_str())
             .bind(&as_of_str)
@@ -550,7 +980,7 @@ impl EventStore {
     /// Get the last event appended for a given subject path.
     async fn last_event_for_subject(&self, subject: &str) -> Result<Option<Event>, StoreError> {
         let row: Option<EventRow> = sqlx::query_as(
-            "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion FROM events WHERE subject = ? ORDER BY seq DESC LIMIT 1",
+            "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE subject = ? ORDER BY seq DESC LIMIT 1",
         )
         .bind(subject)
         .fetch_optional(&self.pool)
@@ -560,6 +990,33 @@ impl EventStore {
             Some(r) => Ok(Some(r.into_event()?)),
             None => Ok(None),
         }
+    }
+}
+
+/// Extract a free-text representation of `event` to feed into an
+/// embedder. Returns `None` if the event has no text-like content
+/// (binary blobs, empty payloads).
+///
+/// The current rule: prepend the subject (gives semantic anchor),
+/// then concatenate every string-valued field of the JSON payload
+/// (top-level only — avoids quadratic cost on deeply nested data).
+fn indexable_text(event: &Event) -> Option<String> {
+    let mut parts: Vec<String> = vec![event.subject.as_str().to_string()];
+    if let serde_json::Value::Object(map) = &event.data {
+        for (_, v) in map {
+            match v {
+                serde_json::Value::String(s) if !s.is_empty() => parts.push(s.clone()),
+                serde_json::Value::Number(n) => parts.push(n.to_string()),
+                serde_json::Value::Bool(b) => parts.push(b.to_string()),
+                _ => {}
+            }
+        }
+    }
+    let joined = parts.join(" ").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
     }
 }
 
@@ -576,10 +1033,25 @@ struct EventRow {
     predecessorhash: Option<String>,
     signature: Option<String>,
     specversion: String,
+    /// v0.3: comma-separated UUIDs. `None` or empty string means no parents.
+    parents: Option<String>,
+    /// v0.3: raw attestation bytes.
+    attestation: Option<Vec<u8>>,
 }
 
 impl EventRow {
     fn into_event(self) -> Result<Event, StoreError> {
+        let parents: Vec<uuid::Uuid> = match self.parents.as_deref() {
+            None | Some("") => Vec::new(),
+            Some(s) => s
+                .split(',')
+                .map(|p| {
+                    p.parse::<uuid::Uuid>().map_err(|e| {
+                        StoreError::Database(sqlx::Error::Protocol(format!("bad parent uuid: {e}")))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        };
         Ok(Event {
             specversion: self.specversion,
             id: self.id.parse().map_err(|e| {
@@ -595,6 +1067,8 @@ impl EventRow {
             data: serde_json::from_str(&self.data)?,
             predecessorhash: self.predecessorhash,
             signature: self.signature,
+            parents,
+            attestation: self.attestation,
         })
     }
 }
@@ -602,6 +1076,63 @@ impl EventRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn append_with_parents_and_attestation_roundtrips() {
+        let store = EventStore::open_memory().await.unwrap();
+        let subject = Subject::new("/merge/test").unwrap();
+        let p1 = uuid::Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap();
+        let p2 = uuid::Uuid::parse_str("00000000-0000-7000-8000-000000000002").unwrap();
+
+        let mut event = Event::new(
+            "ctxd://test".to_string(),
+            subject.clone(),
+            "demo".to_string(),
+            serde_json::json!({"step": "merge"}),
+        );
+        event.parents = vec![p2, p1]; // insertion order differs from sort order
+        event.attestation = Some(vec![0xba, 0xad, 0xf0, 0x0d]);
+
+        let stored = store.append(event).await.unwrap();
+        // Round-trip: read back and confirm fields survived.
+        let events = store.read(&subject, false).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, stored.id);
+        // parents should come back sorted on read (DB stores sorted form).
+        assert_eq!(events[0].parents, vec![p1, p2]);
+        assert_eq!(
+            events[0].attestation.as_deref(),
+            Some(&[0xba, 0xad, 0xf0, 0x0du8][..])
+        );
+
+        // The event_parents side table should have two rows for this event.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_parents WHERE event_id = ?")
+            .bind(stored.id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 2);
+    }
+
+    #[tokio::test]
+    async fn v03_schema_tables_exist() {
+        let store = EventStore::open_memory().await.unwrap();
+        // All v0.3 tables should exist and be queryable.
+        for table in [
+            "event_parents",
+            "peers",
+            "peer_cursors",
+            "token_budgets",
+            "pending_approvals",
+            "vector_embeddings",
+        ] {
+            let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&store.pool)
+                .await
+                .unwrap_or_else(|e| panic!("{table} missing: {e}"));
+            assert_eq!(row.0, 0, "{table} should start empty");
+        }
+    }
 
     #[tokio::test]
     async fn append_and_read() {

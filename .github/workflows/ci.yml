@@ -34,3 +34,48 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+
+  postgres:
+    name: Postgres backend (conformance + extras)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CTXD_PG_URL: postgres://postgres:test@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5432 -U postgres; then
+              echo "postgres ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres did not become ready" >&2
+          exit 1
+
+      - name: Clippy (postgres crate)
+        run: cargo clippy -p ctxd-store-postgres --all-targets -- -D warnings
+
+      - name: Conformance + extras
+        run: cargo test -p ctxd-store-postgres --all-targets

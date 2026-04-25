@@ -6,7 +6,9 @@ How ctxd works, how data flows through it, and how the pieces fit together. Writ
 
 ctxd is a daemon that stores and serves context for AI agents. Context is anything an agent might need: notes, documents, customer data, code changes, meeting summaries, file contents. It enters as events, gets indexed into materialized views, and leaves via MCP tool calls, wire protocol queries, or HTTP endpoints.
 
-One binary. One SQLite file. No external services.
+One binary. SQLite by default — Postgres available for operators who want a managed datastore. No external services required.
+
+Storage backends live behind the [`Store`](../crates/ctxd-store-core/src/lib.rs) trait (v0.3+); see ADR 017 for the conformance pattern that gates every backend, ADR 016 for the Postgres schema choices, and `docs/storage-postgres.md` for operator setup.
 
 ## System overview
 
@@ -271,7 +273,8 @@ Indexes on events: `subject`, `time`, `event_type`.
 | Token revocation | v0.2 | Needs revocation list |
 | Graph view | v0.2 | Needs LLM extraction |
 | Temporal queries | v0.2 | Needs point-in-time reconstruction |
-| Postgres/DuckDB | v0.2 | SQLite sufficient for single-node |
+| Postgres backend | v0.3 | Shipped — `ctxd-store-postgres` (ADR 016) |
+| DuckDB+object-store backend | v0.3 (in flight) | Phase 5B parallel agent |
 | Embedding generation | never | ctxd stores, not generates |
 | EventQL parser | v0.2 | Basic LIKE filter for v0.1 |
 | MCP over SSE/HTTP | v0.2 | stdio only |
