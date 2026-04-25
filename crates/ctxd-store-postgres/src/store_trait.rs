@@ -275,7 +275,7 @@ impl PostgresStore {
         .await?;
 
         let mut out = Vec::with_capacity(outgoing.len() + incoming.len());
-        for r in outgoing.into_iter().chain(incoming.into_iter()) {
+        for r in outgoing.into_iter().chain(incoming) {
             let id: String = r
                 .try_get("id")
                 .map_err(|e| PgStoreError::Decode(format!("rel.id: {e}")))?;

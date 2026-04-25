@@ -170,6 +170,9 @@ fn rewrite_token_in_jsonrpc(
                 }
             }
             obj @ serde_json::Value::Object(_) => {
+                // clippy::collapsible_match suggests merging this into a guard,
+                // but a guard borrows immutably, and inject_token needs &mut.
+                #[allow(clippy::collapsible_match)]
                 if inject_token(obj, header_tok) {
                     mutated = true;
                 }
@@ -240,18 +243,16 @@ fn inject_token(value: &mut serde_json::Value, header_token: &str) -> bool {
 fn json_has_token_arg(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Array(items) => items.iter().any(json_has_token_arg),
-        serde_json::Value::Object(obj) => {
-            if obj.get("method").and_then(|v| v.as_str()) == Some("tools/call") {
-                obj.get("params")
-                    .and_then(|p| p.as_object())
-                    .and_then(|p| p.get("arguments"))
-                    .and_then(|a| a.as_object())
-                    .and_then(|a| a.get("token"))
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|s| !s.is_empty())
-            } else {
-                false
-            }
+        serde_json::Value::Object(obj)
+            if obj.get("method").and_then(|v| v.as_str()) == Some("tools/call") =>
+        {
+            obj.get("params")
+                .and_then(|p| p.as_object())
+                .and_then(|p| p.get("arguments"))
+                .and_then(|a| a.as_object())
+                .and_then(|a| a.get("token"))
+                .and_then(|t| t.as_str())
+                .is_some_and(|s| !s.is_empty())
         }
         _ => false,
     }
