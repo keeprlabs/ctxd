@@ -1,0 +1,25 @@
+[package]
+name = "ctxd-store-core"
+description = "Storage trait and conformance test suite for ctxd backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctxd-core = { path = "../ctxd-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+
+[features]
+# Exposes the conformance test suite as a library feature so every backend
+# crate can re-use it from its own tests.
+testsuite = []
+
+[dev-dependencies]
+tokio = { workspace = true }

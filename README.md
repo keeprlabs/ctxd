@@ -1,67 +1,113 @@
 # ctxd
 
-Context substrate for AI agents. Single binary, append-only event log, subject-based addressing, capability tokens, MCP-native.
+Context substrate for AI agents. Single binary, append-only event log, subject-based addressing, capability tokens, federated, MCP-native.
 
 Not a vector DB. Not an agent framework. Not a knowledge graph. A substrate.
 
 ```mermaid
 flowchart LR
-    Agent["AI Agent\n(Claude, Cursor, custom)"]
-    MCP["MCP\n(stdio)"]
-    CTXD["ctxd daemon"]
-    LOG["Event Log\n(SQLite)"]
-    KV["KV View"]
-    FTS["FTS View"]
-    VEC["Vector View"]
-
-    Agent -->|"ctx_write\nctx_read\nctx_search"| MCP --> CTXD --> LOG
-    LOG --- KV
-    LOG --- FTS
-    LOG --- VEC
+    A1["Claude Desktop"] -->|"stdio"| MCP
+    A2["Claude.ai / Cursor"] -->|"streamable HTTP"| MCP
+    A3["Custom agent"] -->|"SSE"| MCP
+    MCP["MCP server<br/>(8 tools)"] --> CTXD["ctxd daemon"]
+    PEER["peer ctxd"] <-->|"replicate"| CTXD
+    GH["GitHub adapter"] --> CTXD
+    GM["Gmail adapter"] --> CTXD
+    FS["fs adapter"] --> CTXD
+    CTXD --> LOG["Event log<br/>(SQLite | Postgres | DuckDB+S3)"]
+    LOG --- KV["KV"]
+    LOG --- FTS["FTS"]
+    LOG --- VEC["Vector<br/>(HNSW)"]
+    LOG --- GRAPH["Graph"]
 ```
+
+## What's in v0.3
+
+- **Federation.** Two ctxd nodes peer with one command, replicate subjects bidirectionally, resume from persisted cursors after a crash, and verify biscuit third-party capability chains offline.
+- **Three storage backends.** SQLite (default), Postgres (clustered FTS via tsvector), DuckDB-on-object-store (Parquet log on S3/R2/local fs + SQLite sidecar) — all behind a shared `Store` trait + conformance suite.
+- **Multi-transport MCP.** stdio, SSE, and streamable-HTTP serve the same tool surface concurrently. Bearer-token auth on HTTP; tool-arg fallback for stdio.
+- **Real ingestion adapters.** Gmail (OAuth2 device flow + AES-256-GCM token at rest + History API incremental sync). GitHub (PAT + ETag caching + rate-limit handling).
+- **Hybrid search.** Pluggable embedder (OpenAI, Ollama, none); persisted HNSW index via `hnsw_rs`; FTS + vector + Reciprocal Rank Fusion.
+- **Stateful caveats.** `BudgetLimit` (per-token spend ceiling) and `HumanApprovalRequired` (blocking approval flow via `ctxd approve` or `POST /v1/approvals/:id/decide`).
+- **Causal DAG.** Events carry `parents` so concurrent writes are detected and resolved deterministically (LWW on `(time, id)`). Tamper-evident via predecessor hash chains; signed via Ed25519.
 
 ## Install and run
 
 ```bash
-git clone https://github.com/ctxd/ctxd && cd ctxd
+git clone https://github.com/keeprlabs/ctxd && cd ctxd
 cargo build --release
+# add --features storage-postgres,storage-duckdb-object for the heavier backends
 ```
 
 ## 60-second quickstart
 
 ```bash
-# Write three events
+# Start the daemon (SQLite + stdio MCP).
+ctxd serve
+
+# In another terminal: write a few events.
 ctxd write --subject /work/acme/notes/standup --type ctx.note \
   --data '{"content":"Ship auth by Friday"}'
-
-ctxd write --subject /work/acme/notes/standup --type ctx.note \
-  --data '{"content":"Blocked on API review"}'
-
 ctxd write --subject /work/acme/customers/cust-42 --type ctx.crm \
   --data '{"status":"interested","plan":"enterprise"}'
 
-# Read back everything under /work/acme
+# Read back recursively.
 ctxd read --subject /work/acme --recursive
 
-# Full-text search
-ctxd query 'FROM e IN events WHERE e.subject LIKE "/work/acme/%" PROJECT INTO e'
+# List subjects.
+ctxd subjects --recursive
 
-# List all subjects
-ctxd subjects
-
-# Mint a capability token scoped to /work/acme, read-only
+# Mint a capability scoped to /work/acme, read-only.
 ctxd grant --subject "/work/acme/**" --operations "read,subjects"
-
-# Start the daemon
-ctxd serve
-# HTTP admin on 127.0.0.1:7777
-# Wire protocol on 127.0.0.1:7778
-# MCP on stdio (for Claude Desktop)
 ```
 
-## Connect Claude Desktop
+### With semantic + hybrid search
 
-Add to `claude_desktop_config.json`:
+```bash
+export OPENAI_API_KEY=sk-...
+ctxd serve --embedder openai
+# ctx_search defaults to hybrid (FTS + vector + RRF) when an embedder is configured.
+# See docs/embeddings.md for Ollama and other providers.
+```
+
+### With multi-transport MCP
+
+```bash
+ctxd serve \
+  --mcp-stdio \
+  --mcp-sse 127.0.0.1:7779 \
+  --mcp-http 127.0.0.1:7780 \
+  --require-auth
+# All three transports serve the same tool surface. Auth via
+# `Authorization: Bearer <base64-biscuit>` on HTTP; tool-arg fallback for stdio.
+```
+
+### With federation
+
+```bash
+# On node A:
+ctxd peer grant --subjects "/work/shared/**" --expires 30d > cap-from-a.b64
+# Hand cap-from-a.b64 to the operator of node B; they run:
+ctxd peer add --url tcp://node-a:7778 --capability "$(cat cap-from-a.b64)"
+# Both sides auto-exchange capabilities, replicate /work/shared/**,
+# and resume from cursor after a restart.
+```
+
+See [docs/federation.md](docs/federation.md) for the full two-node tutorial.
+
+### With Postgres or DuckDB+S3
+
+```bash
+ctxd serve --storage postgres \
+  --storage-uri postgres://user:pass@host/ctxd
+
+ctxd serve --storage duckdb-object \
+  --storage-uri s3://my-bucket/ctxd-events
+```
+
+Postgres and DuckDB run a minimal HTTP admin (full daemon over `dyn Store` is a v0.4 follow-up). See [docs/storage-postgres.md](docs/storage-postgres.md) and [docs/storage-duckdb-object.md](docs/storage-duckdb-object.md).
+
+## Connect Claude Desktop
 
 ```json
 {
@@ -74,107 +120,137 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-Claude gets five tools: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`.
+Claude gets eight tools: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`, `ctx_entities`, `ctx_related`, `ctx_timeline`.
 
 ## Why ctxd exists
 
 Every AI agent starts each session with amnesia. Your context is scattered across Gmail, Slack, GitHub, Notion, and whatever you typed into the last chat window. Each tool has its own siloed view. None of them talk to each other. Your AI re-derives context from scratch every time.
 
-ctxd fixes this. It's a single place where all your context lives, addressed by subject paths, secured by capability tokens, queryable by any agent over MCP. Write once, query from anywhere.
+ctxd fixes this. It's a single place where all your context lives, addressed by subject paths, secured by capability tokens, queryable by any agent over MCP, and replicated to peer nodes you trust. Write once, query from anywhere.
 
-The event log is append-only. Every write is tamper-evident via predecessor hash chains. Materialized views (KV, FTS, vector) are derived from the log and can be rebuilt from it. Capability tokens are signed, attenuable, and bearer. An agent gets exactly the scope it needs and cannot escalate.
+The event log is append-only. Every write is tamper-evident via predecessor hash chains and signed with Ed25519. Materialized views (KV, FTS, vector, graph, temporal) are derived from the log and can be rebuilt from it. Capability tokens are signed, attenuable, and bearer — an agent gets exactly the scope it needs, can delegate via biscuit third-party blocks, and cannot escalate.
 
 ## Architecture
 
 See [docs/architecture.md](docs/architecture.md) for the full picture with diagrams.
 
-Quick version:
+ctxd is a Cargo workspace of 14 crates:
 
 ```
-ctxd is 10 Rust crates:
-
-ctxd-core       Event struct, Subject paths, hash chains. Zero deps on storage/network.
-ctxd-store      SQLite event log + KV/FTS/vector views. Depends only on core.
-ctxd-cap        Biscuit-based capability engine. Depends only on core.
-ctxd-mcp        MCP server (5 tools over stdio). Depends on core, store, cap.
-ctxd-http       Admin REST API (3 endpoints). Depends on core, store, cap.
-ctxd-cli        The `ctxd` binary. Wires everything together.
-ctxd-adapter-core   Adapter trait + EventSink for ingestion.
-ctxd-adapter-fs     Filesystem watcher adapter.
-ctxd-adapter-gmail  Gmail adapter (stub).
-ctxd-adapter-github GitHub adapter (stub).
+ctxd-core             Event struct, Subject paths, hash chains, Ed25519 signing.
+ctxd-store-core       Store trait + shared DTOs + conformance test suite.
+ctxd-store-sqlite     Default SQLite backend. KV / FTS5 / HNSW vector / graph views.
+ctxd-store-postgres   Postgres backend. tsvector FTS, advisory-lock TOCTOU.
+ctxd-store-duckobj    DuckDB-on-object-store. Parquet + WAL + SQLite sidecar.
+ctxd-store            Back-compat shim re-exporting from ctxd-store-sqlite.
+ctxd-cap              Biscuit capabilities. Third-party blocks + caveat enforcement.
+ctxd-embed            Embedder trait + NullEmbedder + OpenAI + Ollama impls.
+ctxd-mcp              MCP server. stdio + SSE + streamable-HTTP transports.
+ctxd-http             Admin REST API (health, grant, stats, peers, approvals).
+ctxd-cli              The `ctxd` binary. Wires everything together.
+ctxd-adapter-core     Adapter trait + EventSink for ingestion.
+ctxd-adapter-fs       Filesystem watcher adapter.
+ctxd-adapter-gmail    Real Gmail adapter (OAuth2 device flow + History API).
+ctxd-adapter-github   Real GitHub adapter (PAT + ETag + rate limits).
 ```
 
 ## API surfaces
-
-ctxd exposes three interfaces. All three read and write the same event log.
 
 ### MCP (for agents)
 
 | Tool | Description |
 |------|-------------|
-| `ctx_write` | Append an event. Params: `subject`, `event_type`, `data`, `token?` |
-| `ctx_read` | Read events. Params: `subject`, `recursive?`, `token?` |
-| `ctx_subjects` | List subjects. Params: `prefix?`, `recursive?`, `token?` |
-| `ctx_search` | Full-text search. Params: `query`, `subject_pattern?`, `k?`, `token?` |
-| `ctx_subscribe` | Poll events since timestamp. Params: `subject`, `since?`, `recursive?`, `token?` |
+| `ctx_write` | Append an event |
+| `ctx_read` | Read events under a subject (recursive optional) |
+| `ctx_subjects` | List subject paths |
+| `ctx_search` | FTS / vector / hybrid search (RRF) |
+| `ctx_subscribe` | Poll events since a timestamp |
+| `ctx_entities` | Query graph entities |
+| `ctx_related` | Walk graph relationships from an entity |
+| `ctx_timeline` | Read events as-of a historical timestamp |
 
-### Wire protocol (for services, MessagePack over TCP, port 7778)
+### Wire protocol (MessagePack over TCP, port 7778)
 
 | Verb | Description |
 |------|-------------|
 | `PUB` | Append an event |
-| `SUB` | Subscribe to a subject pattern (real-time via broadcast) |
-| `QUERY` | Query a materialized view (log, kv, fts) |
-| `GRANT` | Mint a capability token |
-| `REVOKE` | Revoke a token (v0.2) |
+| `SUB` | Subscribe (real-time broadcast) |
+| `QUERY` | Query a materialized view |
+| `GRANT` / `REVOKE` | Capability lifecycle |
+| `PEER_HELLO` / `PEER_WELCOME` | Federation handshake |
+| `PEER_REPLICATE` / `PEER_ACK` | Bidirectional event stream |
+| `PEER_CURSOR_REQUEST` / `PEER_CURSOR` | Resume from last-seen |
+| `PEER_FETCH_EVENTS` | Parent backfill on causal DAG gap |
 | `PING` | Health check |
 
-### HTTP (for admin, port 7777)
+### HTTP (port 7777)
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Health check + version |
+| `GET /health` | Health + version |
 | `POST /v1/grant` | Mint a capability token |
 | `GET /v1/stats` | Store statistics |
+| `GET /v1/peers` | List federation peers |
+| `GET /v1/approvals` | List pending HumanApproval requests |
+| `POST /v1/approvals/:id/decide` | Allow / deny an approval (admin) |
 
 ## CLI reference
 
 ```
-ctxd serve      Start daemon (HTTP :7777 + wire :7778 + MCP stdio)
-ctxd write      Append an event (--subject, --type, --data)
+ctxd serve      Start daemon (HTTP + wire + MCP transports)
+                Flags: --bind, --wire-bind, --mcp-stdio,
+                       --mcp-sse <addr>, --mcp-http <addr>, --require-auth,
+                       --embedder {null|openai|ollama},
+                       --embedder-model, --embedder-url, --embedder-api-key,
+                       --storage {sqlite|postgres|duckdb-object},
+                       --storage-uri <uri>
+ctxd write      Append an event (--subject, --type, --data, --sign)
 ctxd read       Read events (--subject, --recursive)
-ctxd query      EventQL query (v0.1: basic LIKE filter)
+ctxd query      Basic EventQL filter
 ctxd subjects   List subjects (--prefix, --recursive)
-ctxd grant      Mint capability token (--subject, --operations)
-ctxd verify     Verify a token (--token, --subject, --operation)
-ctxd revoke     Revoke a token (v0.2 stub)
-ctxd connect    Connect to remote daemon via wire protocol
+ctxd grant      Mint a capability token
+ctxd verify     Verify a token
+ctxd revoke     Revoke a token by id
+ctxd verify-signature  Verify an event's Ed25519 signature
+ctxd peer       add | list | status | remove | grant
+ctxd migrate    Re-canonicalize an existing DB at the v0.3 schema
+ctxd approve    Decide a pending HumanApproval (--id, --decision)
+ctxd connect    Connect to a remote daemon via wire protocol
 ```
 
-Global flag: `--db <path>` (default: `ctxd.db`)
+Global flags: `--db <path>` (default `ctxd.db` for SQLite).
 
 ## Docs
 
 | Document | What it covers |
 |----------|---------------|
-| [architecture.md](docs/architecture.md) | System design, data flow, crate map, diagrams |
-| [events.md](docs/events.md) | CloudEvents schema, canonical form, hash chain |
+| [architecture.md](docs/architecture.md) | System design, data flow, crate map |
+| [events.md](docs/events.md) | CloudEvents schema, canonical form, hash chain, parents |
 | [subjects.md](docs/subjects.md) | Path syntax, recursive reads, glob patterns |
-| [capabilities.md](docs/capabilities.md) | Biscuit tokens, caveats, verification model |
-| [capability-tutorial.md](docs/capability-tutorial.md) | Hands-on walkthrough with CLI commands |
-| [mcp.md](docs/mcp.md) | MCP tool reference with parameter tables |
-| [adapter-guide.md](docs/adapter-guide.md) | How to write ingestion adapters |
-| [benchmarking.md](docs/benchmarking.md) | Performance numbers and comparisons vs Redis, NATS, Mem0, ChromaDB |
-| [decisions/](docs/decisions/) | Architecture Decision Records |
+| [capabilities.md](docs/capabilities.md) | Biscuit tokens, third-party blocks, BudgetLimit, HumanApprovalRequired |
+| [capability-tutorial.md](docs/capability-tutorial.md) | Hands-on walkthrough |
+| [mcp.md](docs/mcp.md) | Tool reference + transports (stdio / SSE / HTTP) |
+| [federation.md](docs/federation.md) | Two-node tutorial + handshake + cursor resume |
+| [embeddings.md](docs/embeddings.md) | Embedder providers + hybrid search modes |
+| [storage-postgres.md](docs/storage-postgres.md) | Postgres backend setup |
+| [storage-duckdb-object.md](docs/storage-duckdb-object.md) | DuckDB+S3 backend setup |
+| [adapters/gmail.md](docs/adapters/gmail.md) | Gmail adapter walkthrough |
+| [adapters/github.md](docs/adapters/github.md) | GitHub adapter walkthrough |
+| [adapter-guide.md](docs/adapter-guide.md) | Authoring a new adapter |
+| [benchmarking.md](docs/benchmarking.md) | Methodology + comparisons |
+| [benchmark-results.md](docs/benchmark-results.md) | Latest numbers (HNSW, FTS, federation throughput) |
+| [decisions/](docs/decisions/) | 19 ADRs covering every meaningful design call |
 
 ## Development
 
 ```bash
-cargo test                    # 49 tests
-cargo clippy -- -D warnings   # lint
-cargo fmt --check             # format check
+cargo test --workspace                   # 364 tests (default features)
+cargo test --workspace --all-features    # exercises postgres + duckdb features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
+
+CI runs the Postgres conformance suite against a postgres:16 service container.
 
 ## License
 

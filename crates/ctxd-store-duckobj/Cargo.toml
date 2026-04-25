@@ -1,0 +1,50 @@
+[package]
+name = "ctxd-store-duckobj"
+description = "Object-store-backed event store for ctxd (append-only Parquet on S3/fs/R2 with a SQLite sidecar)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctxd-core = { path = "../ctxd-core" }
+ctxd-store-core = { path = "../ctxd-store-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+# Columnar stack — Parquet on top of Arrow, streamed via object_store.
+arrow = { version = "58", default-features = false }
+parquet = { version = "58", default-features = false, features = [
+    "arrow",
+    "snap",
+    "async",
+    "object_store",
+] }
+# Local filesystem + S3 + Azure + GCS all via the same API. `fs` is
+# the default; cloud features are opt-in so the base footprint stays small.
+object_store = { version = "0.13", default-features = false, features = ["fs"] }
+bytes = "1"
+futures = "0.3"
+# Sidecar SQLite for small transactional state (KV, peers, caveats,
+# vectors). We share the same crate the sqlite backend uses so
+# federation LWW semantics match byte-for-byte.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "json",
+    "chrono",
+    "uuid",
+    "macros",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+ctxd-store-core = { path = "../ctxd-store-core", features = ["testsuite"] }
+anyhow = { workspace = true }
+futures = "0.3"

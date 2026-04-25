@@ -2,12 +2,26 @@
 //!
 //! Signs the canonical form of an event (same form used for predecessor hashing,
 //! excluding `predecessorhash` and `signature` fields) using Ed25519.
+//!
+//! v0.3: canonical form now unconditionally includes `parents` (sorted) and
+//! `attestation` (hex-encoded or `null`). See [`crate::hash`].
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use std::collections::BTreeMap;
 
 use crate::event::Event;
+
+/// Errors from event signing / verification.
+#[derive(Debug, thiserror::Error)]
+pub enum SigningError {
+    /// Underlying Ed25519 error.
+    #[error("ed25519 error: {0}")]
+    Ed25519(#[from] ed25519_dalek::SignatureError),
+    /// JSON serialization error building the canonical form.
+    #[error("canonical form serialization: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
 
 /// An event signer that holds an Ed25519 keypair.
 pub struct EventSigner {
@@ -41,15 +55,21 @@ impl EventSigner {
     }
 
     /// Sign the canonical form of an event. Returns a hex-encoded signature.
-    pub fn sign(&self, event: &Event) -> String {
-        let canonical = canonical_bytes(event);
+    ///
+    /// Returns an error if the canonical form cannot be serialized. In practice
+    /// this should not happen for well-formed events, but we surface the
+    /// failure rather than panicking.
+    pub fn sign(&self, event: &Event) -> Result<String, SigningError> {
+        let canonical = canonical_bytes(event)?;
         let signature = self.signing_key.sign(&canonical);
-        hex::encode(signature.to_bytes())
+        Ok(hex::encode(signature.to_bytes()))
     }
 
     /// Verify an event's signature against the given public key bytes.
     ///
-    /// `signature` is hex-encoded. `public_key` is 32 raw bytes.
+    /// `signature` is hex-encoded. `public_key` is 32 raw bytes. Returns
+    /// `false` on any failure — malformed hex, wrong length, signature
+    /// mismatch, or canonical-form serialization failure.
     pub fn verify(event: &Event, signature: &str, public_key: &[u8]) -> bool {
         let sig_bytes = match hex::decode(signature) {
             Ok(b) => b,
@@ -68,7 +88,10 @@ impl EventSigner {
             Ok(vk) => vk,
             Err(_) => return false,
         };
-        let canonical = canonical_bytes(event);
+        let canonical = match canonical_bytes(event) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
         verifying_key.verify(&canonical, &sig).is_ok()
     }
 }
@@ -80,29 +103,45 @@ impl Default for EventSigner {
 }
 
 /// Produce canonical bytes for signing (same as hash canonical form).
-fn canonical_bytes(event: &Event) -> Vec<u8> {
+///
+/// Mirrors [`crate::hash`]'s canonical form exactly: sorted keys,
+/// parents sorted lexicographically, attestation hex-encoded.
+fn canonical_bytes(event: &Event) -> Result<Vec<u8>, serde_json::Error> {
     let mut map = BTreeMap::new();
-    map.insert(
-        "specversion",
-        serde_json::to_value(&event.specversion).unwrap(),
-    );
-    map.insert("id", serde_json::to_value(event.id).unwrap());
-    map.insert("source", serde_json::to_value(&event.source).unwrap());
-    map.insert("subject", serde_json::to_value(&event.subject).unwrap());
-    map.insert("type", serde_json::to_value(&event.event_type).unwrap());
-    map.insert("time", serde_json::to_value(event.time).unwrap());
+    map.insert("specversion", serde_json::to_value(&event.specversion)?);
+    map.insert("id", serde_json::to_value(event.id)?);
+    map.insert("source", serde_json::to_value(&event.source)?);
+    map.insert("subject", serde_json::to_value(&event.subject)?);
+    map.insert("type", serde_json::to_value(&event.event_type)?);
+    map.insert("time", serde_json::to_value(event.time)?);
     map.insert(
         "datacontenttype",
-        serde_json::to_value(&event.datacontenttype).unwrap(),
+        serde_json::to_value(&event.datacontenttype)?,
     );
     map.insert("data", event.data.clone());
-    serde_json::to_vec(&map).unwrap()
+
+    // v0.3 fields — always present.
+    let parents_sorted: Vec<String> = {
+        let mut v: Vec<String> = event.parents.iter().map(|u| u.to_string()).collect();
+        v.sort();
+        v
+    };
+    map.insert("parents", serde_json::to_value(parents_sorted)?);
+
+    let attestation_val: serde_json::Value = match &event.attestation {
+        Some(bytes) => serde_json::Value::String(hex::encode(bytes)),
+        None => serde_json::Value::Null,
+    };
+    map.insert("attestation", attestation_val);
+
+    serde_json::to_vec(&map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::subject::Subject;
+    use uuid::Uuid;
 
     #[test]
     fn sign_and_verify() {
@@ -114,7 +153,7 @@ mod tests {
             serde_json::json!({"msg": "hello"}),
         );
 
-        let sig = signer.sign(&event);
+        let sig = signer.sign(&event).unwrap();
         let pubkey = signer.public_key_bytes();
         assert!(EventSigner::verify(&event, &sig, &pubkey));
     }
@@ -129,12 +168,52 @@ mod tests {
             serde_json::json!({"msg": "hello"}),
         );
 
-        let sig = signer.sign(&event);
+        let sig = signer.sign(&event).unwrap();
         let pubkey = signer.public_key_bytes();
 
-        // Tamper with the event
         let mut tampered = event.clone();
         tampered.data = serde_json::json!({"msg": "tampered"});
+        assert!(!EventSigner::verify(&tampered, &sig, &pubkey));
+    }
+
+    #[test]
+    fn widening_parents_fails_verification() {
+        let signer = EventSigner::new();
+        let mut event = Event::new(
+            "ctxd://test".to_string(),
+            Subject::new("/test/widen").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({}),
+        );
+        event.parents = vec![Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap()];
+        let sig = signer.sign(&event).unwrap();
+        let pubkey = signer.public_key_bytes();
+
+        let mut widened = event;
+        widened
+            .parents
+            .push(Uuid::parse_str("00000000-0000-7000-8000-000000000002").unwrap());
+        assert!(
+            !EventSigner::verify(&widened, &sig, &pubkey),
+            "adding a parent must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn tampered_attestation_fails_verification() {
+        let signer = EventSigner::new();
+        let mut event = Event::new(
+            "ctxd://test".to_string(),
+            Subject::new("/test/attest").unwrap(),
+            "demo".to_string(),
+            serde_json::json!({}),
+        );
+        event.attestation = Some(vec![0x01, 0x02]);
+        let sig = signer.sign(&event).unwrap();
+        let pubkey = signer.public_key_bytes();
+
+        let mut tampered = event;
+        tampered.attestation = Some(vec![0x03, 0x04]);
         assert!(!EventSigner::verify(&tampered, &sig, &pubkey));
     }
 
@@ -149,7 +228,7 @@ mod tests {
             serde_json::json!({"msg": "hello"}),
         );
 
-        let sig = signer1.sign(&event);
+        let sig = signer1.sign(&event).unwrap();
         let wrong_pubkey = signer2.public_key_bytes();
         assert!(!EventSigner::verify(&event, &sig, &wrong_pubkey));
     }
@@ -167,7 +246,7 @@ mod tests {
             serde_json::json!({"msg": "hello"}),
         );
 
-        let sig = signer.sign(&event);
+        let sig = signer.sign(&event).unwrap();
         let pubkey = signer2.public_key_bytes();
         assert!(EventSigner::verify(&event, &sig, &pubkey));
     }
