@@ -145,17 +145,48 @@ impl CaveatState for SqliteCaveatState {
         approval_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), CapError> {
+        if decision == ApprovalDecision::Pending {
+            return Err(CapError::Denied(
+                "cannot decide an approval back to Pending".to_string(),
+            ));
+        }
         let decision_str = match decision {
-            ApprovalDecision::Pending => "pending",
             ApprovalDecision::Allow => "allow",
             ApprovalDecision::Deny => "deny",
+            ApprovalDecision::Pending => unreachable!("guarded above"),
         };
         let now = chrono::Utc::now().to_rfc3339();
+
+        // Pre-check the row's existence + state. We need three distinct
+        // outcomes (no-such-row, already-decided, success) so a single
+        // `UPDATE … WHERE decision='pending'` can't tell them apart on
+        // its own.
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT decision FROM pending_approvals WHERE approval_id = ?")
+                .bind(approval_id)
+                .fetch_optional(self.store.pool())
+                .await
+                .map_err(map_err)?;
+        let prior = match row {
+            None => return Err(CapError::Denied(format!("no such approval: {approval_id}"))),
+            Some((s,)) => s,
+        };
+        if prior != "pending" {
+            return Err(CapError::Denied(format!(
+                "approval {approval_id} already decided as {prior}"
+            )));
+        }
+
+        // Conditional UPDATE. The `decision = 'pending'` predicate is
+        // the actual concurrency guard — if two `approval_decide` calls
+        // race, only the first lands rows_affected = 1 and the second
+        // sees rows_affected = 0 and falls into the `already decided`
+        // error path below.
         let result = sqlx::query(
             r#"
             UPDATE pending_approvals
             SET decision = ?, decided_at = ?
-            WHERE approval_id = ?
+            WHERE approval_id = ? AND decision = 'pending'
             "#,
         )
         .bind(decision_str)
@@ -165,7 +196,9 @@ impl CaveatState for SqliteCaveatState {
         .await
         .map_err(map_err)?;
         if result.rows_affected() == 0 {
-            return Err(CapError::Denied(format!("no such approval: {approval_id}")));
+            return Err(CapError::Denied(format!(
+                "approval {approval_id} race-lost: already decided"
+            )));
         }
         Ok(())
     }
@@ -216,5 +249,37 @@ mod tests {
             .approval_decide("missing", ApprovalDecision::Allow)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_approval_double_decide_rejected() {
+        let store = EventStore::open_memory().await.unwrap();
+        let st = SqliteCaveatState::new(store);
+        st.approval_request("a1", "tok-1", "write", "/x")
+            .await
+            .unwrap();
+        st.approval_decide("a1", ApprovalDecision::Allow)
+            .await
+            .unwrap();
+        // Second decide must fail — guarantees that an attacker who
+        // grabs an approval id can't flip Deny → Allow after the fact.
+        let res = st.approval_decide("a1", ApprovalDecision::Deny).await;
+        assert!(res.is_err());
+        // Status remains Allow.
+        assert_eq!(
+            st.approval_status("a1").await.unwrap(),
+            ApprovalDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_approval_decide_rejects_pending_decision() {
+        let store = EventStore::open_memory().await.unwrap();
+        let st = SqliteCaveatState::new(store);
+        st.approval_request("a1", "tok-1", "write", "/x")
+            .await
+            .unwrap();
+        let res = st.approval_decide("a1", ApprovalDecision::Pending).await;
+        assert!(res.is_err());
     }
 }

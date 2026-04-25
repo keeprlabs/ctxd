@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use chrono::TimeZone;
+use ctxd_cap::state::{CaveatState, InMemoryCaveatState};
 use ctxd_cap::CapEngine;
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
@@ -18,7 +19,8 @@ use rmcp::handler::server::wrapper::Parameters;
 async fn make_server() -> CtxdMcpServer {
     let store = EventStore::open_memory().await.expect("open store");
     let cap_engine = Arc::new(CapEngine::new());
-    CtxdMcpServer::new(store, cap_engine, "ctxd://test".to_string())
+    let caveat_state: Arc<dyn CaveatState> = Arc::new(InMemoryCaveatState::new());
+    CtxdMcpServer::new(store, cap_engine, caveat_state, "ctxd://test".to_string())
 }
 
 fn store_of(server: &CtxdMcpServer) -> &EventStore {

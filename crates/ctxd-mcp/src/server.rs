@@ -1,5 +1,6 @@
 //! MCP server that wraps ctxd store operations as tools.
 
+use ctxd_cap::state::CaveatState;
 use ctxd_cap::{CapEngine, Operation};
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
@@ -8,6 +9,15 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Default timeout the MCP server waits for a human approval to be
+/// decided before failing the tool call.
+///
+/// Five minutes matches the CLI default so a stressed engineering
+/// manager has reasonable time to switch context, read the request,
+/// and decide.
+const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Arguments for ctx_write tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -133,15 +143,27 @@ pub struct SubscribeParams {
 pub struct CtxdMcpServer {
     store: EventStore,
     cap_engine: Arc<CapEngine>,
+    caveat_state: Arc<dyn CaveatState>,
     source: String,
 }
 
 impl CtxdMcpServer {
-    /// Create a new MCP server wrapping the given store and capability engine.
-    pub fn new(store: EventStore, cap_engine: Arc<CapEngine>, source: String) -> Self {
+    /// Create a new MCP server wrapping the given store, capability
+    /// engine, and stateful-caveat backing.
+    ///
+    /// `caveat_state` is shared with HTTP and any other transport so
+    /// budgets persist across request paths and approvals raised by
+    /// MCP can be decided from the CLI / HTTP.
+    pub fn new(
+        store: EventStore,
+        cap_engine: Arc<CapEngine>,
+        caveat_state: Arc<dyn CaveatState>,
+        source: String,
+    ) -> Self {
         Self {
             store,
             cap_engine,
+            caveat_state,
             source,
         }
     }
@@ -154,7 +176,12 @@ impl CtxdMcpServer {
     }
 
     /// Verify a capability token if provided.
-    fn verify_token(
+    ///
+    /// Threads the daemon's [`CaveatState`] so budget caveats and
+    /// human-approval caveats are enforced at request time. Tools that
+    /// don't pass a token fall through to v0.1 open-by-default
+    /// (ADR 004) — there's nothing to verify.
+    async fn verify_token(
         &self,
         token: &Option<String>,
         subject: &str,
@@ -163,7 +190,15 @@ impl CtxdMcpServer {
         if let Some(tok) = token {
             let bytes = CapEngine::token_from_base64(tok).map_err(|e| e.to_string())?;
             self.cap_engine
-                .verify(&bytes, subject, operation, None)
+                .verify_with_state(
+                    &bytes,
+                    subject,
+                    operation,
+                    None,
+                    Some(self.caveat_state.as_ref()),
+                    DEFAULT_APPROVAL_TIMEOUT,
+                )
+                .await
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -178,7 +213,10 @@ impl CtxdMcpServer {
         description = "Append a context event. Takes subject (path), event_type, data (JSON string), and optional token (capability)."
     )]
     async fn ctx_write(&self, Parameters(params): Parameters<WriteParams>) -> Json<WriteResult> {
-        if let Err(e) = self.verify_token(&params.token, &params.subject, Operation::Write) {
+        if let Err(e) = self
+            .verify_token(&params.token, &params.subject, Operation::Write)
+            .await
+        {
             return Json(WriteResult {
                 id: String::new(),
                 subject: format!("error: {e}"),
@@ -230,7 +268,10 @@ impl CtxdMcpServer {
         description = "Read context events for a subject path. Takes subject (path), recursive (bool), and optional token."
     )]
     async fn ctx_read(&self, Parameters(params): Parameters<ReadParams>) -> String {
-        if let Err(e) = self.verify_token(&params.token, &params.subject, Operation::Read) {
+        if let Err(e) = self
+            .verify_token(&params.token, &params.subject, Operation::Read)
+            .await
+        {
             return format!("error: {e}");
         }
 
@@ -259,7 +300,10 @@ impl CtxdMcpServer {
     async fn ctx_subjects(&self, Parameters(params): Parameters<SubjectsParams>) -> String {
         let prefix = match &params.prefix {
             Some(p) => {
-                if let Err(e) = self.verify_token(&params.token, p, Operation::Subjects) {
+                if let Err(e) = self
+                    .verify_token(&params.token, p, Operation::Subjects)
+                    .await
+                {
                     return format!("error: {e}");
                 }
                 match Subject::new(p) {
@@ -284,7 +328,10 @@ impl CtxdMcpServer {
     async fn ctx_search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         // Use subject_pattern for token verification if provided, otherwise use wildcard
         let subject_for_auth = params.subject_pattern.as_deref().unwrap_or("/**");
-        if let Err(e) = self.verify_token(&params.token, subject_for_auth, Operation::Search) {
+        if let Err(e) = self
+            .verify_token(&params.token, subject_for_auth, Operation::Search)
+            .await
+        {
             return format!("error: {e}");
         }
 
@@ -318,7 +365,10 @@ impl CtxdMcpServer {
         description = "Poll for context events since a given timestamp. Takes subject (path), optional since (RFC3339 timestamp), recursive (bool), and optional token."
     )]
     async fn ctx_subscribe(&self, Parameters(params): Parameters<SubscribeParams>) -> String {
-        if let Err(e) = self.verify_token(&params.token, &params.subject, Operation::Read) {
+        if let Err(e) = self
+            .verify_token(&params.token, &params.subject, Operation::Read)
+            .await
+        {
             return format!("error: {e}");
         }
 
@@ -362,7 +412,10 @@ impl CtxdMcpServer {
         // if they filtered by subject_pattern we use that, otherwise
         // require a cap covering `/**`.
         let auth_subject = params.subject_pattern.as_deref().unwrap_or("/**");
-        if let Err(e) = self.verify_token(&params.token, auth_subject, Operation::Search) {
+        if let Err(e) = self
+            .verify_token(&params.token, auth_subject, Operation::Search)
+            .await
+        {
             return format!("error: {e}");
         }
 
@@ -408,7 +461,10 @@ impl CtxdMcpServer {
         // Without per-entity subject metadata on the graph row, we require
         // a cap for the wildcard subject to query relationships. Phase 2
         // can refine this once we carry the source subject on graph rows.
-        if let Err(e) = self.verify_token(&params.token, "/**", Operation::Search) {
+        if let Err(e) = self
+            .verify_token(&params.token, "/**", Operation::Search)
+            .await
+        {
             return format!("error: {e}");
         }
 
@@ -452,7 +508,10 @@ impl CtxdMcpServer {
         description = "Temporal read: returns events with time <= as_of for the given subject (optionally recursive). as_of is RFC3339."
     )]
     pub async fn ctx_timeline(&self, Parameters(params): Parameters<TimelineParams>) -> String {
-        if let Err(e) = self.verify_token(&params.token, &params.subject, Operation::Read) {
+        if let Err(e) = self
+            .verify_token(&params.token, &params.subject, Operation::Read)
+            .await
+        {
             return format!("error: {e}");
         }
         let subject = match Subject::new(&params.subject) {
