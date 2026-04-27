@@ -112,13 +112,12 @@ impl CaveatState for SqliteCaveatState {
         .execute(&mut *tx)
         .await
         .map_err(map_err)?;
-        let row: (i64, i64) = sqlx::query_as(
-            "SELECT window_start, count FROM rate_buckets WHERE token_id = ?",
-        )
-        .bind(token_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_err)?;
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT window_start, count FROM rate_buckets WHERE token_id = ?")
+                .bind(token_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_err)?;
         tx.commit().await.map_err(map_err)?;
         // The post-increment count is what we compare. The ELSE arm
         // above has already reset count to 1 for a new window so this

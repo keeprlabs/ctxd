@@ -313,7 +313,7 @@ All three depend on the same `docs/api/` contract and
 ## Development
 
 ```bash
-cargo test --workspace                   # 364 tests (default features)
+cargo test --workspace                   # ~425 tests (default features); --all-features adds postgres/duckdb suites
 cargo test --workspace --all-features    # exercises postgres + duckdb features
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
