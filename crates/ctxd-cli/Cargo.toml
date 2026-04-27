@@ -33,6 +33,7 @@ ctxd-store-core = { path = "../ctxd-store-core" }
 ctxd-cap = { path = "../ctxd-cap" }
 ctxd-mcp = { path = "../ctxd-mcp", features = ["http-transports"] }
 ctxd-http = { path = "../ctxd-http" }
+ctxd-wire = { path = "../ctxd-wire" }
 ctxd-embed = { path = "../ctxd-embed" }
 # Optional alternate backends — gated by feature flags above.
 ctxd-store-postgres = { path = "../ctxd-store-postgres", optional = true }

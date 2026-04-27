@@ -1,12 +1,16 @@
-//! ctxd wire protocol: MessagePack over TCP.
+//! Daemon-side wire protocol server.
 //!
-//! Six verbs:
-//! - `PUB <subject> <event_json>` — append event
-//! - `SUB <subject_pattern>` — subscribe (returns stream of events)
-//! - `QUERY <subject_pattern> <view>` — query materialized view
-//! - `GRANT <subject> <ops> <expiry>` — mint capability token
-//! - `REVOKE <cap_id>` — stub (v0.2)
-//! - `PING` — health check
+//! The over-the-wire types (`Request`, `Response`, `BroadcastEvent`),
+//! the length-prefix codec, and the consumer-facing `ProtocolClient`
+//! live in the lean `ctxd-wire` crate so SDK clients can depend on the
+//! protocol without inheriting the daemon's Store/Cap/MCP/HTTP stack.
+//! This module owns only the server-side dispatch: TCP listener, per-
+//! connection task, and the handlers that bind to `EventStore`,
+//! `CapEngine`, and federation.
+//!
+//! Wire types are re-exported below so existing code (federation, main,
+//! integration tests) can keep using `ctxd_cli::protocol::Request` etc.
+//! without churn.
 
 use crate::federation::PeerManager;
 use crate::rate_limit::RateLimiter;
@@ -14,158 +18,16 @@ use ctxd_cap::{CapEngine, Operation};
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
 use ctxd_store::EventStore;
-use serde::{Deserialize, Serialize};
+use ctxd_wire::frame::{read_frame, write_frame};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
 
-/// Wire protocol request messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-// Federation verbs intentionally carry the `PeerCursorRequest` suffix to
-// mirror the RFC-style PeerCursorRequest/PeerCursor pair (a request vs a
-// carrier). The clippy lint is a style nudge we've chosen to reject here.
-#[allow(clippy::enum_variant_names)]
-pub enum Request {
-    /// Publish (append) an event.
-    Pub {
-        subject: String,
-        event_type: String,
-        data: serde_json::Value,
-    },
-    /// Subscribe to events matching a subject pattern.
-    Sub { subject_pattern: String },
-    /// Query a materialized view.
-    Query {
-        subject_pattern: String,
-        view: String,
-    },
-    /// Mint a capability token.
-    Grant {
-        subject: String,
-        operations: Vec<String>,
-        expiry: Option<String>,
-    },
-    /// Revoke a capability token (v0.2 stub).
-    Revoke { cap_id: String },
-    /// Health check.
-    Ping,
-
-    // --- v0.3 federation (2A) ---
-    //
-    // The federation verbs are wire-level types introduced in v0.3. A
-    // handler for each is wired via `ctxd-cli/src/federation.rs` in a
-    // follow-up; for now the `ProtocolServer::handle_connection` path
-    // returns `Error { message: "federation not yet wired" }` for any
-    // federation request. The shape here is the source-of-truth for
-    // the over-the-wire payload.
-    /// A peer introduces itself. Includes its Ed25519 public key, the
-    /// capability it's offering the remote peer (base64-encoded biscuit),
-    /// and the subject globs the remote should deliver to it.
-    PeerHello {
-        /// Local peer id (typically remote pubkey hex).
-        peer_id: String,
-        /// Sender's Ed25519 public key (32 raw bytes).
-        public_key: Vec<u8>,
-        /// Capability token sender mints for recipient (base64-encoded).
-        offered_cap: String,
-        /// Subject globs sender will deliver to recipient.
-        subjects: Vec<String>,
-    },
-
-    /// Remote's welcome response with its reciprocal capability.
-    PeerWelcome {
-        /// Remote peer id.
-        peer_id: String,
-        /// Remote's Ed25519 public key.
-        public_key: Vec<u8>,
-        /// Reciprocal capability token (base64-encoded).
-        offered_cap: String,
-        /// Subject globs remote will deliver to sender.
-        subjects: Vec<String>,
-    },
-
-    /// Streaming replication message carrying an event from peer.
-    PeerReplicate {
-        /// Origin peer id of the event.
-        origin_peer_id: String,
-        /// Serialized `ctxd_core::event::Event` as JSON.
-        event: serde_json::Value,
-    },
-
-    /// Acknowledgement of a `PeerReplicate`, used to advance cursors.
-    PeerAck {
-        /// Origin peer id of the event being ACKed.
-        origin_peer_id: String,
-        /// UUIDv7 event id that was accepted.
-        event_id: String,
-    },
-
-    /// Request the peer's current cursor for a subject pattern, to
-    /// resume replication after a disconnect.
-    PeerCursorRequest {
-        /// Peer id whose cursor we're asking about.
-        peer_id: String,
-        /// Subject glob pattern.
-        subject_pattern: String,
-    },
-
-    /// Carrier for a cursor response.
-    PeerCursor {
-        /// Peer id the cursor belongs to.
-        peer_id: String,
-        /// Subject glob pattern.
-        subject_pattern: String,
-        /// Last-known event id, or `None` if no events have been
-        /// exchanged for this pattern.
-        last_event_id: Option<String>,
-        /// RFC3339 timestamp of the last-known event, or `None`.
-        last_event_time: Option<String>,
-    },
-
-    /// Request a batch of events by id — used for parent-backfill when
-    /// an incoming `PeerReplicate` references parents we don't have.
-    PeerFetchEvents {
-        /// UUIDv7 event ids to fetch.
-        event_ids: Vec<String>,
-    },
-}
-
-/// Wire protocol response messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Response {
-    /// Successful response with a JSON payload.
-    Ok { data: serde_json::Value },
-    /// An event streamed from a subscription.
-    Event { event: serde_json::Value },
-    /// Error response.
-    Error { message: String },
-    /// Pong response to a health check.
-    Pong,
-    /// End of stream marker.
-    EndOfStream,
-}
-
-/// Broadcast event for SUB fan-out and federation replay.
-///
-/// `origin_peer_id` carries the peer-id of the daemon that *originally*
-/// published the event (locally produced events use the local
-/// daemon's peer_id; replicated-in events carry the origin from the
-/// `PeerReplicate` envelope). Federation's outbound replicator uses
-/// this for the loop-guard rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BroadcastEvent {
-    /// Subject of the event.
-    pub subject: String,
-    /// JSON-serialized event payload.
-    pub event: serde_json::Value,
-    /// Origin peer id. Defaults to empty string for local PUB; the
-    /// federation receiver overrides this with the inbound
-    /// `PeerReplicate.origin_peer_id` before re-broadcasting.
-    #[serde(default)]
-    pub origin_peer_id: String,
-}
+// Wire-level types live in ctxd-wire. Re-export them from this module
+// so all existing imports (e.g. `use ctxd_cli::protocol::Request`)
+// continue to resolve. The wire crate is the source of truth.
+pub use ctxd_wire::{BroadcastEvent, ProtocolClient, Request, Response, SubscriptionStream};
 
 /// The wire protocol TCP server.
 pub struct ProtocolServer {
@@ -255,35 +117,11 @@ impl ProtocolServer {
     }
 }
 
-/// Read a length-prefixed MessagePack frame from the stream.
-async fn read_frame(stream: &mut TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
-    let len = match stream.read_u32().await {
-        Ok(n) => n as usize,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-
-    if len > 16 * 1024 * 1024 {
-        anyhow::bail!("frame too large: {len} bytes");
-    }
-
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(Some(buf))
-}
-
-/// Write a length-prefixed MessagePack frame to the stream.
-async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> anyhow::Result<()> {
-    stream.write_u32(data.len() as u32).await?;
-    stream.write_all(data).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
 /// Send a Response over the stream.
 async fn send_response(stream: &mut TcpStream, response: &Response) -> anyhow::Result<()> {
     let data = rmp_serde::to_vec(response)?;
-    write_frame(stream, &data).await
+    write_frame(stream, &data).await?;
+    Ok(())
 }
 
 /// Handle a single TCP connection.
@@ -609,232 +447,9 @@ fn subject_matches_pattern(subject: &str, pattern: &str) -> bool {
     ctxd_core::subject::Subject::matches_cap_pattern(subject, pattern)
 }
 
-/// TCP client for connecting to a running ctxd daemon via the wire protocol.
-pub struct ProtocolClient {
-    stream: TcpStream,
-}
-
-impl ProtocolClient {
-    /// Connect to a ctxd daemon at the given address.
-    pub async fn connect(addr: &str) -> anyhow::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        Ok(Self { stream })
-    }
-
-    /// Send a request and receive a response.
-    pub async fn request(&mut self, req: &Request) -> anyhow::Result<Response> {
-        let data = rmp_serde::to_vec(req)?;
-        write_frame(&mut self.stream, &data).await?;
-
-        let frame = read_frame(&mut self.stream)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("server closed connection"))?;
-        let response: Response = rmp_serde::from_slice(&frame)?;
-        Ok(response)
-    }
-
-    /// Send a PING and expect a PONG.
-    pub async fn ping(&mut self) -> anyhow::Result<()> {
-        let response = self.request(&Request::Ping).await?;
-        match response {
-            Response::Pong => Ok(()),
-            other => anyhow::bail!("unexpected response to PING: {other:?}"),
-        }
-    }
-
-    /// Publish an event.
-    pub async fn publish(
-        &mut self,
-        subject: &str,
-        event_type: &str,
-        data: serde_json::Value,
-    ) -> anyhow::Result<Response> {
-        self.request(&Request::Pub {
-            subject: subject.to_string(),
-            event_type: event_type.to_string(),
-            data,
-        })
-        .await
-    }
-
-    /// Query a materialized view.
-    pub async fn query(&mut self, subject_pattern: &str, view: &str) -> anyhow::Result<Response> {
-        self.request(&Request::Query {
-            subject_pattern: subject_pattern.to_string(),
-            view: view.to_string(),
-        })
-        .await
-    }
-
-    /// Mint a capability token.
-    pub async fn grant(
-        &mut self,
-        subject: &str,
-        operations: &[&str],
-        expiry: Option<&str>,
-    ) -> anyhow::Result<Response> {
-        self.request(&Request::Grant {
-            subject: subject.to_string(),
-            operations: operations.iter().map(|s| s.to_string()).collect(),
-            expiry: expiry.map(|s| s.to_string()),
-        })
-        .await
-    }
-
-    /// Subscribe to events matching a pattern. Returns the stream for reading events.
-    #[allow(dead_code)]
-    pub async fn subscribe(mut self, subject_pattern: &str) -> anyhow::Result<SubscriptionStream> {
-        let req = Request::Sub {
-            subject_pattern: subject_pattern.to_string(),
-        };
-        let data = rmp_serde::to_vec(&req)?;
-        write_frame(&mut self.stream, &data).await?;
-        Ok(SubscriptionStream {
-            stream: self.stream,
-        })
-    }
-}
-
-/// A stream of events from a subscription.
-#[allow(dead_code)]
-pub struct SubscriptionStream {
-    stream: TcpStream,
-}
-
-impl SubscriptionStream {
-    /// Receive the next event from the subscription.
-    #[allow(dead_code)]
-    pub async fn next_event(&mut self) -> anyhow::Result<Option<Response>> {
-        let frame = match read_frame(&mut self.stream).await? {
-            Some(f) => f,
-            None => return Ok(None),
-        };
-        let response: Response = rmp_serde::from_slice(&frame)?;
-        match &response {
-            Response::EndOfStream => Ok(None),
-            _ => Ok(Some(response)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn request_serialization_roundtrip() {
-        let req = Request::Pub {
-            subject: "/test/hello".to_string(),
-            event_type: "demo".to_string(),
-            data: serde_json::json!({"msg": "world"}),
-        };
-        let bytes = rmp_serde::to_vec(&req).unwrap();
-        let decoded: Request = rmp_serde::from_slice(&bytes).unwrap();
-        match decoded {
-            Request::Pub {
-                subject,
-                event_type,
-                data,
-            } => {
-                assert_eq!(subject, "/test/hello");
-                assert_eq!(event_type, "demo");
-                assert_eq!(data, serde_json::json!({"msg": "world"}));
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
-    fn response_serialization_roundtrip() {
-        let resp = Response::Ok {
-            data: serde_json::json!({"id": "abc123"}),
-        };
-        let bytes = rmp_serde::to_vec(&resp).unwrap();
-        let decoded: Response = rmp_serde::from_slice(&bytes).unwrap();
-        match decoded {
-            Response::Ok { data } => {
-                assert_eq!(data["id"], "abc123");
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
-    fn ping_pong_serialization() {
-        let req = Request::Ping;
-        let bytes = rmp_serde::to_vec(&req).unwrap();
-        let decoded: Request = rmp_serde::from_slice(&bytes).unwrap();
-        assert!(matches!(decoded, Request::Ping));
-
-        let resp = Response::Pong;
-        let bytes = rmp_serde::to_vec(&resp).unwrap();
-        let decoded: Response = rmp_serde::from_slice(&bytes).unwrap();
-        assert!(matches!(decoded, Response::Pong));
-    }
-
-    #[test]
-    fn all_request_variants_serialize() {
-        let variants: Vec<Request> = vec![
-            Request::Ping,
-            Request::Pub {
-                subject: "/a".to_string(),
-                event_type: "t".to_string(),
-                data: serde_json::json!({}),
-            },
-            Request::Sub {
-                subject_pattern: "/**".to_string(),
-            },
-            Request::Query {
-                subject_pattern: "/a".to_string(),
-                view: "log".to_string(),
-            },
-            Request::Grant {
-                subject: "/**".to_string(),
-                operations: vec!["read".to_string()],
-                expiry: None,
-            },
-            Request::Revoke {
-                cap_id: "id-1".to_string(),
-            },
-            Request::PeerHello {
-                peer_id: "peer-a".to_string(),
-                public_key: vec![1u8; 32],
-                offered_cap: "Y2Fw".to_string(),
-                subjects: vec!["/work/**".to_string()],
-            },
-            Request::PeerWelcome {
-                peer_id: "peer-b".to_string(),
-                public_key: vec![2u8; 32],
-                offered_cap: "Y2Fw".to_string(),
-                subjects: vec!["/home/**".to_string()],
-            },
-            Request::PeerReplicate {
-                origin_peer_id: "peer-a".to_string(),
-                event: serde_json::json!({"id": "01"}),
-            },
-            Request::PeerAck {
-                origin_peer_id: "peer-a".to_string(),
-                event_id: "01".to_string(),
-            },
-            Request::PeerCursorRequest {
-                peer_id: "peer-a".to_string(),
-                subject_pattern: "/**".to_string(),
-            },
-            Request::PeerCursor {
-                peer_id: "peer-a".to_string(),
-                subject_pattern: "/**".to_string(),
-                last_event_id: Some("abc".to_string()),
-                last_event_time: Some("2025-01-01T00:00:00Z".to_string()),
-            },
-            Request::PeerFetchEvents {
-                event_ids: vec!["abc".to_string(), "def".to_string()],
-            },
-        ];
-        for v in &variants {
-            let bytes = rmp_serde::to_vec(v).unwrap();
-            let _: Request = rmp_serde::from_slice(&bytes).unwrap();
-        }
-    }
 
     #[test]
     fn subject_pattern_matching() {
@@ -849,39 +464,39 @@ mod tests {
 
     #[tokio::test]
     async fn wire_protocol_pub_then_query_log() {
-        let store = EventStore::open_memory().await.unwrap();
+        let store = EventStore::open_memory().await.expect("open store");
         let cap_engine = Arc::new(CapEngine::new());
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        let bound_addr = listener.local_addr().unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("parse addr");
+        let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+        let bound_addr = listener.local_addr().expect("local_addr");
 
         let server_store = store.clone();
         let server_cap = cap_engine.clone();
         let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.expect("accept");
             let store = Arc::new(server_store);
             let (event_tx, _) = broadcast::channel(1024);
             handle_connection(stream, store, server_cap, event_tx, None)
                 .await
-                .unwrap();
+                .expect("handle_connection");
         });
 
         let mut client = ProtocolClient::connect(&bound_addr.to_string())
             .await
-            .unwrap();
+            .expect("connect");
 
         // PUB an event
         let pub_resp = client
             .publish("/test/wire", "demo", serde_json::json!({"msg": "hello"}))
             .await
-            .unwrap();
+            .expect("publish");
         assert!(matches!(pub_resp, Response::Ok { .. }));
 
         // QUERY it back via "log" view
-        let query_resp = client.query("/test/wire", "log").await.unwrap();
+        let query_resp = client.query("/test/wire", "log").await.expect("query");
         match query_resp {
             Response::Ok { data } => {
-                let arr = data.as_array().unwrap();
+                let arr = data.as_array().expect("array");
                 assert_eq!(arr.len(), 1);
                 assert_eq!(arr[0]["data"]["msg"], "hello");
             }
@@ -896,13 +511,15 @@ mod tests {
     async fn wire_protocol_sub_receives_pub() {
         // Test the SUB/PUB broadcast mechanism using a shared ProtocolServer
         // that handles both connections on the same broadcast channel.
-        let store = EventStore::open_memory().await.unwrap();
+        let store = EventStore::open_memory().await.expect("open store");
         let cap_engine = Arc::new(CapEngine::new());
         let (event_tx, _) = broadcast::channel::<BroadcastEvent>(1024);
 
         // Use a single listener that accepts both connections sequentially.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound_addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let bound_addr = listener.local_addr().expect("local_addr");
 
         let store_clone = store.clone();
         let cap_clone = cap_engine.clone();
@@ -911,7 +528,7 @@ mod tests {
             let store = Arc::new(store_clone);
             // Accept two connections
             for _ in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (stream, _) = listener.accept().await.expect("accept");
                 let s = Arc::clone(&store);
                 let c = Arc::clone(&cap_clone);
                 let tx = event_tx_clone.clone();
@@ -924,8 +541,8 @@ mod tests {
         // Connect subscriber first
         let sub_client = ProtocolClient::connect(&bound_addr.to_string())
             .await
-            .unwrap();
-        let mut sub_stream = sub_client.subscribe("/test/**").await.unwrap();
+            .expect("connect sub");
+        let mut sub_stream = sub_client.subscribe("/test/**").await.expect("subscribe");
 
         // Give the subscription a moment to register with the broadcast channel
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -933,18 +550,18 @@ mod tests {
         // Connect publisher and PUB an event
         let mut pub_client = ProtocolClient::connect(&bound_addr.to_string())
             .await
-            .unwrap();
+            .expect("connect pub");
         let _resp = pub_client
             .publish("/test/sub-test", "demo", serde_json::json!({"sub": "test"}))
             .await
-            .unwrap();
+            .expect("publish");
 
         // Subscriber should receive the event within 5 seconds
         let received =
             tokio::time::timeout(std::time::Duration::from_secs(5), sub_stream.next_event())
                 .await
                 .expect("timed out waiting for subscription event")
-                .unwrap();
+                .expect("next_event");
 
         match received {
             Some(Response::Event { event }) => {
@@ -960,36 +577,41 @@ mod tests {
 
     #[tokio::test]
     async fn wire_protocol_grant_returns_valid_base64_biscuit() {
-        let store = EventStore::open_memory().await.unwrap();
+        let store = EventStore::open_memory().await.expect("open store");
         let cap_engine = Arc::new(CapEngine::new());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound_addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let bound_addr = listener.local_addr().expect("local_addr");
 
         let server_store = store.clone();
         let server_cap = cap_engine.clone();
         let server_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.expect("accept");
             let store = Arc::new(server_store);
             let (event_tx, _) = broadcast::channel(1024);
             handle_connection(stream, store, server_cap, event_tx, None)
                 .await
-                .unwrap();
+                .expect("handle_connection");
         });
 
         let mut client = ProtocolClient::connect(&bound_addr.to_string())
             .await
-            .unwrap();
+            .expect("connect");
 
-        let resp = client.grant("/**", &["read", "write"], None).await.unwrap();
+        let resp = client
+            .grant("/**", &["read", "write"], None)
+            .await
+            .expect("grant");
         match resp {
             Response::Ok { data } => {
-                let token_b64 = data["token"].as_str().unwrap();
+                let token_b64 = data["token"].as_str().expect("token");
                 // Verify it is valid base64
-                let token_bytes = CapEngine::token_from_base64(token_b64).unwrap();
+                let token_bytes = CapEngine::token_from_base64(token_b64).expect("base64");
                 // Verify the token can be verified by the cap engine
                 cap_engine
                     .verify(&token_bytes, "/test", Operation::Read, None)
-                    .unwrap();
+                    .expect("verify");
             }
             other => panic!("expected Ok, got {other:?}"),
         }
