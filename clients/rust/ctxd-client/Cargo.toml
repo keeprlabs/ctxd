@@ -62,5 +62,6 @@ tokio = { workspace = true }
 # There's an inherent TOCTOU window, but tests aren't competing for
 # ports in normal runs.
 portpicker = "0.1"
-# Future-stream consumption in subscribe tests.
-futures-util = "0.3"
+# Conformance tests round-trip msgpack to compare against the canonical
+# `docs/api/conformance/wire/*.msgpack.hex` corpus.
+rmp-serde = "1"
