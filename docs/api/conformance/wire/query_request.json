@@ -1,0 +1,6 @@
+{
+  "Query": {
+    "subject_pattern": "/work/**",
+    "view": "log"
+  }
+}

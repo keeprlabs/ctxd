@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/keeprlabs/ctxd/docs/api/events.schema.json",
+  "title": "ctxd Event",
+  "description": "A CloudEvents v1.0 event with ctxd extensions. This schema is the source of truth for all SDK code generation (Rust, Python, TS/JS) and MUST stay in sync with `crates/ctxd-core/src/event.rs`.\n\nNotes on canonical form:\n - For hashing and signing, the canonical form is JSON with keys sorted alphabetically (BTreeMap order), the `predecessorhash` and `signature` fields removed, `parents` always present as a lexicographically-sorted array of UUID strings (empty array when none), and `attestation` always present as either a hex-encoded string or JSON `null`.\n - On the *wire*, optional fields (`predecessorhash`, `signature`, `parents` when empty, `attestation` when None) are omitted to keep payloads small. Consumers MUST treat absent optional fields as defaults.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "subject",
+    "type",
+    "time",
+    "data"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "specversion": {
+      "description": "CloudEvents spec version. Always `1.0` for v0.3 ctxd.",
+      "type": "string",
+      "const": "1.0"
+    },
+    "id": {
+      "description": "Globally-unique event id. UUIDv7 so the natural ordering is monotonically time-aligned.",
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "source": {
+      "description": "Identifies the context in which the event happened. For ctxd this is typically the daemon URI (e.g. `ctxd://my-host`).",
+      "type": "string",
+      "minLength": 1
+    },
+    "subject": {
+      "description": "Subject path the event is filed under. Must start with `/` and contain non-empty path segments.",
+      "type": "string",
+      "pattern": "^/[^\\s]*$",
+      "minLength": 1
+    },
+    "type": {
+      "description": "Event type discriminator (e.g. `ctx.note`, `ctx.document`, `demo`). On the Rust side this maps to the `event_type` field; CloudEvents requires the wire key `type`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "time": {
+      "description": "RFC3339 timestamp of when the event was created.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "datacontenttype": {
+      "description": "Content type of `data`. Defaults to `application/json` when omitted.",
+      "type": "string",
+      "default": "application/json"
+    },
+    "data": {
+      "description": "Event payload. JSON of any shape. SDKs MAY decode it into a stronger type if `datacontenttype` is `application/json` and the consumer knows the schema."
+    },
+    "predecessorhash": {
+      "description": "SHA-256 hash of the predecessor event's canonical form, scoped per subject tree. Hex-encoded, lowercase, exactly 64 chars. Absent on the first event in a chain.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "signature": {
+      "description": "Ed25519 signature over the canonical form. Hex-encoded, lowercase, exactly 128 chars. Absent for unsigned events.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "parents": {
+      "description": "Parent event ids, used to represent concurrent / branch merges in the federated log. When omitted on the wire, treat as empty. The canonical form always includes this field as a lexicographically-sorted array.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "attestation": {
+      "description": "Optional TEE attestation blob. Hex-encoded bytes on the wire. ctxd does not interpret this field — it is carried end-to-end through federation. The canonical form encodes this as a hex string when present, JSON `null` when absent.",
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]*$"
+    }
+  }
+}

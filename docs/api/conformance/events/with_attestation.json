@@ -1,0 +1,13 @@
+{
+  "specversion": "1.0",
+  "id": "01900000-0000-7000-8000-000000000020",
+  "source": "ctxd://conformance",
+  "subject": "/conformance/attestation",
+  "type": "tee.report",
+  "time": "2026-01-01T00:02:00Z",
+  "datacontenttype": "application/json",
+  "data": {
+    "report": "opaque to ctxd"
+  },
+  "attestation": "deadbeefcafef00d"
+}
