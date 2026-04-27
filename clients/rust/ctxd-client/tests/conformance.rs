@@ -21,7 +21,10 @@ fn workspace_root() -> PathBuf {
         }
         match cursor.parent() {
             Some(p) => cursor = p.to_path_buf(),
-            None => panic!("workspace root not found from {:?}", env!("CARGO_MANIFEST_DIR")),
+            None => panic!(
+                "workspace root not found from {:?}",
+                env!("CARGO_MANIFEST_DIR")
+            ),
         }
     }
 }
@@ -80,7 +83,10 @@ fn signatures_corpus_matches_expected() {
         );
         count += 1;
     }
-    assert!(count >= 3, "expected at least 3 signature fixtures, found {count}");
+    assert!(
+        count >= 3,
+        "expected at least 3 signature fixtures, found {count}"
+    );
 }
 
 #[test]
@@ -108,8 +114,7 @@ fn wire_corpus_msgpack_hex_roundtrips() {
     let mut covered = 0;
     for (stem, (json_path, hex_path)) in pairs {
         let json_path = json_path.unwrap_or_else(|| panic!("missing JSON fixture for {stem}"));
-        let hex_path =
-            hex_path.unwrap_or_else(|| panic!("missing msgpack.hex fixture for {stem}"));
+        let hex_path = hex_path.unwrap_or_else(|| panic!("missing msgpack.hex fixture for {stem}"));
 
         let json_text = fs::read_to_string(&json_path).expect("read json");
         let hex_text = fs::read_to_string(&hex_path).expect("read hex");
@@ -121,14 +126,12 @@ fn wire_corpus_msgpack_hex_roundtrips() {
         let actual_bytes: Vec<u8> = if stem.ends_with("_response") {
             let value: serde_json::Value =
                 serde_json::from_str(&json_text).expect("parse response json");
-            let resp: WireResponse =
-                serde_json::from_value(value).expect("deserialize response");
+            let resp: WireResponse = serde_json::from_value(value).expect("deserialize response");
             rmp_serde::to_vec(&resp).expect("encode msgpack")
         } else {
             let value: serde_json::Value =
                 serde_json::from_str(&json_text).expect("parse request json");
-            let req: WireRequest =
-                serde_json::from_value(value).expect("deserialize request");
+            let req: WireRequest = serde_json::from_value(value).expect("deserialize request");
             rmp_serde::to_vec(&req).expect("encode msgpack")
         };
 
@@ -175,7 +178,10 @@ fn events_corpus_roundtrips_structurally() {
         );
         count += 1;
     }
-    assert!(count >= 3, "expected at least 3 event fixtures, found {count}");
+    assert!(
+        count >= 3,
+        "expected at least 3 event fixtures, found {count}"
+    );
 
     // Smoke-check the signed fixture in particular — the SDK can
     // verify it against the side-channel pubkey hex.

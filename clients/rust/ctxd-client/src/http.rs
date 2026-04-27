@@ -144,7 +144,10 @@ impl HttpAdminClient {
         });
         let body = GrantRequest {
             subject: subject.to_string(),
-            operations: operations.iter().map(|o| o.as_wire_str().to_string()).collect(),
+            operations: operations
+                .iter()
+                .map(|o| o.as_wire_str().to_string())
+                .collect(),
             expires_in_secs,
         };
         let resp: GrantResponse = self.post_json("/v1/grant", &body).await?;
