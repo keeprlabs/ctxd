@@ -20,8 +20,14 @@ path = "src/lib.rs"
 # the protocol). We do NOT depend on `ctxd-store`, `ctxd-cap`,
 # `ctxd-http`, axum, sqlx, etc. — pulling those in would defeat the
 # purpose of a thin SDK.
-ctxd-core = { path = "../../../crates/ctxd-core" }
-ctxd-wire = { path = "../../../crates/ctxd-wire" }
+#
+# Both deps carry both `path` (for in-workspace builds) and `version`
+# (for `cargo publish`). The version pin is exact-match because the
+# wire format moves in lockstep with the daemon — an SDK published
+# against a different ctxd-core minor version would silently produce
+# wrong canonical bytes.
+ctxd-core = { path = "../../../crates/ctxd-core", version = "0.3.0" }
+ctxd-wire = { path = "../../../crates/ctxd-wire", version = "0.3.0" }
 
 # Serialization. Both used by the HTTP admin types and (transitively)
 # by the wire protocol surface.
