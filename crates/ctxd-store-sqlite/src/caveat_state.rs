@@ -83,17 +83,48 @@ impl CaveatState for SqliteCaveatState {
         Ok(row.map(|(v,)| v).unwrap_or(0))
     }
 
-    async fn rate_check(
-        &self,
-        _token_id: &str,
-        _op: &str,
-        _rate_ops_per_sec: u32,
-    ) -> Result<bool, CapError> {
-        // SQLite-backed rate limiting is deferred — the in-memory fast
-        // path in `ctxd-cli::rate_limit::RateLimiter` is the hot path.
-        // We intentionally return `true` here so call sites that layer
-        // both remain correct under either backend.
-        Ok(true)
+    async fn rate_check(&self, token_id: &str, ops_per_sec: u32) -> Result<bool, CapError> {
+        // Sliding 1-second window counter persisted in `rate_buckets`.
+        // The PRIMARY KEY on `token_id` makes the upsert atomic per
+        // SQLite's per-table write lock. On a different second we
+        // *replace* `(window_start, count)` with `(now_secs, 1)`; on
+        // the same second we increment.
+        //
+        // We do this in a single statement using `INSERT … ON CONFLICT`
+        // so two concurrent verifies for the same token cannot both
+        // observe a pre-increment count and both succeed.
+        let now_secs = chrono::Utc::now().timestamp();
+        let mut tx = self.store.pool().begin().await.map_err(map_err)?;
+        sqlx::query(
+            r#"
+            INSERT INTO rate_buckets (token_id, window_start, count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(token_id) DO UPDATE SET
+                count = CASE
+                    WHEN rate_buckets.window_start = excluded.window_start THEN rate_buckets.count + 1
+                    ELSE 1
+                END,
+                window_start = excluded.window_start
+            "#,
+        )
+        .bind(token_id)
+        .bind(now_secs)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_err)?;
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT window_start, count FROM rate_buckets WHERE token_id = ?",
+        )
+        .bind(token_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_err)?;
+        tx.commit().await.map_err(map_err)?;
+        // The post-increment count is what we compare. The ELSE arm
+        // above has already reset count to 1 for a new window so this
+        // comparison is always against the current window's hits.
+        debug_assert_eq!(row.0, now_secs, "rate window should have rolled to now");
+        Ok(row.1 <= ops_per_sec as i64)
     }
 
     async fn approval_request(
