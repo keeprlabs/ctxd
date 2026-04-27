@@ -106,10 +106,8 @@ pub async fn spawn_daemon() -> DaemonHandle {
     // the CLI doesn't accept a pre-opened FD today, so we accept the
     // small TOCTOU window. Retries are unnecessary because parallel
     // tests aren't fighting over loopback ports in practice.
-    let http_port =
-        portpicker::pick_unused_port().expect("no free TCP port for HTTP admin");
-    let wire_port =
-        portpicker::pick_unused_port().expect("no free TCP port for wire protocol");
+    let http_port = portpicker::pick_unused_port().expect("no free TCP port for HTTP admin");
+    let wire_port = portpicker::pick_unused_port().expect("no free TCP port for wire protocol");
     let http_addr = format!("127.0.0.1:{http_port}");
     let wire_addr = format!("127.0.0.1:{wire_port}");
     let http_url = format!("http://{http_addr}");

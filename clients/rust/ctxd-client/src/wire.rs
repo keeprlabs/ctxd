@@ -124,14 +124,11 @@ impl WireConn {
             Response::Ok { data } => {
                 // The PUB handler returns the full event JSON. Pull
                 // the id field — it's a UUIDv7 string per CloudEvents.
-                let id_str = data
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        CtxdError::UnexpectedWireResponse(format!(
-                            "Pub response missing string `id` field: {data}"
-                        ))
-                    })?;
+                let id_str = data.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                    CtxdError::UnexpectedWireResponse(format!(
+                        "Pub response missing string `id` field: {data}"
+                    ))
+                })?;
                 let id = uuid::Uuid::parse_str(id_str).map_err(|e| {
                     CtxdError::UnexpectedWireResponse(format!("invalid uuid in Pub response: {e}"))
                 })?;

@@ -84,7 +84,10 @@ impl CtxdError {
         match status.as_u16() {
             401 | 403 => Self::Auth(body),
             404 => Self::NotFound(body),
-            other => Self::HttpStatus { status: other, body },
+            other => Self::HttpStatus {
+                status: other,
+                body,
+            },
         }
     }
 }
