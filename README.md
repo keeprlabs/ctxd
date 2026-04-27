@@ -247,7 +247,7 @@ Global flags: `--db <path>` (default `ctxd.db` for SQLite).
 | Language | Crate / package | Status |
 |----------|-----------------|--------|
 | Rust | [`ctxd-client`](clients/rust/ctxd-client/README.md) | v0.3 — published |
-| Python | `ctxd` (PyPI) | v0.3 — coming next |
+| Python | [`ctxd-client`](clients/python/ctxd-py/README.md) (imports as `ctxd`) | v0.3 — published |
 | TypeScript | `@keeprlabs/ctxd` (npm) | v0.3 — coming next |
 
 The Rust SDK is the source of truth: it defines the API surface the
