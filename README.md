@@ -242,6 +242,18 @@ Global flags: `--db <path>` (default `ctxd.db` for SQLite).
 | [benchmark-results.md](docs/benchmark-results.md) | Latest numbers (HNSW, FTS, federation throughput) |
 | [decisions/](docs/decisions/) | 19 ADRs covering every meaningful design call |
 
+## Client SDKs
+
+| Language | Crate / package | Status |
+|----------|-----------------|--------|
+| Rust | [`ctxd-client`](clients/rust/ctxd-client/README.md) | v0.3 — published |
+| Python | `ctxd` (PyPI) | v0.3 — coming next |
+| TypeScript | `@keeprlabs/ctxd` (npm) | v0.3 — coming next |
+
+The Rust SDK is the source of truth: it defines the API surface the
+Python and TypeScript packages mirror. All three depend on the same
+`docs/api/` contract and `docs/api/conformance/` fixtures.
+
 ## Development
 
 ```bash

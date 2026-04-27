@@ -17,6 +17,7 @@ members = [
     "crates/ctxd-adapter-fs",
     "crates/ctxd-adapter-gmail",
     "crates/ctxd-adapter-github",
+    "clients/rust/ctxd-client",
 ]
 
 [workspace.package]
