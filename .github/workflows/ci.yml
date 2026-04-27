@@ -79,3 +79,43 @@ jobs:
 
       - name: Conformance + extras
         run: cargo test -p ctxd-store-postgres --all-targets
+
+  python-sdk:
+    name: Python SDK (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The Python integration tests spawn the workspace ``ctxd``
+      # binary. Build it once per job up-front so the test suite
+      # doesn't shell out to cargo on the hot path.
+      - name: Build ctxd binary
+        run: cargo build --bin ctxd
+
+      - name: Install Python SDK (editable, with dev extras)
+        working-directory: clients/python/ctxd-py
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff lint
+        working-directory: clients/python/ctxd-py
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+
+      - name: Pytest
+        working-directory: clients/python/ctxd-py
+        run: pytest -xvs
