@@ -147,7 +147,7 @@ timestamp, and how many `(message, label)` pairs we've published.
   replaced with `-`, runs collapsed.
     - `INBOX` → `inbox`
     - `SENT` → `sent`
-    - `Projects/Sagework` → `projects-sagework`
+    - `Projects/Acme` → `projects-acme`
     - `[Imap]/Sent` → `imap-sent`
 - `message_id` is the Gmail-internal id (the `id` field on the
   message resource), not the RFC 822 `Message-ID` header.
