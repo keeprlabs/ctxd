@@ -1,0 +1,33 @@
+[package]
+name = "ctxd-wire"
+description = "ctxd wire protocol — message types, frame codec, and TCP client. The lean leaf SDK clients depend on."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "ctxd_wire"
+path = "src/lib.rs"
+
+[dependencies]
+# Serialization. The wire format is MessagePack; serde_json is also in the
+# protocol surface because PUB/QUERY/PeerReplicate carry opaque JSON
+# payloads (events, view results) by design.
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = "1"
+
+# Async. We deliberately depend on a *minimal* tokio: only `net` for
+# TcpStream and `io-util` for AsyncReadExt/AsyncWriteExt. No `full` —
+# the SDK should not pull in tokio's signal/process/fs stacks.
+tokio = { version = "1", default-features = false, features = ["net", "io-util"] }
+
+# Errors and tracing.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Test-time only: in-process duplex streams + the `#[tokio::test]` attribute.
+# Production builds get the lean tokio (`net` + `io-util`) declared above.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "io-util"] }
