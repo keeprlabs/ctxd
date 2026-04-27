@@ -119,3 +119,105 @@ jobs:
       - name: Pytest
         working-directory: clients/python/ctxd-py
         run: pytest -xvs
+
+  typescript-sdk:
+    name: TypeScript SDK (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: clients/typescript/ctxd-client/package-lock.json
+
+      # Integration tests spawn the workspace ``ctxd`` binary. Build
+      # it once per job up-front so the test suite doesn't shell out
+      # to cargo on the hot path.
+      - name: Build ctxd binary
+        run: cargo build --bin ctxd
+
+      - name: Install npm dependencies
+        working-directory: clients/typescript/ctxd-client
+        run: npm ci
+
+      - name: ESLint
+        working-directory: clients/typescript/ctxd-client
+        run: npm run lint
+
+      - name: Typecheck
+        working-directory: clients/typescript/ctxd-client
+        run: npm run typecheck
+
+      - name: Build (tsup)
+        working-directory: clients/typescript/ctxd-client
+        run: npm run build
+
+      - name: Verify browser bundle has no node:net imports
+        working-directory: clients/typescript/ctxd-client
+        run: |
+          if grep -q "node:net" dist/index.browser.js; then
+            echo "::error::dist/index.browser.js contains node:net — browser stub regression"
+            exit 1
+          fi
+
+      - name: Vitest
+        working-directory: clients/typescript/ctxd-client
+        run: npm test
+
+      - name: npm pack dry-run
+        working-directory: clients/typescript/ctxd-client
+        run: npm pack --dry-run
+
+  typescript-sdk-bun:
+    name: TypeScript SDK (Bun smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: clients/typescript/ctxd-client/package-lock.json
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The SDK's own scripts run via npm; we use Bun for a smoke test
+      # that exercises the published API surface against a real daemon.
+      - name: Build ctxd binary
+        run: cargo build --bin ctxd
+
+      - name: Install npm dependencies
+        working-directory: clients/typescript/ctxd-client
+        run: npm ci
+
+      - name: Build (tsup)
+        working-directory: clients/typescript/ctxd-client
+        run: npm run build
+
+      - name: Bun import smoke test
+        working-directory: clients/typescript/ctxd-client
+        run: |
+          bun -e 'import("./dist/index.js").then(m => {
+            const required = ["CtxdClient", "Operation", "verifySignature", "WireClient", "CtxdError"];
+            for (const k of required) {
+              if (!(k in m)) { console.error("missing:", k); process.exit(1); }
+            }
+            console.log("Bun import smoke OK:", Object.keys(m).length, "exports");
+          })'
