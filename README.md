@@ -248,11 +248,12 @@ Global flags: `--db <path>` (default `ctxd.db` for SQLite).
 |----------|-----------------|--------|
 | Rust | [`ctxd-client`](clients/rust/ctxd-client/README.md) | v0.3 — published |
 | Python | [`ctxd-client`](clients/python/ctxd-py/README.md) (imports as `ctxd`) | v0.3 — published |
-| TypeScript | `@keeprlabs/ctxd` (npm) | v0.3 — coming next |
+| TypeScript | [`@ctxd/client`](clients/typescript/ctxd-client/README.md) | v0.3 — published |
 
-The Rust SDK is the source of truth: it defines the API surface the
-Python and TypeScript packages mirror. All three depend on the same
-`docs/api/` contract and `docs/api/conformance/` fixtures.
+All three SDKs ship at v0.3.0. The Rust SDK is the source of truth:
+it defines the API surface the Python and TypeScript packages mirror.
+All three depend on the same `docs/api/` contract and
+`docs/api/conformance/` fixtures.
 
 ## Development
 
