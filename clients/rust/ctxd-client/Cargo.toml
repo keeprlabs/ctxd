@@ -1,0 +1,66 @@
+[package]
+name = "ctxd-client"
+description = "Official Rust SDK for the ctxd context substrate daemon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["ctxd", "context", "agents", "mcp", "sdk"]
+categories = ["api-bindings", "asynchronous"]
+rust-version = "1.78"
+
+[lib]
+name = "ctxd_client"
+path = "src/lib.rs"
+
+[dependencies]
+# Source-of-truth crates from the workspace. We deliberately depend on
+# the lean leaves (`ctxd-core` for the Event struct, `ctxd-wire` for
+# the protocol). We do NOT depend on `ctxd-store`, `ctxd-cap`,
+# `ctxd-http`, axum, sqlx, etc. — pulling those in would defeat the
+# purpose of a thin SDK.
+ctxd-core = { path = "../../../crates/ctxd-core" }
+ctxd-wire = { path = "../../../crates/ctxd-wire" }
+
+# Serialization. Both used by the HTTP admin types and (transitively)
+# by the wire protocol surface.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async. Lean tokio: only what the SDK actually needs at runtime. No
+# `full` — that pulls in fs/process/signal/macros which a library has
+# no business requiring of its host application.
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "rt"] }
+
+# HTTP admin client. rustls-only by design — `default-features = false`
+# strips the native-tls path entirely, so consumers don't end up
+# linking against system OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# Errors and tracing.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Crypto + encoding for verify_signature.
+ed25519-dalek = "2"
+hex = "0.4"
+
+# Time + ids — match the workspace versions so types interop cleanly
+# with `ctxd_core::event::Event`.
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Spawning the real ctxd binary for integration tests.
+assert_cmd = "2"
+tempfile = { workspace = true }
+# Tests need the full tokio macros (`#[tokio::test]`) and runtimes.
+tokio = { workspace = true }
+# Pre-allocate ports for the daemon. The CLI's `--bind` doesn't accept
+# `:0`, so we pre-pick on `127.0.0.1` and pass the picked addresses on.
+# There's an inherent TOCTOU window, but tests aren't competing for
+# ports in normal runs.
+portpicker = "0.1"
+# Future-stream consumption in subscribe tests.
+futures-util = "0.3"
