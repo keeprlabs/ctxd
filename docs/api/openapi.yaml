@@ -1,0 +1,475 @@
+openapi: 3.1.0
+info:
+  title: ctxd Admin HTTP API
+  version: 0.3.0
+  description: |
+    HTTP admin surface for the ctxd daemon. This spec covers the
+    endpoints exposed by `crates/ctxd-http/src/router.rs` as of the
+    v0.3 release. The wire protocol (publish/subscribe/query) is
+    documented separately in `wire-protocol.md` and uses MessagePack
+    over TCP — it is intentionally NOT served over HTTP.
+
+    ## Authentication
+
+    Endpoints documented as `security: [{ bearerAuth: [] }]` require
+    a base64-encoded biscuit token in the `Authorization: Bearer
+    <token>` header. The token must carry the `admin` operation. The
+    handler emits HTTP 401 when the header is missing or malformed,
+    and 403 when the token is present but lacks `admin`.
+
+    Endpoints without `security` are open by default to support local
+    CLI usage (see ADR 004 in the repo).
+
+    ## Versioning and stability
+
+    All endpoints in this document are versioned `/v1`. Breaking
+    changes will go to `/v2`. The `/health` endpoint is unversioned
+    and is the canonical liveness / version probe.
+  contact:
+    name: keeprlabs/ctxd
+    url: https://github.com/keeprlabs/ctxd
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://127.0.0.1:7777
+    description: Default local development binding (`ctxd serve --bind 127.0.0.1:7777`).
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: base64-biscuit
+      description: |
+        Base64-encoded biscuit (capability) token, minted by `POST
+        /v1/grant` or the `ctxd grant` CLI. The token must carry the
+        `admin` operation for endpoints that require auth.
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, version]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          const: ok
+        version:
+          type: string
+          description: Daemon package version (semver, e.g. `0.3.0`).
+
+    GrantRequest:
+      type: object
+      required: [subject, operations]
+      additionalProperties: false
+      properties:
+        subject:
+          type: string
+          description: Subject glob pattern the token grants access to.
+          examples: ["/work/**", "/", "/team/acme/**"]
+        operations:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [read, write, subjects, search, admin]
+          description: Operations to grant.
+        expires_in_secs:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Optional TTL in seconds. If omitted, the token does not
+            expire on its own (it can still be revoked).
+
+    GrantResponse:
+      type: object
+      required: [token]
+      additionalProperties: false
+      properties:
+        token:
+          type: string
+          description: Base64-encoded capability token.
+
+    StatsResponse:
+      type: object
+      required: [subject_count]
+      additionalProperties: true
+      properties:
+        subject_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of distinct subjects with at least one event.
+
+    PendingApproval:
+      type: object
+      required: [approval_id, token_id, operation, subject, requested_at]
+      additionalProperties: false
+      properties:
+        approval_id:
+          type: string
+          description: Unique id of this approval row.
+        token_id:
+          type: string
+          description: Capability id the approval was filed under.
+        operation:
+          type: string
+          enum: [read, write, subjects, search, admin]
+        subject:
+          type: string
+          description: Subject the requester wanted to operate on.
+        requested_at:
+          type: string
+          format: date-time
+          description: RFC3339 timestamp of when the approval was filed.
+
+    ApprovalsListResponse:
+      type: object
+      required: [pending]
+      additionalProperties: false
+      properties:
+        pending:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingApproval"
+
+    DecideRequest:
+      type: object
+      required: [decision]
+      additionalProperties: false
+      properties:
+        decision:
+          type: string
+          enum: [allow, deny]
+          description: |
+            Case-insensitive on the wire; the handler lowercases
+            before persisting.
+        token:
+          type: string
+          description: |
+            Optional admin token (base64). When the daemon is in
+            open-by-default mode and the request comes from localhost,
+            this can be omitted. When provided, the handler verifies
+            it carries the admin operation before recording the
+            decision.
+
+    DecideResponse:
+      type: object
+      required: [approval_id, decision]
+      additionalProperties: false
+      properties:
+        approval_id:
+          type: string
+        decision:
+          type: string
+          enum: [allow, deny]
+
+    PeerListItem:
+      type: object
+      required:
+        - peer_id
+        - url
+        - public_key
+        - subject_patterns
+        - added_at
+        - last_seen_at
+      additionalProperties: false
+      properties:
+        peer_id:
+          type: string
+          description: Local identifier for this peer (often the hex pubkey, but free-form).
+        url:
+          type: string
+          description: "Address we dial when replicating with this peer (e.g. `tcp://host:port`)."
+        public_key:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Remote peer's Ed25519 public key, hex-encoded lowercase.
+        subject_patterns:
+          type: array
+          items:
+            type: string
+          description: Subject globs we are willing to deliver to this peer.
+        added_at:
+          type: string
+          format: date-time
+          description: RFC3339 timestamp the peer was first registered.
+        last_seen_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: |
+            Reserved for v0.4 heartbeat tracking. Today this field is
+            present on the wire and always `null`. SDKs SHOULD treat it
+            as nullable.
+
+    PeerListResponse:
+      type: object
+      required: [peers]
+      additionalProperties: false
+      properties:
+        peers:
+          type: array
+          items:
+            $ref: "#/components/schemas/PeerListItem"
+          description: Peers in `(added_at ASC, peer_id ASC)` order.
+
+    Event:
+      $ref: "./events.schema.json"
+
+    PlainTextError:
+      type: string
+      description: |
+        Error responses on this surface are plain UTF-8 text, not JSON.
+        The body is the human-readable message produced by the handler
+        (e.g. `"missing bearer token"`, `"no peer: pX"`).
+
+  responses:
+    Unauthorized:
+      description: Authorization header missing or malformed.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/PlainTextError"
+    Forbidden:
+      description: Bearer token is present but does not grant `admin`.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/PlainTextError"
+
+paths:
+  /health:
+    get:
+      summary: Liveness + version probe.
+      description: |
+        Returns `{ "status": "ok", "version": "<daemon version>" }`.
+        Always open — never requires auth. Use this to verify the
+        daemon is up and to check SDK/daemon version compatibility.
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: Daemon is up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "5XX":
+          description: Daemon is unreachable or in a degraded state. Body shape is implementation-defined.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+
+  /v1/grant:
+    post:
+      summary: Mint a capability token.
+      description: |
+        Mints a fresh biscuit-encoded capability token authorizing the
+        named operations on the given subject pattern. The returned
+        token is base64-encoded and goes into the `Authorization:
+        Bearer <token>` header on subsequent calls.
+
+        v0.3: this endpoint does NOT require auth (open-by-default
+        for local CLI flows). Production deployments behind a network
+        boundary SHOULD front this with a reverse proxy that enforces
+        their own auth.
+      operationId: grant
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantRequest"
+      responses:
+        "200":
+          description: Token minted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GrantResponse"
+        "400":
+          description: Unknown operation name in `operations`.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+        "500":
+          description: The cap engine failed to mint a token.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+
+  /v1/stats:
+    get:
+      summary: Basic store statistics.
+      description: |
+        Returns `{ "subject_count": <n> }`. Open by default; cheap to
+        call. v0.4 will likely add a richer breakdown — extra keys
+        will be additive.
+      operationId: stats
+      security: []
+      responses:
+        "200":
+          description: Stats snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+        "5XX":
+          description: Storage failure assembling the snapshot.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+
+  /v1/approvals:
+    get:
+      summary: List pending human-approval requests.
+      description: |
+        Returns a list of approval rows still in the `pending` state,
+        ordered by `requested_at ASC`. SQLite-backed daemons return
+        the full row shape; in-memory daemons (test harnesses) return
+        an empty list because the trait does not expose enumeration.
+      operationId: listApprovals
+      security: []
+      responses:
+        "200":
+          description: Pending approvals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApprovalsListResponse"
+        "5XX":
+          description: Storage failure listing approvals.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+
+  /v1/approvals/{id}/decide:
+    post:
+      summary: Record a human decision on a pending approval.
+      description: |
+        Records the decision (`allow` or `deny`) against the named
+        approval row. If the request body carries a `token`, it is
+        verified to grant `admin` before the decision is persisted.
+        Open-by-default semantics apply when no token is supplied
+        (see ADR 004).
+      operationId: decideApproval
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+          description: Approval id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecideRequest"
+      responses:
+        "200":
+          description: Decision recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecideResponse"
+        "400":
+          description: Malformed token or invalid decision string.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+        "403":
+          description: Token present but does not carry `admin`.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+        "409":
+          description: |
+            Approval cannot be decided in its current state (already
+            decided, or the row does not exist).
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+
+  /v1/peers:
+    get:
+      summary: List federation peers.
+      description: |
+        Returns every registered federation peer in `(added_at ASC,
+        peer_id ASC)` order. Requires an admin bearer token.
+
+        Wire-shape note: `granted_subjects` (storage) is exposed as
+        `subject_patterns` (HTTP) so the JSON stays stable even if
+        the storage layer reshapes its internal struct.
+      operationId: listPeers
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Peer list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PeerListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Storage failure listing peers.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+
+  /v1/peers/{peer_id}:
+    delete:
+      summary: Remove a federation peer.
+      description: |
+        Deletes the peer row and its replication cursors. Requires an
+        admin bearer token. Returns `204 No Content` on success and
+        `404 Not Found` if no peer with that id exists.
+      operationId: removePeer
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: peer_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Peer removed.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No peer with that id.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
+        "500":
+          description: Storage failure removing the peer.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/PlainTextError"
