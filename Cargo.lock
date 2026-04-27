@@ -1098,6 +1098,7 @@ dependencies = [
  "ctxd-store-duckobj",
  "ctxd-store-postgres",
  "ctxd-store-sqlite",
+ "ctxd-wire",
  "hex",
  "opentelemetry",
  "opentelemetry-otlp",
