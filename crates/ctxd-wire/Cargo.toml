@@ -28,6 +28,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# Test-time only: in-process duplex streams + the `#[tokio::test]` attribute.
-# Production builds get the lean tokio (`net` + `io-util`) declared above.
-tokio = { version = "1", default-features = false, features = ["macros", "rt", "io-util"] }
+# Test-time only: in-process duplex streams, network listener for the
+# loopback test, and the `#[tokio::test]` attribute. Production builds
+# get the lean tokio (`net` + `io-util`) declared above.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "io-util", "net", "sync"] }
+rmp-serde = "1"
+serde_json = { workspace = true }

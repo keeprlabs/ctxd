@@ -25,10 +25,12 @@
 //! `PeerReplicate`, `PeerAck`, `PeerCursorRequest`, `PeerCursor`,
 //! `PeerFetchEvents`).
 
+pub mod client;
 pub mod errors;
 pub mod frame;
 pub mod messages;
 
+pub use client::{ProtocolClient, SubscriptionStream};
 pub use errors::{Result, WireError};
 pub use frame::{read_frame, write_frame, MAX_FRAME_BYTES};
 pub use messages::{BroadcastEvent, Request, Response};
