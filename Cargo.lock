@@ -1098,6 +1098,7 @@ dependencies = [
  "ctxd-store-duckobj",
  "ctxd-store-postgres",
  "ctxd-store-sqlite",
+ "ctxd-wire",
  "hex",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1287,6 +1288,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ctxd-wire"
+version = "0.3.0"
+dependencies = [
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
