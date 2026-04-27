@@ -1,0 +1,16 @@
+{
+  "specversion": "1.0",
+  "id": "01900000-0000-7000-8000-000000000010",
+  "source": "ctxd://conformance",
+  "subject": "/conformance/parents",
+  "type": "merge",
+  "time": "2026-01-01T00:01:00Z",
+  "datacontenttype": "application/json",
+  "data": {
+    "merge": true
+  },
+  "parents": [
+    "01900000-0000-7000-8000-000000000002",
+    "01900000-0000-7000-8000-000000000003"
+  ]
+}

@@ -34,3 +34,12 @@ tracing = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "io-util", "net", "sync"] }
 rmp-serde = "1"
 serde_json = { workspace = true }
+# Conformance corpus tests verify the daemon's own canonical msgpack
+# matches the docs/api/conformance/wire/*.msgpack.hex files, and run
+# EventSigner::verify against docs/api/conformance/signatures/* fixtures.
+# These deps are dev-only — the no-dev `dep_audit` test still asserts
+# `ctxd-wire`'s production tree is lean.
+ctxd-core = { path = "../ctxd-core" }
+hex = "0.4"
+uuid = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,10 @@
+{
+  "Grant": {
+    "subject": "/work/**",
+    "operations": [
+      "read",
+      "write"
+    ],
+    "expiry": null
+  }
+}
