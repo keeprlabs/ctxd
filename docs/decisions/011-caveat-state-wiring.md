@@ -113,6 +113,56 @@ ingestion.
   it would let token holders forge a cheap cost. Costs must be the
   verifier's prerogative.
 
+### 6. Rate-limit state shipped in 0.3.x
+
+The `rate_limit_ops_per_sec(<u32>)` fact has been a token attribute
+since v0.2 but was unenforced — the trait method
+`CaveatState::rate_check` returned `Ok(true)` on every backend. v0.3.x
+ships persistent enforcement on all three backends.
+
+**Design**: a per-`token_id` 1-second windowed counter. On each
+`rate_check(token_id, ops_per_sec)`:
+
+1. Floor `now()` to the start of the current wall-clock second
+   (`window_start`).
+2. Atomically upsert the row: if the stored `window_start` matches the
+   current one, increment `count`; otherwise replace `(window_start,
+   count)` with `(now_floor, 1)`.
+3. Return `count <= ops_per_sec`.
+
+The atomicity is what matters: SQLite uses a transaction-wrapped
+`INSERT … ON CONFLICT(token_id) DO UPDATE` with `CASE` arms inside the
+SET clause; Postgres uses the same shape with `RETURNING count` for a
+single round-trip; the in-memory backend uses a `Mutex<HashMap>`. Two
+concurrent verifies for the same token cannot both observe a
+pre-increment count and both succeed.
+
+**`CapEngine::verify_with_state` runs `rate_check` *last*** —
+after static, budget, and approval caveats have cleared. A
+rate-limited token has otherwise satisfied every check, so the error
+message ("back off and retry") is the only useful one.
+
+**Conditions that would make us revisit**: this is a hard
+sliding-window counter, which means an attacker can (in theory) burst
+2N hits across a 1-millisecond window centered on the second
+boundary. We accept that for v0.3.x because:
+- The hot path for production rate-limiting is still the in-memory
+  fast-path inside `ctxd-cli::rate_limit::RateLimiter`. The DB-backed
+  path exists for multi-process daemons and survives restarts.
+- The error this risks (a brief 2x burst at second boundaries) is
+  preferable to the failure modes of a token-bucket: leaky-bucket
+  state grows per-token-per-window, refill clocks drift across
+  replicas, and admission becomes harder to reason about under
+  partition. The ADR for that rewrite is queued for v0.4 (token
+  bucket with `refill_per_sec` + `bucket_capacity`).
+
+The integration tests in
+`crates/ctxd-cap/tests/rate_limit_enforcement.rs`,
+`crates/ctxd-store-sqlite/tests/rate_limit_persists.rs`, and
+`crates/ctxd-store-postgres/tests/pg_rate_limit.rs` pin the
+admit/deny boundary so a future smoother replacement has a regression
+net.
+
 ## Conditions that would make us revisit
 
 - A user reports billing errors caused by failed-op-still-charged
@@ -122,3 +172,7 @@ ingestion.
 - A second store backend (Postgres) lands: re-confirm the
   atomicity contract on `budget_increment` (it must use
   `UPDATE … RETURNING` or a transaction; SQLite uses the latter).
+- A user reports "I get a brief burst above my rate limit at exactly
+  the wall-clock second boundary": replace the windowed counter with
+  a token bucket per the v0.4 ADR. Until that lands, the
+  `rate_limit_*` integration tests remain the contract.
