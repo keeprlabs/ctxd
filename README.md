@@ -9,16 +9,19 @@ flowchart LR
     A1["Claude Desktop"] -->|"stdio"| MCP
     A2["Claude.ai / Cursor"] -->|"streamable HTTP"| MCP
     A3["Custom agent"] -->|"SSE"| MCP
+    SDK["First-party SDKs<br/>Rust · Python · TS"] -->|"HTTP + wire"| CTXD
     MCP["MCP server<br/>(8 tools)"] --> CTXD["ctxd daemon"]
-    PEER["peer ctxd"] <-->|"replicate"| CTXD
+    PEER["peer ctxd"] <-->|"replicate (TCP)"| CTXD
     GH["GitHub adapter"] --> CTXD
     GM["Gmail adapter"] --> CTXD
     FS["fs adapter"] --> CTXD
-    CTXD --> LOG["Event log<br/>(SQLite | Postgres | DuckDB+S3)"]
+    CTXD --> LOG["Event log<br/>(SQLite · Postgres · DuckDB+S3)"]
     LOG --- KV["KV"]
     LOG --- FTS["FTS"]
     LOG --- VEC["Vector<br/>(HNSW)"]
     LOG --- GRAPH["Graph"]
+    SDK -. "pinned to" .-> API["docs/api/<br/>OpenAPI · JSON Schema · msgpack hex"]
+    CTXD -. "validates against" .-> API
 ```
 
 ## What's in v0.3
@@ -28,8 +31,10 @@ flowchart LR
 - **Multi-transport MCP.** stdio, SSE, and streamable-HTTP serve the same tool surface concurrently. Bearer-token auth on HTTP; tool-arg fallback for stdio.
 - **Real ingestion adapters.** Gmail (OAuth2 device flow + AES-256-GCM token at rest + History API incremental sync). GitHub (PAT + ETag caching + rate-limit handling).
 - **Hybrid search.** Pluggable embedder (OpenAI, Ollama, none); persisted HNSW index via `hnsw_rs`; FTS + vector + Reciprocal Rank Fusion.
-- **Stateful caveats.** `BudgetLimit` (per-token spend ceiling) and `HumanApprovalRequired` (blocking approval flow via `ctxd approve` or `POST /v1/approvals/:id/decide`).
+- **Stateful caveats.** `BudgetLimit` (per-token spend ceiling), `HumanApprovalRequired` (blocking approval flow via `ctxd approve` or `POST /v1/approvals/:id/decide`), and `RateLimited` (persisted per-token 1-second windowed counter).
 - **Causal DAG.** Events carry `parents` so concurrent writes are detected and resolved deterministically (LWW on `(time, id)`). Tamper-evident via predecessor hash chains; signed via Ed25519.
+- **Three first-party SDKs.** Rust ([`ctxd-client`](clients/rust/ctxd-client/README.md)), Python ([`ctxd-client`](clients/python/ctxd-py/README.md), imports as `ctxd`), TypeScript ([`@ctxd/client`](clients/typescript/ctxd-client/README.md)). All three ship at v0.3 and pin to the same [`docs/api/`](docs/api/) contract.
+- **API contract artifact.** [`docs/api/`](docs/api/) is the single source of truth: OpenAPI 3.1 for HTTP, JSON Schema for events, MessagePack hex fixtures for the wire protocol. Every SDK runs the same conformance corpus.
 
 ## Install and run
 
@@ -107,6 +112,49 @@ ctxd serve --storage duckdb-object \
 
 Postgres and DuckDB run a minimal HTTP admin (full daemon over `dyn Store` is a v0.4 follow-up). See [docs/storage-postgres.md](docs/storage-postgres.md) and [docs/storage-duckdb-object.md](docs/storage-duckdb-object.md).
 
+### Build a client
+
+The three first-party SDKs all wrap the same HTTP admin + wire protocol surface. Each has its own README with full quickstart, request/response types, and conformance notes.
+
+**Rust** — [`clients/rust/ctxd-client`](clients/rust/ctxd-client/README.md):
+
+```bash
+cargo add ctxd-client
+```
+
+```rust
+let client = ctxd_client::CtxdClient::connect("http://127.0.0.1:7777").await?
+    .with_wire("127.0.0.1:7778").await?;
+let id = client.write("/work/notes", "ctx.note", json!({"hi": "there"})).await?;
+```
+
+**Python** — [`clients/python/ctxd-py`](clients/python/ctxd-py/README.md). PyPI package is `ctxd-client`, imports as `ctxd`:
+
+```bash
+pip install ctxd-client
+```
+
+```python
+from ctxd import CtxdAsyncClient
+async with CtxdAsyncClient.connect("http://127.0.0.1:7777") as client:
+    await client.with_wire("127.0.0.1:7778")
+    eid = await client.write("/work/notes", "ctx.note", {"hi": "there"})
+```
+
+**TypeScript / JavaScript** — [`clients/typescript/ctxd-client`](clients/typescript/ctxd-client/README.md):
+
+```bash
+npm i @ctxd/client
+```
+
+```ts
+import { CtxdClient } from "@ctxd/client";
+const client = new CtxdClient({ httpUrl: "http://127.0.0.1:7777", wireAddr: "127.0.0.1:7778" });
+const eid = await client.write({ subject: "/work/notes", eventType: "ctx.note", data: { hi: "there" } });
+```
+
+All three SDKs pin to the same [`docs/api/`](docs/api/) contract artifact and run the same conformance corpus.
+
 ## Connect Claude Desktop
 
 ```json
@@ -134,7 +182,7 @@ The event log is append-only. Every write is tamper-evident via predecessor hash
 
 See [docs/architecture.md](docs/architecture.md) for the full picture with diagrams.
 
-ctxd is a Cargo workspace of 14 crates:
+ctxd is a Cargo workspace of 16 crates plus 3 first-party client SDKs:
 
 ```
 ctxd-core             Event struct, Subject paths, hash chains, Ed25519 signing.
@@ -147,11 +195,16 @@ ctxd-cap              Biscuit capabilities. Third-party blocks + caveat enforcem
 ctxd-embed            Embedder trait + NullEmbedder + OpenAI + Ollama impls.
 ctxd-mcp              MCP server. stdio + SSE + streamable-HTTP transports.
 ctxd-http             Admin REST API (health, grant, stats, peers, approvals).
+ctxd-wire             MessagePack wire protocol — request/response enums + framing.
 ctxd-cli              The `ctxd` binary. Wires everything together.
 ctxd-adapter-core     Adapter trait + EventSink for ingestion.
 ctxd-adapter-fs       Filesystem watcher adapter.
 ctxd-adapter-gmail    Real Gmail adapter (OAuth2 device flow + History API).
 ctxd-adapter-github   Real GitHub adapter (PAT + ETag + rate limits).
+
+clients/rust/ctxd-client       Rust SDK (cargo add ctxd-client).
+clients/python/ctxd-py         Python SDK (pip install ctxd-client).
+clients/typescript/ctxd-client TypeScript / JS SDK (npm i @ctxd/client).
 ```
 
 ## API surfaces
@@ -241,6 +294,8 @@ Global flags: `--db <path>` (default `ctxd.db` for SQLite).
 | [benchmarking.md](docs/benchmarking.md) | Methodology + comparisons |
 | [benchmark-results.md](docs/benchmark-results.md) | Latest numbers (HNSW, FTS, federation throughput) |
 | [decisions/](docs/decisions/) | 19 ADRs covering every meaningful design call |
+| [clients/](clients/) | First-party SDKs (Rust / Python / TypeScript) that wrap the daemon API |
+| [docs/api/](docs/api/) | API contract artifact — OpenAPI 3.1, JSON Schema, MessagePack hex fixtures |
 
 ## Client SDKs
 

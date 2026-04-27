@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.1 — 2026-04-24
+
+The launch-ready polish release. Persistent rate-limit caveat state closes the last v0.3 leftover, three first-party SDKs land alongside the daemon, and the `/v1/peers` admin surface gets a friendlier README + architecture pass.
+
+- **First-party SDKs shipped.** Rust ([`ctxd-client`](clients/rust/ctxd-client/README.md)) on crates.io, Python ([`ctxd-client`](clients/python/ctxd-py/README.md), imports as `ctxd`) on PyPI, TypeScript ([`@ctxd/client`](clients/typescript/ctxd-client/README.md)) on npm. All three pin to the same API contract and run the same conformance corpus.
+- **API contract artifact** at [`docs/api/`](docs/api/) — OpenAPI 3.1 for HTTP, JSON Schema 2020-12 for events, MessagePack hex fixtures for the wire protocol, plus a SDK<->daemon compatibility matrix. The Rust workspace runs the same conformance harness in `crates/ctxd-wire/tests/conformance_corpus.rs` so the daemon is held to the same bar as the SDKs.
+- **HTTP `/v1/peers` admin endpoints.** `GET /v1/peers` lists federation peers; `DELETE /v1/peers/:peer_id` removes one. Mirrors the `ctxd peer list / remove` CLI.
+- **`ctxd-wire` crate split out of `ctxd-cli`.** The MessagePack request/response enums and length-prefixed framing now live in their own leaf crate so SDKs, federation, and embedded servers can take a wire-protocol dep without dragging in storage, capabilities, MCP, or the HTTP admin.
+- **Persistent rate-limit caveat state (3E).** `CaveatState::rate_check(token_id, ops_per_sec)` is now a real per-token 1-second windowed counter on all three backends. `verify_with_state` enforces it as the last gate after budget + approval. New `CapError::RateLimited { ops_per_sec }` variant. SQLite gets a `rate_buckets` table (additive, gated on `IF NOT EXISTS`); Postgres adds the same in `0003_caveats.sql`. Three integration suites pin the admit/deny boundary so a future smoother token-bucket rewrite has a regression net. ADR 011 updated.
+
 ## v0.3 — 2026-04-24
 
 The federation, backends, and adapters release. Five phases delivered across 13 sub-agent runs and one shared review pass. **364 tests passing**, clippy clean, fmt clean. 19 ADRs cover every meaningful design call.
