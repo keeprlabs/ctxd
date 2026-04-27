@@ -181,9 +181,9 @@ keeps the policy in one file.
 
 * When rmcp 1.x ships a server-side SSE transport, swap our in-tree
   SSE for theirs.
-* When a Sagework production deployment needs in-process TLS (e.g. a
-  customer's air-gapped install where they can't run nginx), revisit
-  the TLS decision and add rustls behind a feature flag.
+* When a production deployment needs in-process TLS (e.g. an air-gapped
+  install where the operator can't run nginx), revisit the TLS decision
+  and add rustls behind a feature flag.
 * When the per-call body exceeds 1 MiB on a real workload, raise the
   limit (configurable today via `AuthMiddlewareConfig::max_body_bytes`
   if a downstream caller wants to override).
