@@ -190,7 +190,8 @@ ctxd-adapter-github   Real GitHub adapter (PAT + ETag + rate limits).
 | `GET /health` | Health + version |
 | `POST /v1/grant` | Mint a capability token |
 | `GET /v1/stats` | Store statistics |
-| `GET /v1/peers` | List federation peers |
+| `GET /v1/peers` | List federation peers (admin) |
+| `DELETE /v1/peers/:peer_id` | Remove a federation peer (admin) |
 | `GET /v1/approvals` | List pending HumanApproval requests |
 | `POST /v1/approvals/:id/decide` | Allow / deny an approval (admin) |
 

@@ -25,7 +25,7 @@ flowchart TB
     subgraph "ctxd daemon"
         MCP["MCP Server\n(rmcp, stdio)\n\n5 tools:\nctx_write\nctx_read\nctx_subjects\nctx_search\nctx_subscribe"]
         WIRE["Wire Protocol\n(MsgPack/TCP, :7778)\n\n6 verbs:\nPUB, SUB, QUERY\nGRANT, REVOKE, PING"]
-        HTTP["HTTP Server\n(axum, :7777)\n\n3 endpoints:\nGET /health\nPOST /v1/grant\nGET /v1/stats"]
+        HTTP["HTTP Server\n(axum, :7777)\n\nendpoints:\nGET /health\nPOST /v1/grant\nGET /v1/stats\nGET /v1/peers\nDELETE /v1/peers/:id\nGET /v1/approvals\nPOST /v1/approvals/:id/decide"]
 
         CAP["Capability Engine\n(biscuit-auth)\n\nmint / verify / attenuate"]
 

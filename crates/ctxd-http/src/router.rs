@@ -1,9 +1,10 @@
 //! HTTP router and handlers for the ctxd admin API.
 
+use crate::responses::{PeerListItem, PeerListResponse};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ctxd_cap::state::{ApprovalDecision, CaveatState};
 use ctxd_cap::{CapEngine, Operation};
@@ -41,7 +42,56 @@ pub fn build_router(
         .route("/v1/stats", get(stats))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/decide", post(decide_approval))
+        .route("/v1/peers", get(list_peers))
+        .route("/v1/peers/{peer_id}", delete(remove_peer))
         .with_state(state)
+}
+
+/// Extract a base64 biscuit from the `Authorization: Bearer <token>`
+/// header. Returns `None` if the header is missing, multi-valued, has
+/// non-ASCII bytes, or doesn't follow the `Bearer <token>` shape.
+///
+/// The header value is intentionally never logged — bearer tokens are
+/// secrets.
+fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(AUTHORIZATION)?;
+    let s = value.to_str().ok()?;
+    let trimmed = s.trim();
+    let token = trimmed.strip_prefix("Bearer ").or_else(|| {
+        // Be lenient about the case of the scheme — RFC 7235 says
+        // schemes are case-insensitive.
+        let (scheme, rest) = trimmed.split_once(char::is_whitespace)?;
+        if scheme.eq_ignore_ascii_case("bearer") {
+            Some(rest)
+        } else {
+            None
+        }
+    })?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// Verify that the request carries a bearer token granting
+/// [`Operation::Admin`] for any subject (we use `"/"` as the
+/// canonical admin target — admin caps cover any subject glob).
+///
+/// Returns `Err` mapped directly to the appropriate HTTP status:
+/// - missing or malformed `Authorization` → `401 Unauthorized`
+/// - present but lacking the admin scope (or otherwise invalid) →
+///   `403 Forbidden`
+fn require_admin(cap_engine: &CapEngine, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    let token_b64 = bearer_from_headers(headers)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
+    let token = CapEngine::token_from_base64(&token_b64)
+        .map_err(|e| (StatusCode::FORBIDDEN, format!("invalid token: {e}")))?;
+    cap_engine
+        .verify(&token, "/", Operation::Admin, None)
+        .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+    Ok(())
 }
 
 /// Health check endpoint.
@@ -194,4 +244,69 @@ async fn list_approvals(State(state): State<AppState>) -> impl IntoResponse {
         .await
         .unwrap_or_default();
     Json(serde_json::json!({ "pending": rows }))
+}
+
+/// `GET /v1/peers` — list every registered federation peer.
+///
+/// Requires an admin bearer token. Peers are returned sorted by
+/// `(added_at ASC, peer_id ASC)` so the response is stable for
+/// snapshot-style assertions.
+async fn list_peers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PeerListResponse>, (StatusCode, String)> {
+    require_admin(&state.cap_engine, &headers)?;
+
+    let mut peers = state
+        .store
+        .peer_list_impl()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Stable order: (added_at ASC, peer_id ASC). The SQLite
+    // implementation already orders by added_at, but we re-sort here
+    // to (a) make the contract explicit and (b) tie-break on peer_id
+    // so equal timestamps don't surface non-deterministically.
+    peers.sort_by(|a, b| a.added_at.cmp(&b.added_at).then(a.peer_id.cmp(&b.peer_id)));
+
+    let items: Vec<PeerListItem> = peers.into_iter().map(PeerListItem::from).collect();
+    Ok(Json(PeerListResponse { peers: items }))
+}
+
+/// `DELETE /v1/peers/:peer_id` — remove a federation peer and its
+/// replication cursors.
+///
+/// Returns:
+/// - `204 No Content` on a successful delete
+/// - `404 Not Found` if no peer with that id exists
+/// - `401`/`403` per [`require_admin`]
+async fn remove_peer(
+    State(state): State<AppState>,
+    Path(peer_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_admin(&state.cap_engine, &headers)?;
+
+    // `Store::peer_remove` is idempotent (Ok whether or not the row
+    // existed), so we must look the peer up first to honor the 404
+    // contract. Cost is fine: the peer table is tiny by design.
+    let exists = state
+        .store
+        .peer_list_impl()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .iter()
+        .any(|p| p.peer_id == peer_id);
+
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, format!("no peer: {peer_id}")));
+    }
+
+    state
+        .store
+        .peer_remove_impl(&peer_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
