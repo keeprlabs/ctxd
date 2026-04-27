@@ -1,0 +1,9 @@
+{
+  "Pub": {
+    "subject": "/test/hello",
+    "event_type": "demo",
+    "data": {
+      "msg": "world"
+    }
+  }
+}
