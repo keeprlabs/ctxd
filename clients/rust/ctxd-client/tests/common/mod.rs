@@ -155,7 +155,19 @@ pub async fn spawn_daemon() -> DaemonHandle {
             .await
         {
             Ok(r) if r.status().is_success() => {
-                return handle;
+                // HTTP is up — now wait for the wire-protocol port too.
+                // The daemon binds wire after HTTP, so on slow CI
+                // runners there's a small window where /health answers
+                // but the wire socket is still pre-listen. Probe with
+                // a TCP connect; retry within the same deadline.
+                while Instant::now() < deadline {
+                    if tokio::net::TcpStream::connect(&wire_addr).await.is_ok() {
+                        return handle;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                last_err = Some(format!("wire port {wire_addr} never accepted"));
+                break;
             }
             Ok(r) => {
                 last_err = Some(format!("status {}", r.status()));
