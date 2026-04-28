@@ -1,5 +1,16 @@
 name: Release
 
+# Builds the ctxd daemon binary for macOS (arm64 + x86_64) and Linux
+# (x86_64 + aarch64) on every `v*` tag, attaches the tarballs and an
+# install.sh to the GitHub Release, and pushes a Homebrew formula to
+# keeprlabs/homebrew-tap so `brew install keeprlabs/tap/ctxd` works.
+#
+# The release notes for the public-facing release are committed to
+# release-notes/v<version>.md. If that file exists, the workflow uses
+# it verbatim; otherwise it falls back to GitHub's auto-generated
+# notes. This lets us hand-write voice for the announcement releases
+# and still ship patch tags without ceremony.
+
 on:
   push:
     tags:
@@ -13,6 +24,7 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -31,38 +43,210 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross-compilation tools (linux/aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --bin ctxd --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Package
+        id: pkg
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../ctxd-${{ matrix.target }}.tar.gz ctxd
-          cd ../../..
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="ctxd-${VERSION}-${TARGET}"
+          mkdir -p "$STAGE"
+          cp "target/${TARGET}/release/ctxd" "$STAGE/ctxd"
+          cp README.md LICENSE "$STAGE/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          # Compute sha256 in a portable way (shasum is on both macOS and ubuntu-latest).
+          shasum -a 256 "${STAGE}.tar.gz" | awk '{print $1}' > "${STAGE}.tar.gz.sha256"
+          echo "tarball=${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${STAGE}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "Built ${STAGE}.tar.gz"
+          echo "sha256: $(cat "${STAGE}.tar.gz.sha256")"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ctxd-${{ matrix.target }}
-          path: ctxd-${{ matrix.target }}.tar.gz
+          path: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.checksum }}
+          retention-days: 7
 
   release:
-    name: Create Release
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha_x86_64_linux: ${{ steps.checksums.outputs.sha_x86_64_linux }}
+      sha_aarch64_linux: ${{ steps.checksums.outputs.sha_aarch64_linux }}
+      sha_x86_64_darwin: ${{ steps.checksums.outputs.sha_x86_64_darwin }}
+      sha_aarch64_darwin: ${{ steps.checksums.outputs.sha_aarch64_darwin }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
 
-      - name: Create Release
+      - name: Compute release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts and gather checksums
+        id: checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Each upload-artifact directory contains the tarball + .sha256 sibling.
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} dist/ \;
+          ls -la dist
+
+          # Read each per-target sha into outputs so the homebrew job can reuse them
+          # without re-downloading. Filenames are deterministic from the matrix.
+          v="${{ steps.meta.outputs.version }}"
+          read_sha() { cat "dist/ctxd-${v}-$1.tar.gz.sha256"; }
+          {
+            echo "sha_x86_64_linux=$(read_sha x86_64-unknown-linux-gnu)"
+            echo "sha_aarch64_linux=$(read_sha aarch64-unknown-linux-gnu)"
+            echo "sha_x86_64_darwin=$(read_sha x86_64-apple-darwin)"
+            echo "sha_aarch64_darwin=$(read_sha aarch64-apple-darwin)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render install.sh with pinned version
+        run: |
+          set -euo pipefail
+          v="${{ steps.meta.outputs.version }}"
+          # Stamp the version into the installer template so the asset
+          # on the release matches the release exactly. The "UNPINNED"
+          # sentinel (in scripts/install.sh) becomes the literal
+          # version string here. Users who hit
+          # /releases/latest/download/install.sh get the per-release
+          # pinned variant; the unpinned latest-resolving variant is
+          # in scripts/install.sh on main, for the rare case where a
+          # caller needs to track latest deliberately.
+          sed "s/^PINNED_VERSION=\"UNPINNED\"$/PINNED_VERSION=\"${v}\"/" scripts/install.sh > dist/install.sh
+          chmod +x dist/install.sh
+          grep '^PINNED_VERSION=' dist/install.sh
+
+      - name: Resolve release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          v="${{ steps.meta.outputs.version }}"
+          NOTES_FILE="release-notes/v${v}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "Using hand-written notes from $NOTES_FILE"
+            echo "path=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+            echo "use_generated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No $NOTES_FILE — falling back to GitHub auto-generated notes"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "use_generated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release (hand-written notes)
+        if: steps.notes.outputs.use_generated == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          files: ctxd-*/ctxd-*.tar.gz
+          files: |
+            dist/ctxd-*.tar.gz
+            dist/ctxd-*.tar.gz.sha256
+            dist/install.sh
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+
+      - name: Create GitHub Release (auto-generated notes)
+        if: steps.notes.outputs.use_generated == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ctxd-*.tar.gz
+            dist/ctxd-*.tar.gz.sha256
+            dist/install.sh
           generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  update-homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    # Skip pre-release tags (alpha/beta/rc) — they shouldn't update the
+    # default `brew install` path.
+    if: ${{ !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA_X86_LINUX: ${{ needs.release.outputs.sha_x86_64_linux }}
+          SHA_ARM_LINUX: ${{ needs.release.outputs.sha_aarch64_linux }}
+          SHA_X86_DARWIN: ${{ needs.release.outputs.sha_x86_64_darwin }}
+          SHA_ARM_DARWIN: ${{ needs.release.outputs.sha_aarch64_darwin }}
+        run: |
+          set -euo pipefail
+          # Substitute version + per-platform sha256s into the template.
+          # The template lives in-repo so reviewers can see the formula
+          # change in the same PR as a release-process change.
+          sed \
+            -e "s|__VERSION__|${VERSION}|g" \
+            -e "s|__SHA_X86_LINUX__|${SHA_X86_LINUX}|g" \
+            -e "s|__SHA_ARM_LINUX__|${SHA_ARM_LINUX}|g" \
+            -e "s|__SHA_X86_DARWIN__|${SHA_X86_DARWIN}|g" \
+            -e "s|__SHA_ARM_DARWIN__|${SHA_ARM_DARWIN}|g" \
+            homebrew/ctxd.rb.tmpl > /tmp/ctxd.rb
+          echo "── rendered formula ──"
+          cat /tmp/ctxd.rb
+
+      - name: Push to homebrew-tap
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_DEPLOY_KEY:-}" ]; then
+            echo "::warning::TAP_DEPLOY_KEY is not configured. Skipping tap update."
+            echo "To enable: add a deploy key with write access to keeprlabs/homebrew-tap"
+            echo "and store its private key as TAP_DEPLOY_KEY in this repo's secrets."
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$TAP_DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o StrictHostKeyChecking=no"
+
+          git clone git@github.com:keeprlabs/homebrew-tap.git /tmp/homebrew-tap
+          cd /tmp/homebrew-tap
+          mkdir -p Formula
+          cp /tmp/ctxd.rb Formula/ctxd.rb
+
+          git config user.name "ctxd-release-bot"
+          git config user.email "bot@keeprlabs.org"
+          git add Formula/ctxd.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit"
+            exit 0
+          fi
+          git commit -m "ctxd ${VERSION}"
+          git push origin main
+          echo "Published ctxd ${VERSION} to keeprlabs/homebrew-tap"
