@@ -1,8 +1,55 @@
 # ctxd
 
-Context substrate for AI agents. Single binary, append-only event log, subject-based addressing, capability tokens, federated, MCP-native.
+**Context substrate for AI agents.** A single-binary daemon that gives every agent — Claude Desktop, Cursor, your own code — one place to write and read shared context, with capability tokens, federation, and a native MCP server.
 
-Not a vector DB. Not an agent framework. Not a knowledge graph. A substrate.
+[![Release](https://img.shields.io/github/v/release/keeprlabs/ctxd?style=flat-square)](https://github.com/keeprlabs/ctxd/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/keeprlabs/ctxd/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/keeprlabs/ctxd/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/keeprlabs/ctxd?style=flat-square)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/keeprlabs/ctxd?style=flat-square)](https://github.com/keeprlabs/ctxd/stargazers)
+
+```bash
+brew install keeprlabs/tap/ctxd
+ctxd serve
+```
+
+Now any MCP-aware agent — or one of the [three first-party SDKs](#build-a-client) — can write to `/work/notes/...` and read it back from anywhere else.
+
+---
+
+## Why ctxd
+
+Every AI agent starts each session with amnesia. Context is scattered across Gmail, Slack, GitHub, Notion, and chat windows. None of those tools share a view, and your AI re-derives state from scratch every time.
+
+ctxd is the place that context lives. Write once over MCP or HTTP, query from any agent, prove what was written via Ed25519 signatures, replicate to peer nodes you trust. Not a vector DB, not an agent framework, not a knowledge graph — a substrate the rest of those things plug into.
+
+## Quickstart
+
+```bash
+# 1. Install
+brew install keeprlabs/tap/ctxd
+
+# 2. Run
+ctxd serve                   # HTTP admin :7777, MCP on stdio
+
+# 3. Use
+ctxd write --subject /work/notes/standup --type ctx.note \
+  --data '{"content":"Ship auth by Friday"}'
+ctxd read --subject /work --recursive
+```
+
+Point Claude Desktop at it (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "ctxd": { "command": "/opt/homebrew/bin/ctxd", "args": ["serve", "--mcp-stdio"] }
+  }
+}
+```
+
+You now have eight MCP tools wired to your context: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`, `ctx_entities`, `ctx_related`, `ctx_timeline`.
+
+## How it fits
 
 ```mermaid
 flowchart LR
@@ -20,23 +67,40 @@ flowchart LR
     LOG --- FTS["FTS"]
     LOG --- VEC["Vector<br/>(HNSW)"]
     LOG --- GRAPH["Graph"]
-    SDK -. "pinned to" .-> API["docs/api/<br/>OpenAPI · JSON Schema · msgpack hex"]
-    CTXD -. "validates against" .-> API
 ```
 
-## What's in v0.3
+The event log is append-only. Views (KV, FTS, vector, graph, temporal) are derived from it and rebuildable from it. See [docs/architecture.md](docs/architecture.md) for the full picture.
 
-- **Federation.** Two ctxd nodes peer with one command, replicate subjects bidirectionally, resume from persisted cursors after a crash, and verify biscuit third-party capability chains offline.
-- **Three storage backends.** SQLite (default), Postgres (clustered FTS via tsvector), DuckDB-on-object-store (Parquet log on S3/R2/local fs + SQLite sidecar) — all behind a shared `Store` trait + conformance suite.
-- **Multi-transport MCP.** stdio, SSE, and streamable-HTTP serve the same tool surface concurrently. Bearer-token auth on HTTP; tool-arg fallback for stdio.
-- **Real ingestion adapters.** Gmail (OAuth2 device flow + AES-256-GCM token at rest + History API incremental sync). GitHub (PAT + ETag caching + rate-limit handling).
-- **Hybrid search.** Pluggable embedder (OpenAI, Ollama, none); persisted HNSW index via `hnsw_rs`; FTS + vector + Reciprocal Rank Fusion.
-- **Stateful caveats.** `BudgetLimit` (per-token spend ceiling), `HumanApprovalRequired` (blocking approval flow via `ctxd approve` or `POST /v1/approvals/:id/decide`), and `RateLimited` (persisted per-token 1-second windowed counter).
-- **Causal DAG.** Events carry `parents` so concurrent writes are detected and resolved deterministically (LWW on `(time, id)`). Tamper-evident via predecessor hash chains; signed via Ed25519.
-- **Three first-party SDKs.** Rust ([`ctxd-client`](clients/rust/ctxd-client/README.md)), Python ([`ctxd-client`](clients/python/ctxd-py/README.md), imports as `ctxd`), TypeScript ([`@ctxd/client`](clients/typescript/ctxd-client/README.md)). All three ship at v0.3 and pin to the same [`docs/api/`](docs/api/) contract.
-- **API contract artifact.** [`docs/api/`](docs/api/) is the single source of truth: OpenAPI 3.1 for HTTP, JSON Schema for events, MessagePack hex fixtures for the wire protocol. Every SDK runs the same conformance corpus.
+## Features
 
-## Install and run
+| Feature | Description |
+|---------|-------------|
+| **Multi-transport** | One binary speaks HTTP admin (`:7777`), MessagePack wire (`:7778`), and MCP over stdio + SSE + streamable-HTTP — concurrently, off the same tool surface |
+| **Tamper-evident log** | Append-only event log, predecessor hash chains, Ed25519 signatures, causal-DAG `parents` for deterministic conflict resolution |
+| **Capability tokens** | Biscuit-based, attenuable, bearer. Stateful caveats: budget limits, human approval, rate limits |
+| **Storage backends** | SQLite (default), Postgres (clustered FTS via `tsvector`), DuckDB-on-object-store (Parquet on S3 / R2 / local fs) — all behind one `Store` trait + conformance suite |
+| **Federation** | Two nodes peer with one command, replicate subjects bidirectionally, resume from cursors after a crash, backfill missing parents on causal-DAG gaps |
+| **Hybrid search** | Pluggable embedder (OpenAI, Ollama, none); persisted HNSW vector index + FTS fused via Reciprocal Rank Fusion |
+| **Real adapters** | Gmail (OAuth2 + AES-256-GCM token at rest + History API). GitHub (PAT + ETag caching + rate limits) |
+| **Three SDKs** | Rust, Python, TypeScript — all pinned to the same `docs/api/` conformance corpus the daemon runs |
+
+## Install
+
+### Homebrew (macOS, Linux)
+
+```bash
+brew install keeprlabs/tap/ctxd
+```
+
+### curl | sh
+
+```bash
+curl -fsSL https://github.com/keeprlabs/ctxd/releases/latest/download/install.sh | sh
+```
+
+Auto-detects OS + arch, verifies the published sha256, drops the binary in the first writable directory on `$PATH`. Override with `CTXD_INSTALL_DIR=...` (set it on the `sh` side of the pipe).
+
+### From source
 
 ```bash
 git clone https://github.com/keeprlabs/ctxd && cd ctxd
@@ -44,282 +108,63 @@ cargo build --release
 # add --features storage-postgres,storage-duckdb-object for the heavier backends
 ```
 
-## 60-second quickstart
+Pre-built tarballs for macOS arm64/x86_64 and Linux x86_64/aarch64 are attached to every [release](https://github.com/keeprlabs/ctxd/releases).
 
-```bash
-# Start the daemon (SQLite + stdio MCP).
-ctxd serve
+## Build a client
 
-# In another terminal: write a few events.
-ctxd write --subject /work/acme/notes/standup --type ctx.note \
-  --data '{"content":"Ship auth by Friday"}'
-ctxd write --subject /work/acme/customers/cust-42 --type ctx.crm \
-  --data '{"status":"interested","plan":"enterprise"}'
+The three first-party SDKs all wrap the same HTTP admin + wire protocol surface. Each pins to the same [`docs/api/`](docs/api/) contract.
 
-# Read back recursively.
-ctxd read --subject /work/acme --recursive
+| Language | Install | Status |
+|----------|---------|--------|
+| Rust | `cargo add ctxd-client` ([README](clients/rust/ctxd-client/README.md)) | v0.3 — published |
+| Python | `pip install ctxd-client` (imports as `ctxd`, [README](clients/python/ctxd-py/README.md)) | v0.3 — published |
+| TypeScript | `npm i @ctxd/client` ([README](clients/typescript/ctxd-client/README.md)) | v0.3 — published |
 
-# List subjects.
-ctxd subjects --recursive
-
-# Mint a capability scoped to /work/acme, read-only.
-ctxd grant --subject "/work/acme/**" --operations "read,subjects"
-```
-
-### With semantic + hybrid search
-
-```bash
-export OPENAI_API_KEY=sk-...
-ctxd serve --embedder openai
-# ctx_search defaults to hybrid (FTS + vector + RRF) when an embedder is configured.
-# See docs/embeddings.md for Ollama and other providers.
-```
-
-### With multi-transport MCP
-
-```bash
-ctxd serve \
-  --mcp-stdio \
-  --mcp-sse 127.0.0.1:7779 \
-  --mcp-http 127.0.0.1:7780 \
-  --require-auth
-# All three transports serve the same tool surface. Auth via
-# `Authorization: Bearer <base64-biscuit>` on HTTP; tool-arg fallback for stdio.
-```
-
-### With federation
-
-```bash
-# On node A:
-ctxd peer grant --subjects "/work/shared/**" --expires 30d > cap-from-a.b64
-# Hand cap-from-a.b64 to the operator of node B; they run:
-ctxd peer add --url tcp://node-a:7778 --capability "$(cat cap-from-a.b64)"
-# Both sides auto-exchange capabilities, replicate /work/shared/**,
-# and resume from cursor after a restart.
-```
-
-See [docs/federation.md](docs/federation.md) for the full two-node tutorial.
-
-### With Postgres or DuckDB+S3
-
-```bash
-ctxd serve --storage postgres \
-  --storage-uri postgres://user:pass@host/ctxd
-
-ctxd serve --storage duckdb-object \
-  --storage-uri s3://my-bucket/ctxd-events
-```
-
-Postgres and DuckDB run a minimal HTTP admin (full daemon over `dyn Store` is a v0.4 follow-up). See [docs/storage-postgres.md](docs/storage-postgres.md) and [docs/storage-duckdb-object.md](docs/storage-duckdb-object.md).
-
-### Build a client
-
-The three first-party SDKs all wrap the same HTTP admin + wire protocol surface. Each has its own README with full quickstart, request/response types, and conformance notes.
-
-**Rust** — [`clients/rust/ctxd-client`](clients/rust/ctxd-client/README.md):
-
-```bash
-cargo add ctxd-client
-```
+The Rust SDK is the source of truth; the Python and TypeScript packages mirror it. All three run the same MessagePack hex fixtures and JSON Schema corpus the daemon runs.
 
 ```rust
-let client = ctxd_client::CtxdClient::connect("http://127.0.0.1:7777").await?
+use ctxd_client::CtxdClient;
+let client = CtxdClient::connect("http://127.0.0.1:7777").await?
     .with_wire("127.0.0.1:7778").await?;
 let id = client.write("/work/notes", "ctx.note", json!({"hi": "there"})).await?;
 ```
 
-**Python** — [`clients/python/ctxd-py`](clients/python/ctxd-py/README.md). PyPI package is `ctxd-client`, imports as `ctxd`:
+## Going further
 
-```bash
-pip install ctxd-client
-```
-
-```python
-from ctxd import CtxdAsyncClient
-async with CtxdAsyncClient.connect("http://127.0.0.1:7777") as client:
-    await client.with_wire("127.0.0.1:7778")
-    eid = await client.write("/work/notes", "ctx.note", {"hi": "there"})
-```
-
-**TypeScript / JavaScript** — [`clients/typescript/ctxd-client`](clients/typescript/ctxd-client/README.md):
-
-```bash
-npm i @ctxd/client
-```
-
-```ts
-import { CtxdClient } from "@ctxd/client";
-const client = new CtxdClient({ httpUrl: "http://127.0.0.1:7777", wireAddr: "127.0.0.1:7778" });
-const eid = await client.write({ subject: "/work/notes", eventType: "ctx.note", data: { hi: "there" } });
-```
-
-All three SDKs pin to the same [`docs/api/`](docs/api/) contract artifact and run the same conformance corpus.
-
-## Connect Claude Desktop
-
-```json
-{
-  "mcpServers": {
-    "ctxd": {
-      "command": "/path/to/ctxd",
-      "args": ["serve", "--mcp-stdio"]
-    }
-  }
-}
-```
-
-Claude gets eight tools: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`, `ctx_entities`, `ctx_related`, `ctx_timeline`.
-
-## Why ctxd exists
-
-Every AI agent starts each session with amnesia. Your context is scattered across Gmail, Slack, GitHub, Notion, and whatever you typed into the last chat window. Each tool has its own siloed view. None of them talk to each other. Your AI re-derives context from scratch every time.
-
-ctxd fixes this. It's a single place where all your context lives, addressed by subject paths, secured by capability tokens, queryable by any agent over MCP, and replicated to peer nodes you trust. Write once, query from anywhere.
-
-The event log is append-only. Every write is tamper-evident via predecessor hash chains and signed with Ed25519. Materialized views (KV, FTS, vector, graph, temporal) are derived from the log and can be rebuilt from it. Capability tokens are signed, attenuable, and bearer — an agent gets exactly the scope it needs, can delegate via biscuit third-party blocks, and cannot escalate.
-
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md) for the full picture with diagrams.
-
-ctxd is a Cargo workspace of 16 crates plus 3 first-party client SDKs:
-
-```
-ctxd-core             Event struct, Subject paths, hash chains, Ed25519 signing.
-ctxd-store-core       Store trait + shared DTOs + conformance test suite.
-ctxd-store-sqlite     Default SQLite backend. KV / FTS5 / HNSW vector / graph views.
-ctxd-store-postgres   Postgres backend. tsvector FTS, advisory-lock TOCTOU.
-ctxd-store-duckobj    DuckDB-on-object-store. Parquet + WAL + SQLite sidecar.
-ctxd-store            Back-compat shim re-exporting from ctxd-store-sqlite.
-ctxd-cap              Biscuit capabilities. Third-party blocks + caveat enforcement.
-ctxd-embed            Embedder trait + NullEmbedder + OpenAI + Ollama impls.
-ctxd-mcp              MCP server. stdio + SSE + streamable-HTTP transports.
-ctxd-http             Admin REST API (health, grant, stats, peers, approvals).
-ctxd-wire             MessagePack wire protocol — request/response enums + framing.
-ctxd-cli              The `ctxd` binary. Wires everything together.
-ctxd-adapter-core     Adapter trait + EventSink for ingestion.
-ctxd-adapter-fs       Filesystem watcher adapter.
-ctxd-adapter-gmail    Real Gmail adapter (OAuth2 device flow + History API).
-ctxd-adapter-github   Real GitHub adapter (PAT + ETag + rate limits).
-
-clients/rust/ctxd-client       Rust SDK (cargo add ctxd-client).
-clients/python/ctxd-py         Python SDK (pip install ctxd-client).
-clients/typescript/ctxd-client TypeScript / JS SDK (npm i @ctxd/client).
-```
-
-## API surfaces
-
-### MCP (for agents)
-
-| Tool | Description |
-|------|-------------|
-| `ctx_write` | Append an event |
-| `ctx_read` | Read events under a subject (recursive optional) |
-| `ctx_subjects` | List subject paths |
-| `ctx_search` | FTS / vector / hybrid search (RRF) |
-| `ctx_subscribe` | Poll events since a timestamp |
-| `ctx_entities` | Query graph entities |
-| `ctx_related` | Walk graph relationships from an entity |
-| `ctx_timeline` | Read events as-of a historical timestamp |
-
-### Wire protocol (MessagePack over TCP, port 7778)
-
-| Verb | Description |
-|------|-------------|
-| `PUB` | Append an event |
-| `SUB` | Subscribe (real-time broadcast) |
-| `QUERY` | Query a materialized view |
-| `GRANT` / `REVOKE` | Capability lifecycle |
-| `PEER_HELLO` / `PEER_WELCOME` | Federation handshake |
-| `PEER_REPLICATE` / `PEER_ACK` | Bidirectional event stream |
-| `PEER_CURSOR_REQUEST` / `PEER_CURSOR` | Resume from last-seen |
-| `PEER_FETCH_EVENTS` | Parent backfill on causal DAG gap |
-| `PING` | Health check |
-
-### HTTP (port 7777)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Health + version |
-| `POST /v1/grant` | Mint a capability token |
-| `GET /v1/stats` | Store statistics |
-| `GET /v1/peers` | List federation peers (admin) |
-| `DELETE /v1/peers/:peer_id` | Remove a federation peer (admin) |
-| `GET /v1/approvals` | List pending HumanApproval requests |
-| `POST /v1/approvals/:id/decide` | Allow / deny an approval (admin) |
-
-## CLI reference
-
-```
-ctxd serve      Start daemon (HTTP + wire + MCP transports)
-                Flags: --bind, --wire-bind, --mcp-stdio,
-                       --mcp-sse <addr>, --mcp-http <addr>, --require-auth,
-                       --embedder {null|openai|ollama},
-                       --embedder-model, --embedder-url, --embedder-api-key,
-                       --storage {sqlite|postgres|duckdb-object},
-                       --storage-uri <uri>
-ctxd write      Append an event (--subject, --type, --data, --sign)
-ctxd read       Read events (--subject, --recursive)
-ctxd query      Basic EventQL filter
-ctxd subjects   List subjects (--prefix, --recursive)
-ctxd grant      Mint a capability token
-ctxd verify     Verify a token
-ctxd revoke     Revoke a token by id
-ctxd verify-signature  Verify an event's Ed25519 signature
-ctxd peer       add | list | status | remove | grant
-ctxd migrate    Re-canonicalize an existing DB at the v0.3 schema
-ctxd approve    Decide a pending HumanApproval (--id, --decision)
-ctxd connect    Connect to a remote daemon via wire protocol
-```
-
-Global flags: `--db <path>` (default `ctxd.db` for SQLite).
-
-## Docs
-
-| Document | What it covers |
-|----------|---------------|
-| [architecture.md](docs/architecture.md) | System design, data flow, crate map |
-| [events.md](docs/events.md) | CloudEvents schema, canonical form, hash chain, parents |
-| [subjects.md](docs/subjects.md) | Path syntax, recursive reads, glob patterns |
-| [capabilities.md](docs/capabilities.md) | Biscuit tokens, third-party blocks, BudgetLimit, HumanApprovalRequired |
-| [capability-tutorial.md](docs/capability-tutorial.md) | Hands-on walkthrough |
-| [mcp.md](docs/mcp.md) | Tool reference + transports (stdio / SSE / HTTP) |
-| [federation.md](docs/federation.md) | Two-node tutorial + handshake + cursor resume |
-| [embeddings.md](docs/embeddings.md) | Embedder providers + hybrid search modes |
-| [storage-postgres.md](docs/storage-postgres.md) | Postgres backend setup |
-| [storage-duckdb-object.md](docs/storage-duckdb-object.md) | DuckDB+S3 backend setup |
-| [adapters/gmail.md](docs/adapters/gmail.md) | Gmail adapter walkthrough |
-| [adapters/github.md](docs/adapters/github.md) | GitHub adapter walkthrough |
-| [adapter-guide.md](docs/adapter-guide.md) | Authoring a new adapter |
-| [benchmarking.md](docs/benchmarking.md) | Methodology + comparisons |
-| [benchmark-results.md](docs/benchmark-results.md) | Latest numbers (HNSW, FTS, federation throughput) |
-| [decisions/](docs/decisions/) | 19 ADRs covering every meaningful design call |
-| [clients/](clients/) | First-party SDKs (Rust / Python / TypeScript) that wrap the daemon API |
-| [docs/api/](docs/api/) | API contract artifact — OpenAPI 3.1, JSON Schema, MessagePack hex fixtures |
-
-## Client SDKs
-
-| Language | Crate / package | Status |
-|----------|-----------------|--------|
-| Rust | [`ctxd-client`](clients/rust/ctxd-client/README.md) | v0.3 — published |
-| Python | [`ctxd-client`](clients/python/ctxd-py/README.md) (imports as `ctxd`) | v0.3 — published |
-| TypeScript | [`@ctxd/client`](clients/typescript/ctxd-client/README.md) | v0.3 — published |
-
-All three SDKs ship at v0.3.0. The Rust SDK is the source of truth:
-it defines the API surface the Python and TypeScript packages mirror.
-All three depend on the same `docs/api/` contract and
-`docs/api/conformance/` fixtures.
+| Topic | Link |
+|-------|------|
+| Architecture, data flow, crate map | [docs/architecture.md](docs/architecture.md) |
+| Events: schema, canonical form, hash chain | [docs/events.md](docs/events.md) |
+| Subjects: path syntax, recursive reads | [docs/subjects.md](docs/subjects.md) |
+| Capabilities: biscuit tokens, caveats | [docs/capabilities.md](docs/capabilities.md) (+ [hands-on](docs/capability-tutorial.md)) |
+| MCP: tool reference + transports | [docs/mcp.md](docs/mcp.md) |
+| Federation: two-node tutorial | [docs/federation.md](docs/federation.md) |
+| Embeddings + hybrid search | [docs/embeddings.md](docs/embeddings.md) |
+| Postgres / DuckDB+S3 backends | [storage-postgres.md](docs/storage-postgres.md) · [storage-duckdb-object.md](docs/storage-duckdb-object.md) |
+| Adapters: Gmail, GitHub, authoring guide | [adapters/](docs/adapters/) · [adapter-guide.md](docs/adapter-guide.md) |
+| Benchmarks (HNSW, FTS, federation) | [benchmark-results.md](docs/benchmark-results.md) |
+| API contract artifact (OpenAPI + JSON Schema + msgpack hex) | [docs/api/](docs/api/) |
+| Architecture decisions (19 ADRs) | [docs/decisions/](docs/decisions/) |
 
 ## Development
 
 ```bash
-cargo test --workspace                   # ~425 tests (default features); --all-features adds postgres/duckdb suites
-cargo test --workspace --all-features    # exercises postgres + duckdb features
+cargo test --workspace                       # ~425 tests (default features)
+cargo test --workspace --all-features        # adds postgres + duckdb suites
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-CI runs the Postgres conformance suite against a postgres:16 service container.
+CI runs the Postgres conformance suite against a `postgres:16` service container. The full matrix lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+## Contributing
+
+Bugs, features, and adapter PRs all welcome.
+
+- File issues at [github.com/keeprlabs/ctxd/issues](https://github.com/keeprlabs/ctxd/issues).
+- For new adapters, start with [docs/adapter-guide.md](docs/adapter-guide.md) — the trait is stable.
+- Open PRs against `main`. CI must be green; clippy and `cargo fmt --check` are gates.
+- We aim to triage every PR within a few days.
 
 ## License
 
