@@ -476,6 +476,23 @@ impl EventStore {
         .execute(&self.pool)
         .await?;
 
+        // v0.3.x: rate_buckets — sliding 1-second window counter per
+        // token_id, used by the `rate_limit_ops_per_sec` caveat. We
+        // store one row per token: when a verify lands in a different
+        // second we overwrite (window_start, count) with the new
+        // window. The PRIMARY KEY on token_id makes the upsert atomic.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rate_buckets (
+                token_id     TEXT PRIMARY KEY,
+                window_start INTEGER NOT NULL,
+                count        INTEGER NOT NULL DEFAULT 0
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1125,6 +1142,7 @@ mod tests {
             "token_budgets",
             "pending_approvals",
             "vector_embeddings",
+            "rate_buckets",
         ] {
             let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(&store.pool)

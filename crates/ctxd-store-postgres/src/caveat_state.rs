@@ -80,15 +80,37 @@ impl CaveatState for PostgresCaveatState {
         }
     }
 
-    async fn rate_check(
-        &self,
-        _token_id: &str,
-        _op: &str,
-        _rate_ops_per_sec: u32,
-    ) -> Result<bool, CapError> {
-        // Same policy as SQLite — the in-memory rate limiter is the
-        // hot path; persistent rate limiting is deferred.
-        Ok(true)
+    async fn rate_check(&self, token_id: &str, ops_per_sec: u32) -> Result<bool, CapError> {
+        // Single-statement upsert mirrors the SQLite impl. The
+        // `date_trunc('second', $2)` floors `now()` to the start of
+        // the current second so two verifies that land in the same
+        // window land on the same `window_start` value. Postgres can
+        // run this as one round-trip with `RETURNING count` — TOCTOU
+        // safe under the per-row lock taken by `INSERT … ON CONFLICT`.
+        let now = chrono::Utc::now();
+        let row = sqlx::query(
+            r#"
+            INSERT INTO rate_buckets (token_id, window_start, count)
+            VALUES ($1, date_trunc('second', $2::timestamptz), 1)
+            ON CONFLICT (token_id) DO UPDATE SET
+                count = CASE
+                    WHEN rate_buckets.window_start = date_trunc('second', $2::timestamptz)
+                        THEN rate_buckets.count + 1
+                    ELSE 1
+                END,
+                window_start = date_trunc('second', $2::timestamptz)
+            RETURNING count
+            "#,
+        )
+        .bind(token_id)
+        .bind(now)
+        .fetch_one(self.store.pool())
+        .await
+        .map_err(map_err)?;
+        let count: i32 = row
+            .try_get("count")
+            .map_err(|e| CapError::Denied(format!("rate_check RETURNING decode: {e}")))?;
+        Ok(count as i64 <= ops_per_sec as i64)
     }
 
     async fn approval_request(

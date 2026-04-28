@@ -20,30 +20,41 @@ flowchart TB
         CA[Custom Agent]
         CLI[CLI]
         ADM[Admin UI]
+        SDK["First-party SDKs<br/>Rust · Python · TS"]
     end
 
     subgraph "ctxd daemon"
-        MCP["MCP Server\n(rmcp, stdio)\n\n5 tools:\nctx_write\nctx_read\nctx_subjects\nctx_search\nctx_subscribe"]
-        WIRE["Wire Protocol\n(MsgPack/TCP, :7778)\n\n6 verbs:\nPUB, SUB, QUERY\nGRANT, REVOKE, PING"]
-        HTTP["HTTP Server\n(axum, :7777)\n\nendpoints:\nGET /health\nPOST /v1/grant\nGET /v1/stats\nGET /v1/peers\nDELETE /v1/peers/:id\nGET /v1/approvals\nPOST /v1/approvals/:id/decide"]
+        MCP["MCP Server<br/>(rmcp; stdio + SSE + streamable-HTTP)<br/><br/>8 tools:<br/>ctx_write · ctx_read · ctx_subjects<br/>ctx_search · ctx_subscribe<br/>ctx_entities · ctx_related · ctx_timeline"]
+        WIRE["Wire Protocol<br/>(MsgPack/TCP, :7778)<br/><br/>verbs:<br/>PUB · SUB · QUERY · GRANT · REVOKE · PING<br/>PEER_HELLO · PEER_WELCOME<br/>PEER_REPLICATE · PEER_ACK<br/>PEER_CURSOR_REQUEST · PEER_CURSOR<br/>PEER_FETCH_EVENTS"]
+        HTTP["HTTP Server<br/>(axum, :7777)<br/><br/>endpoints:<br/>GET /health · POST /v1/grant<br/>GET /v1/stats<br/>GET /v1/peers · DELETE /v1/peers/:id<br/>GET /v1/approvals<br/>POST /v1/approvals/:id/decide"]
 
-        CAP["Capability Engine\n(biscuit-auth)\n\nmint / verify / attenuate"]
+        CAP["Capability Engine<br/>(biscuit-auth)<br/><br/>mint · verify · attenuate · third-party blocks<br/>Stateful caveats: BudgetLimit · HumanApproval · RateLimited"]
 
-        STORE["Event Store\n(SQLite)\n\nappend / read / read_since\nsearch / subjects / kv_get"]
+        STORE["Store trait<br/>(ctxd-store-core)<br/><br/>SQLite (default) · Postgres · DuckDB+S3<br/>append · read · read_at · search<br/>subjects · kv_get · graph · timeline"]
 
-        KV["KV View\nlatest value\nper subject"]
-        FTS["FTS View\nSQLite FTS5\nfull-text search"]
-        VEC["Vector View\nHNSW index\nin-memory"]
+        KV["KV View<br/>latest value<br/>per subject"]
+        FTS["FTS View<br/>FTS5 · tsvector<br/>full-text search"]
+        VEC["Vector View<br/>HNSW (hnsw_rs)<br/>persisted sidecar"]
+        GRAPH["Graph View<br/>entities + relationships<br/>derived from events"]
     end
 
-    CD & CU & CA -->|MCP stdio| MCP
+    PEER["Peer ctxd<br/>federation"]
+    API["docs/api/<br/>OpenAPI · JSON Schema · msgpack hex"]
+
+    CD & CU & CA -->|MCP| MCP
     CLI -->|direct| STORE
     ADM -->|HTTP| HTTP
-    CA -->|TCP| WIRE
+    CA & SDK -->|TCP wire| WIRE
+    SDK -->|HTTP| HTTP
+
+    PEER <-->|replicate| WIRE
 
     MCP & WIRE & HTTP --> CAP
     CAP --> STORE
-    STORE --> KV & FTS & VEC
+    STORE --> KV & FTS & VEC & GRAPH
+
+    SDK -. "pinned to" .-> API
+    HTTP & WIRE -. "validates against" .-> API
 ```
 
 ## Data model
@@ -106,44 +117,66 @@ All views are derived from the append-only event log and can be rebuilt from it.
 
 | View | What it stores | Use case | Implementation |
 |------|---------------|----------|----------------|
-| **KV** | Latest event data per subject | "Current state of customer cust-42?" | SQLite table, UPSERT on append |
-| **FTS** | Full-text index over event data | "Find everything mentioning 'enterprise plan'" | SQLite FTS5 virtual table |
-| **Vector** | HNSW nearest-neighbor index | "10 most semantically similar events" | instant-distance crate, in-memory, rebuilt on restart |
+| **KV** | Latest event data per subject | "Current state of customer cust-42?" | SQLite table / Postgres row, UPSERT on append; LWW on `(time, id)` |
+| **FTS** | Full-text index over event data | "Find everything mentioning 'enterprise plan'" | SQLite FTS5 virtual table; Postgres `tsvector` generated column + GIN |
+| **Vector** | HNSW nearest-neighbor index | "10 most semantically similar events" | `hnsw_rs` 0.3 with on-disk sidecars (`<db>.hnsw.{graph,data,meta,map}`); rebuilt from `vector_embeddings` on corruption |
+| **Graph** | Entities + relationships extracted from event payloads | "All events related to entity cust-42" | SQLite `graph_entities` + `graph_relationships` (mirrored in Postgres) |
+| **Temporal** | Point-in-time event reconstruction | "What did `/work/acme/cust-42` look like on 2025-01-15?" | derived view over the events table by `time` predicate |
 
-ctxd does NOT generate embeddings. Users supply them.
+ctxd does NOT generate embeddings — the `Embedder` trait wraps OpenAI / Ollama / Null providers and the daemon stores whatever vector the embedder returns. Hybrid search (FTS + vector + Reciprocal Rank Fusion at `k=60`) is the default mode when an embedder is configured. See [embeddings.md](embeddings.md) and ADRs 014 / 015.
 
 ## Crate dependency graph
 
 ```mermaid
 graph TD
-    CORE["ctxd-core\nEvent, Subject, PredecessorHash\nZero deps on storage/network/auth"]
+    CORE["ctxd-core<br/>Event · Subject · PredecessorHash · Ed25519<br/>zero deps on storage/network/auth"]
 
-    STORE["ctxd-store\nSQLite event log\nKV / FTS / Vector views"]
-    CAP["ctxd-cap\nBiscuit capability engine"]
-    ADCORE["ctxd-adapter-core\nAdapter + EventSink traits"]
+    STC["ctxd-store-core<br/>Store trait + DTOs<br/>conformance test suite"]
+    SS["ctxd-store-sqlite<br/>SQLite + FTS5 + HNSW + graph"]
+    SP["ctxd-store-postgres<br/>tsvector FTS · advisory-lock TOCTOU"]
+    SD["ctxd-store-duckobj<br/>Parquet + WAL + sidecar"]
+    SHIM["ctxd-store<br/>back-compat shim"]
 
-    ADFS["ctxd-adapter-fs\nFilesystem watcher"]
-    ADGM["ctxd-adapter-gmail\n(stub)"]
-    ADGH["ctxd-adapter-github\n(stub)"]
+    CAP["ctxd-cap<br/>biscuit · third-party blocks<br/>BudgetLimit · HumanApproval · RateLimited"]
+    EMBED["ctxd-embed<br/>Embedder trait<br/>OpenAI · Ollama · Null"]
 
-    MCP["ctxd-mcp\nMCP server, 5 tools\nover stdio"]
-    HTTP["ctxd-http\nAdmin REST API\n3 routes"]
+    WIRE["ctxd-wire<br/>MessagePack request/response enums<br/>length-prefixed framing (leaf crate)"]
 
-    CLI["ctxd-cli\nThe binary\nWires everything together"]
+    ADCORE["ctxd-adapter-core<br/>Adapter + EventSink traits"]
+    ADFS["ctxd-adapter-fs<br/>filesystem watcher"]
+    ADGM["ctxd-adapter-gmail<br/>OAuth2 device flow + History API"]
+    ADGH["ctxd-adapter-github<br/>PAT + ETag + rate limits"]
 
-    CORE --> STORE
+    MCP["ctxd-mcp<br/>stdio + SSE + streamable-HTTP<br/>8 tools"]
+    HTTP["ctxd-http<br/>admin REST · approvals · peers"]
+    CLI["ctxd-cli<br/>the ctxd binary"]
+
+    SDKR["clients/rust/ctxd-client"]
+    SDKP["clients/python/ctxd-py"]
+    SDKT["clients/typescript/ctxd-client"]
+
+    CORE --> STC
+    STC --> SS & SP & SD
+    SS --> SHIM
     CORE --> CAP
+    CORE --> EMBED
     CORE --> ADCORE
+    CORE --> WIRE
 
-    ADCORE --> ADFS
-    ADCORE --> ADGM
-    ADCORE --> ADGH
+    ADCORE --> ADFS & ADGM & ADGH
 
-    CORE & STORE & CAP --> MCP
-    CORE & STORE & CAP --> HTTP
+    CORE & STC & CAP --> MCP
+    CORE & STC & CAP --> HTTP
+    CORE & WIRE --> CLI
 
-    MCP & HTTP & STORE & CAP & ADCORE --> CLI
+    MCP & HTTP & SS & SP & SD & CAP & ADCORE & WIRE --> CLI
+
+    SDKR -. "wraps" .-> HTTP & WIRE
+    SDKP -. "wraps" .-> HTTP & WIRE
+    SDKT -. "wraps" .-> HTTP & WIRE
 ```
+
+`ctxd-wire` is a leaf crate — it depends on `ctxd-core` for the `Event` type but is not depended on by anything inside the workspace except `ctxd-cli` (the binary) and the Rust SDK. Splitting it out means downstream consumers (the three SDKs, federation, embedded servers) can take a wire-protocol dep without dragging in storage, capabilities, MCP, or the HTTP admin.
 
 ## Capability model
 
@@ -165,15 +198,18 @@ flowchart TD
 
 Each level can only narrow scope. Never widen.
 
-**Caveat types in v0.1:**
+**Caveat types (v0.3):**
 
-| Caveat | Purpose |
-|--------|---------|
-| SubjectMatches | Glob pattern restricting which paths the token can access |
-| OperationAllowed | Which operations: read, write, subjects, search, admin |
-| ExpiresAt | Timestamp after which the token is invalid |
-| KindAllowed | Restrict to specific event types (e.g., only `ctx.note`) |
-| RateLimit | Ops/sec cap (stored in token, enforcement is v0.2) |
+| Caveat | Purpose | State |
+|--------|---------|-------|
+| SubjectMatches | Glob pattern restricting which paths the token can access | static |
+| OperationAllowed | Which operations: `read`, `write`, `subjects`, `search`, `admin`, `peer`, `subscribe` | static |
+| ExpiresAt | Timestamp after which the token is invalid | static |
+| KindAllowed | Restrict to specific event types (e.g., only `ctx.note`) | static |
+| RateLimit | `ops_per_sec` cap, persisted 1-second windowed counter (ADR 011) | stateful |
+| BudgetLimit | `(currency, amount_micro_units)` cumulative spend cap with per-op cost table | stateful |
+| HumanApprovalRequired | Each verify for the named op blocks until a human decides | stateful |
+| Third-party block | Authority-signed attenuation (e.g. `A → B → C` chain) verified via `verify_multi` | static |
 
 Verification is datalog-injection-safe. All user inputs are validated against `"`, `)`, `;`, and newline before interpolation into biscuit authorizer code.
 
@@ -188,10 +224,18 @@ sequenceDiagram
     participant SUB as SUB listeners
 
     C->>S: write(subject, type, data, token?)
-    S->>CAP: verify(token, subject, "write")
-    alt token invalid
+    S->>CAP: verify_with_state(token, subject, "write", state)
+    alt token invalid (static caveats fail)
         CAP-->>S: DENIED
         S-->>C: error: authorization denied
+    else budget exceeded
+        CAP-->>S: BudgetExceeded
+        S-->>C: error: budget exceeded
+    else approval required
+        CAP-->>CAP: blocking approval_wait(timeout)
+    else rate limited
+        CAP-->>S: RateLimited
+        S-->>C: error: rate limited (back off)
     end
     CAP-->>S: OK
 
@@ -256,25 +300,50 @@ Every message on the TCP wire is length-prefixed. The length field is a 4-byte b
 ## SQLite schema
 
 ```sql
-events           -- append-only event log (seq, id, source, subject, type, time, data, predecessorhash)
-kv_view          -- latest value per subject (subject PK, data, updated_at)
-fts_view         -- FTS5 virtual table (event_id, subject, event_type, data)
-metadata         -- daemon config (key-value, stores root capability key)
+events             -- append-only event log: seq, id, source, subject, event_type, time,
+                   --                       data, predecessorhash, signature, parents,
+                   --                       attestation
+event_parents      -- causal-DAG side table (event_id, parent_id) for parent backfill
+kv_view            -- latest value per subject (subject PK, data, updated_at)
+fts_view           -- FTS5 virtual table (event_id, subject, event_type, data)
+graph_entities     -- materialized entities extracted from event payloads
+graph_relationships -- edges between entities
+revoked_tokens     -- biscuit token revocation list (token_id PK)
+peers              -- federation peers (peer_id, public_key, url, scopes, …)
+peer_cursors       -- last-seen cursor per peer for resume
+token_budgets      -- BudgetLimit per (token_id, currency)
+pending_approvals  -- HumanApprovalRequired queue (approval_id, decision, …)
+rate_buckets       -- RateLimit 1-second windowed counter per token_id
+vector_embeddings  -- raw vectors backing the persisted HNSW index
+metadata           -- daemon config and ctxd_version stamp
 ```
 
-Indexes on events: `subject`, `time`, `event_type`.
+Postgres mirrors the same logical tables with Postgres-native types (`UUID`, `JSONB`, `TIMESTAMPTZ`, `UUID[]`, `BYTEA`); see `docs/storage-postgres.md` and ADR 016 for the schema choices.
 
-## What v0.1 does NOT include
+DuckDB+object-store keeps the event log as Parquet files behind an atomic `_manifest.json` and uses a SQLite sidecar for the same KV / peers / caveats / vectors / graph tables (ADR 018).
+
+## Client SDKs
+
+Three first-party SDKs ship at v0.3 alongside the daemon. All three pin to the same [`docs/api/`](api/) contract artifact (OpenAPI 3.1 + JSON Schema + MessagePack hex fixtures) and run the same conformance corpus, so a wire change either lands in every SDK or fails CI.
+
+| Language | Package | Path | Source of truth |
+|----------|---------|------|-----------------|
+| Rust | `ctxd-client` (crates.io) | [`clients/rust/ctxd-client`](../clients/rust/ctxd-client/README.md) | yes |
+| Python | `ctxd-client` on PyPI (imports as `ctxd`) | [`clients/python/ctxd-py`](../clients/python/ctxd-py/README.md) | mirrors Rust |
+| TypeScript / JS | `@ctxd/client` on npm | [`clients/typescript/ctxd-client`](../clients/typescript/ctxd-client/README.md) | mirrors Rust |
+
+The Rust SDK's API surface is the source of truth; Python and TypeScript mirror it method-for-method, with language-idiomatic naming and async ergonomics. The Rust workspace runs the same conformance harness in `crates/ctxd-wire/tests/conformance_corpus.rs` so the daemon is held to the same bar as the SDKs.
+
+## What v0.3 does NOT include
 
 | Feature | Target | Reason |
 |---------|--------|--------|
-| Federation | v0.3 | Needs conflict resolution, peer discovery |
-| Ed25519 signatures | v0.2 | Key management UX |
-| Token revocation | v0.2 | Needs revocation list |
-| Graph view | v0.2 | Needs LLM extraction |
-| Temporal queries | v0.2 | Needs point-in-time reconstruction |
-| Postgres backend | v0.3 | Shipped — `ctxd-store-postgres` (ADR 016) |
-| DuckDB+object-store backend | v0.3 (in flight) | Phase 5B parallel agent |
-| Embedding generation | never | ctxd stores, not generates |
-| EventQL parser | v0.2 | Basic LIKE filter for v0.1 |
-| MCP over SSE/HTTP | v0.2 | stdio only |
+| Full daemon over `dyn Store` for non-SQLite backends | v0.4 | Postgres + DuckDB run a minimal HTTP admin in v0.3 |
+| Token-bucket rate limiting | v0.4 | v0.3 ships a hard 1-second windowed counter (ADR 011) |
+| `budget_refund` for failed downstream ops | v0.4 | Reserve-then-commit semantics today (ADR 011) |
+| Full TEE proof verification | v0.4 | Attestation field is canonicalized; verifier hook is optional (ADR 007) |
+| pgvector / native vector indexes in Postgres | v0.4 | Brute-force cosine fallback today (ADR 016) |
+| Slack, Notion, Linear, calendar adapters | v0.4 | Gmail + GitHub shipped in v0.3 |
+| x402 HTTP 402 gateway integration | v0.4 | `BudgetLimit` enforces locally; HTTP-level micropayments are a separate protocol problem |
+| DuckDB compaction / orphan-Parquet cleanup tool | v0.4 | `ctxd compact` is queued |
+| Embedding generation | never | ctxd stores vectors, doesn't generate them |
