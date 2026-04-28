@@ -36,13 +36,31 @@ flowchart LR
 - **Three first-party SDKs.** Rust ([`ctxd-client`](clients/rust/ctxd-client/README.md)), Python ([`ctxd-client`](clients/python/ctxd-py/README.md), imports as `ctxd`), TypeScript ([`@ctxd/client`](clients/typescript/ctxd-client/README.md)). All three ship at v0.3 and pin to the same [`docs/api/`](docs/api/) contract.
 - **API contract artifact.** [`docs/api/`](docs/api/) is the single source of truth: OpenAPI 3.1 for HTTP, JSON Schema for events, MessagePack hex fixtures for the wire protocol. Every SDK runs the same conformance corpus.
 
-## Install and run
+## Install
+
+### Homebrew (macOS, Linux)
+
+```bash
+brew install keeprlabs/tap/ctxd
+```
+
+### curl | sh
+
+```bash
+curl -fsSL https://github.com/keeprlabs/ctxd/releases/latest/download/install.sh | sh
+```
+
+Auto-detects OS + arch, verifies the published sha256, drops the binary in the first writable directory on `$PATH`. Override with `CTXD_INSTALL_DIR=...` (set it on the `sh` side of the pipe).
+
+### From source
 
 ```bash
 git clone https://github.com/keeprlabs/ctxd && cd ctxd
 cargo build --release
 # add --features storage-postgres,storage-duckdb-object for the heavier backends
 ```
+
+Pre-built tarballs for macOS arm64/x86_64 and Linux x86_64/aarch64 are attached to every [GitHub Release](https://github.com/keeprlabs/ctxd/releases).
 
 ## 60-second quickstart
 
