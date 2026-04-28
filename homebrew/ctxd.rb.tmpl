@@ -35,15 +35,10 @@ class Ctxd < Formula
   end
 
   def install
-    bin.install "ctxd-#{version}-#{stage_target}/ctxd"
-  end
-
-  def stage_target
-    if OS.mac?
-      Hardware::CPU.arm? ? "aarch64-apple-darwin" : "x86_64-apple-darwin"
-    else
-      Hardware::CPU.arm? ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu"
-    end
+    # Each tarball contains a single top-level dir (ctxd-<version>-<target>/);
+    # Homebrew cd's into it before calling `install`, so the binary is at "ctxd"
+    # relative to the working directory.
+    bin.install "ctxd"
   end
 
   test do
