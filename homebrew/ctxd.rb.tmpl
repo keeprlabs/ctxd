@@ -1,0 +1,52 @@
+# Homebrew formula for ctxd — context substrate for AI agents.
+#
+# This formula is rendered from homebrew/ctxd.rb.tmpl by
+# .github/workflows/release.yml on every `v*` tag and pushed to
+# keeprlabs/homebrew-tap as Formula/ctxd.rb.
+#
+# Install:
+#   brew install keeprlabs/tap/ctxd
+class Ctxd < Formula
+  desc "Context substrate for AI agents — single-binary daemon, append-only event log, capabilities, MCP-native"
+  homepage "https://github.com/keeprlabs/ctxd"
+  version "__VERSION__"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/keeprlabs/ctxd/releases/download/v#{version}/ctxd-#{version}-aarch64-apple-darwin.tar.gz"
+      sha256 "__SHA_ARM_DARWIN__"
+    end
+    on_intel do
+      url "https://github.com/keeprlabs/ctxd/releases/download/v#{version}/ctxd-#{version}-x86_64-apple-darwin.tar.gz"
+      sha256 "__SHA_X86_DARWIN__"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/keeprlabs/ctxd/releases/download/v#{version}/ctxd-#{version}-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "__SHA_ARM_LINUX__"
+    end
+    on_intel do
+      url "https://github.com/keeprlabs/ctxd/releases/download/v#{version}/ctxd-#{version}-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "__SHA_X86_LINUX__"
+    end
+  end
+
+  def install
+    bin.install "ctxd-#{version}-#{stage_target}/ctxd"
+  end
+
+  def stage_target
+    if OS.mac?
+      Hardware::CPU.arm? ? "aarch64-apple-darwin" : "x86_64-apple-darwin"
+    else
+      Hardware::CPU.arm? ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu"
+    end
+  end
+
+  test do
+    assert_match "ctxd", shell_output("#{bin}/ctxd --version")
+  end
+end
