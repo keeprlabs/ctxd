@@ -15,6 +15,24 @@ jobs:
     name: Check, Test, Lint
     runs-on: ubuntu-latest
     steps:
+      # Free ~30 GB of unused pre-installed tooling on ubuntu-latest before
+      # the cargo build. With clippy --all-features + cargo test --all + a
+      # release build all sharing the same target/, the default ~14 GB of
+      # free space is too tight: we hit "No space left on device" on tempdir
+      # creation and SIGBUS during linking under memory pressure. Removing
+      # dotnet/android/ghc/codeql/docker images we don't use gives the cargo
+      # steps room to breathe without touching what the build actually needs.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
