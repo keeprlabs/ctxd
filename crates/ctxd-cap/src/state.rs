@@ -150,18 +150,21 @@ pub trait CaveatState: Send + Sync {
     /// Current budget total for a `(token_id, currency)` pair.
     async fn budget_get(&self, token_id: &str, currency: &str) -> Result<i64, CapError>;
 
-    /// Check whether an operation on `(token_id, op, subject)` is
-    /// within rate limits. Returns `Ok(true)` when the op can proceed,
+    /// Check whether an op against `token_id` is within
+    /// `ops_per_sec`. Returns `Ok(true)` when the op can proceed,
     /// `Ok(false)` when it must be rejected.
     ///
-    /// Default impl in memory is always `true`; concrete backends
-    /// implement sliding-window counters.
-    async fn rate_check(
-        &self,
-        token_id: &str,
-        op: &str,
-        rate_ops_per_sec: u32,
-    ) -> Result<bool, CapError>;
+    /// # Window semantics (v0.3.x)
+    ///
+    /// Implementations use a windowed counter: each call rounds `now()`
+    /// to the start of a 1-second window, atomically increments the
+    /// counter for that window, and returns true iff the post-increment
+    /// count is `<= ops_per_sec`. Rolling over to a new window resets
+    /// the count to 1. Backends MUST persist the `(window_start, count)`
+    /// pair so the window survives a process restart within the same
+    /// second. See ADR 011 — a smoother token-bucket is on the v0.4
+    /// backlog.
+    async fn rate_check(&self, token_id: &str, ops_per_sec: u32) -> Result<bool, CapError>;
 
     /// Record a pending approval request. Returns the approval id
     /// (caller typically uses a UUIDv7 they already generated).
@@ -255,6 +258,9 @@ pub struct InMemoryCaveatState {
     budgets: Mutex<HashMap<(String, String), i64>>,
     approvals: Mutex<HashMap<String, ApprovalDecision>>,
     notifiers: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Per-token sliding-window counter. Key: `token_id`. Value:
+    /// `(window_start_unix_secs, count_in_window)`.
+    rate_windows: Mutex<HashMap<String, (i64, u32)>>,
 }
 
 impl std::fmt::Debug for InMemoryCaveatState {
@@ -327,13 +333,27 @@ impl CaveatState for InMemoryCaveatState {
             .unwrap_or(0))
     }
 
-    async fn rate_check(
-        &self,
-        _token_id: &str,
-        _op: &str,
-        _rate_ops_per_sec: u32,
-    ) -> Result<bool, CapError> {
-        Ok(true)
+    async fn rate_check(&self, token_id: &str, ops_per_sec: u32) -> Result<bool, CapError> {
+        // Floor `now()` to the second to define the window. Concrete
+        // backends do the same arithmetic in SQL — keeping the floor
+        // here keeps the in-memory impl bit-identical to the SQLite
+        // impl on window boundaries, which is what tests pin.
+        let now_secs = chrono::Utc::now().timestamp();
+        let mut g = self
+            .rate_windows
+            .lock()
+            .map_err(|_| CapError::Denied("rate windows lock poisoned".to_string()))?;
+        let entry = g.entry(token_id.to_string()).or_insert((now_secs, 0));
+        if entry.0 != now_secs {
+            // New window — reset the counter to 1 (this verify is the
+            // first hit in the window) and admit it.
+            *entry = (now_secs, 1);
+            return Ok(true);
+        }
+        // Same window — admit iff post-increment count stays under cap.
+        let new_count = entry.1.saturating_add(1);
+        entry.1 = new_count;
+        Ok(new_count <= ops_per_sec)
     }
 
     async fn approval_request(

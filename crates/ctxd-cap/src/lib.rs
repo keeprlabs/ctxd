@@ -79,6 +79,19 @@ pub enum CapError {
     /// wiring rather than ship an unenforced caveat.
     #[error("token carries requires_approval but no CaveatState was provided to enforce it")]
     ApprovalStateMissing,
+
+    /// A `rate_limit_ops_per_sec` caveat tripped: too many verifies for
+    /// the same token within the current 1-second window.
+    ///
+    /// The caller's expected response is to retry after the next
+    /// window boundary (or to back off according to its own policy).
+    /// We surface the declared `ops_per_sec` so logs make the limit
+    /// visible without re-extracting the token.
+    #[error("rate limited: token exceeded {ops_per_sec} ops/sec")]
+    RateLimited {
+        /// The declared per-token ops-per-second cap.
+        ops_per_sec: u32,
+    },
 }
 
 /// The operations that can be authorized.
@@ -133,6 +146,10 @@ pub struct StatefulCaveats {
     /// Operations that require human approval before the verifier
     /// allows them through.
     pub requires_approval: Vec<Operation>,
+    /// The token's per-token ops-per-second rate limit, if any. When
+    /// present, [`CapEngine::verify_with_state`] consults
+    /// [`state::CaveatState::rate_check`] before allowing the op.
+    pub rate_limit_ops_per_sec: Option<u32>,
 }
 
 /// A constraint that can be added to a capability via a third-party block.
@@ -577,6 +594,19 @@ impl CapEngine {
             }
         }
 
+        // 5. Rate-limit enforcement. Runs *last*: budgets and approvals
+        //    have already cleared, so a `RateLimited` reply tells the
+        //    caller "this op was otherwise admissible — back off and
+        //    retry". Putting rate-limit before approval would mean a
+        //    rate-limited token never even reaches the approver, which
+        //    is a worse error message under load.
+        if let Some(ops_per_sec) = stateful.rate_limit_ops_per_sec {
+            // ops_per_sec == 0 is a degenerate cap — surface immediately.
+            if ops_per_sec == 0 || !state.rate_check(&token_id, ops_per_sec).await? {
+                return Err(CapError::RateLimited { ops_per_sec });
+            }
+        }
+
         Ok(())
     }
 
@@ -590,6 +620,12 @@ impl CapEngine {
             authorizer.query(rule!("budget($c, $n) <- budget_limit($c, $n)"))?;
         let approval_rows: Vec<(String,)> =
             authorizer.query(rule!("approval($op) <- requires_approval($op)"))?;
+        // The mint-time fact is `rate_limit_ops_per_sec(<u32>)`. Datalog
+        // integers are i64 on the way out; we narrow to u32 with a
+        // saturating clamp so a malformed token can't poison the
+        // verifier's u32 path.
+        let rate_rows: Vec<(i64,)> =
+            authorizer.query(rule!("rate($n) <- rate_limit_ops_per_sec($n)"))?;
 
         let budget_limit = budget_rows.into_iter().next().map(|(c, n)| BudgetLimit {
             currency: c,
@@ -616,9 +652,20 @@ impl CapEngine {
             }
         }
 
+        let rate_limit_ops_per_sec = rate_rows.into_iter().next().map(|(n,)| {
+            if n <= 0 {
+                0u32
+            } else if n > u32::MAX as i64 {
+                u32::MAX
+            } else {
+                n as u32
+            }
+        });
+
         Ok(StatefulCaveats {
             budget_limit,
             requires_approval,
+            rate_limit_ops_per_sec,
         })
     }
 
