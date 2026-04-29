@@ -1,11 +1,20 @@
-# ctxd
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/img/logo-dark.svg">
+    <img alt="ctxd" src="assets/img/logo-light.svg" width="72" height="72">
+  </picture>
+</p>
 
-**Context substrate for AI agents.** A single-binary daemon that gives every agent — Claude Desktop, Cursor, your own code — one place to write and read shared context, with capability tokens, federation, and a native MCP server.
+<h1 align="center">ctxd</h1>
 
-[![Release](https://img.shields.io/github/v/release/keeprlabs/ctxd?style=flat-square)](https://github.com/keeprlabs/ctxd/releases)
-[![CI](https://img.shields.io/github/actions/workflow/status/keeprlabs/ctxd/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/keeprlabs/ctxd/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/keeprlabs/ctxd?style=flat-square)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/keeprlabs/ctxd?style=flat-square)](https://github.com/keeprlabs/ctxd/stargazers)
+<p align="center"><strong>Context substrate for AI agents.</strong> A single-binary daemon that gives every agent — Claude Desktop, Cursor, your own code — one place to write and read shared context, with capability tokens, federation, and a native MCP server.</p>
+
+<p align="center">
+  <a href="https://github.com/keeprlabs/ctxd/releases"><img alt="Release" src="https://img.shields.io/github/v/release/keeprlabs/ctxd?style=flat-square"></a>
+  <a href="https://github.com/keeprlabs/ctxd/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/keeprlabs/ctxd/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/keeprlabs/ctxd?style=flat-square"></a>
+  <a href="https://github.com/keeprlabs/ctxd/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/keeprlabs/ctxd?style=flat-square"></a>
+</p>
 
 ```bash
 brew install keeprlabs/tap/ctxd
@@ -49,27 +58,19 @@ Point Claude Desktop at it (`~/Library/Application Support/Claude/claude_desktop
 
 You now have eight MCP tools wired to your context: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`, `ctx_entities`, `ctx_related`, `ctx_timeline`.
 
+## See it run
+
+The same flow against a real daemon — write, read, grant, serve. Generated from [`assets/vhs/terminal.tape`](assets/vhs/terminal.tape).
+
+![ctxd terminal demo](assets/img/terminal.gif)
+
 ## How it fits
 
-```mermaid
-flowchart LR
-    A1["Claude Desktop"] -->|"stdio"| MCP
-    A2["Claude.ai / Cursor"] -->|"streamable HTTP"| MCP
-    A3["Custom agent"] -->|"SSE"| MCP
-    SDK["First-party SDKs<br/>Rust · Python · TS"] -->|"HTTP + wire"| CTXD
-    MCP["MCP server<br/>(8 tools)"] --> CTXD["ctxd daemon"]
-    PEER["peer ctxd"] <-->|"replicate (TCP)"| CTXD
-    GH["GitHub adapter"] --> CTXD
-    GM["Gmail adapter"] --> CTXD
-    FS["fs adapter"] --> CTXD
-    CTXD --> LOG["Event log<br/>(SQLite · Postgres · DuckDB+S3)"]
-    LOG --- KV["KV"]
-    LOG --- FTS["FTS"]
-    LOG --- VEC["Vector<br/>(HNSW)"]
-    LOG --- GRAPH["Graph"]
-```
+<p align="center">
+  <img alt="ctxd architecture: clients → surfaces → capability gate → event store → views" src="assets/img/architecture.svg" width="100%">
+</p>
 
-The event log is append-only. Views (KV, FTS, vector, graph, temporal) are derived from it and rebuildable from it. See [docs/architecture.md](docs/architecture.md) for the full picture.
+The event log is append-only. Views (KV, FTS, vector, graph, temporal) are derived from it and rebuildable from it. See [docs/architecture.md](docs/architecture.md) for the full picture, or the live landing page at [keeprlabs.github.io/ctxd](https://keeprlabs.github.io/ctxd/) for the animated diagram in context.
 
 ## Features
 
