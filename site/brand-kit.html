@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ctxd — brand kit</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg"/>
+<link rel="stylesheet" href="tokens.css"/>
+<style>
+  body { padding: 64px 0 128px; }
+
+  .kit-head {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: end;
+    gap: 32px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--ink);
+    margin-bottom: 64px;
+  }
+  .kit-head h1 {
+    font-family: var(--font-serif);
+    font-weight: 500;
+    font-size: 56px;
+    letter-spacing: -0.02em;
+    margin: 0;
+    line-height: .95;
+  }
+  .kit-head .meta { display: flex; flex-direction: column; gap: 4px; align-items: flex-end; }
+
+  .kit-section { margin-top: 80px; }
+  .kit-section + .kit-section { margin-top: 96px; }
+
+  /* —— Logo grid —— */
+  .logo-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+  .logo-cell {
+    border: 1px solid var(--rule-2);
+    background: var(--paper-2);
+    aspect-ratio: 5 / 3;
+    display: grid;
+    place-items: center;
+    position: relative;
+    border-radius: var(--r-1);
+  }
+  .logo-cell .corner {
+    position: absolute;
+    top: 10px; left: 12px;
+    font-size: var(--t-xs);
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .logo-cell--ink   { background: var(--ink); color: var(--ink-inv); }
+  .logo-cell--ink .corner { color: var(--ink-inv); opacity: .55; }
+  .logo-cell--accent { background: var(--accent); color: var(--ink); }
+  .logo-cell--paper { background: var(--paper); }
+
+  /* construction */
+  .logo-construction {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+    margin-top: 32px;
+  }
+  .construction-board {
+    aspect-ratio: 1;
+    background:
+      linear-gradient(to right, var(--rule-2) 1px, transparent 1px) 0 0 / 8.333% 100%,
+      linear-gradient(to bottom, var(--rule-2) 1px, transparent 1px) 0 0 / 100% 8.333%,
+      var(--paper-2);
+    border: 1px solid var(--rule-3);
+    position: relative;
+    display: grid;
+    place-items: center;
+  }
+  .construction-board svg { width: 70%; height: 70%; }
+  .clearspace-board {
+    aspect-ratio: 1;
+    background: var(--paper-2);
+    border: 1px solid var(--rule-3);
+    display: grid;
+    place-items: center;
+    position: relative;
+  }
+  .clearspace-board .frame {
+    width: 70%; height: 70%;
+    border: 1px dashed var(--rule-3);
+    display: grid;
+    place-items: center;
+    position: relative;
+  }
+  .clearspace-board .frame::before {
+    content: 'x';
+    position: absolute; top: -10px; left: -10px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink-3);
+  }
+
+  /* —— Color swatches —— */
+  .color-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--rule-2);
+    border: 1px solid var(--rule-2);
+  }
+  .swatch {
+    background: var(--paper);
+    padding: 16px 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-height: 140px;
+  }
+  .swatch .chip {
+    width: 48px; height: 48px;
+    border: 1px solid var(--rule-3);
+    margin-bottom: 12px;
+  }
+  .swatch .name { font-size: var(--t-sm); font-weight: 600; }
+  .swatch .var  { font-size: var(--t-xs); color: var(--ink-3); }
+  .swatch .hex  { font-size: var(--t-xs); color: var(--ink-2); margin-top: 4px; }
+
+  /* —— Type scale —— */
+  .type-row {
+    display: grid;
+    grid-template-columns: 100px 1fr auto;
+    gap: 24px;
+    align-items: baseline;
+    padding: 16px 0;
+    border-bottom: 1px dashed var(--rule-2);
+  }
+  .type-row .lbl { font-size: var(--t-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.1em; }
+  .type-row .specimen { line-height: 1; }
+  .type-row .spec { font-size: var(--t-xs); color: var(--ink-3); font-family: var(--font-mono); }
+
+  /* —— Spacing —— */
+  .space-grid { display: flex; align-items: flex-end; gap: 24px; }
+  .space-block {
+    background: var(--ink);
+    width: 24px;
+  }
+  .space-cell { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .space-cell .lbl { font-size: var(--t-xs); color: var(--ink-3); }
+
+  /* —— Components showcase —— */
+  .comp-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 24px;
+  }
+  .comp-cell {
+    border: 1px solid var(--rule-2);
+    background: var(--paper-2);
+    padding: 32px;
+    border-radius: var(--r-1);
+  }
+  .comp-cell .comp-label { font-size: var(--t-xs); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 16px; }
+  .comp-cell .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+
+  /* —— Footer —— */
+  .kit-foot {
+    margin-top: 128px;
+    padding-top: 24px;
+    border-top: 1px solid var(--ink);
+    display: flex;
+    justify-content: space-between;
+    font-size: var(--t-xs);
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+</style>
+</head>
+<body data-theme="paper" data-density="default">
+<div class="shell">
+
+  <!-- HEAD -->
+  <header class="kit-head">
+    <span class="serif" style="font-size: 28px; font-style: italic; line-height: 1;">brand</span>
+    <h1>ctxd / specimen sheet<br/><em style="color:var(--ink-3);font-style:italic;">v0.1</em></h1>
+    <div class="meta">
+      <span class="label">issued</span>
+      <span class="mono" style="font-size: var(--t-sm);">2026.04 — visual system</span>
+    </div>
+  </header>
+
+  <!-- LOGO -->
+  <section class="kit-section">
+    <div class="sec-head">
+      <span class="num">01 ──</span>
+      <h2 class="ttl">Logo</h2>
+      <span class="meta">mark · wordmark · lockup</span>
+    </div>
+
+    <div class="logo-grid">
+      <div class="logo-cell logo-cell--paper" id="cell-mark">
+        <span class="corner">mark</span>
+      </div>
+      <div class="logo-cell logo-cell--paper" id="cell-word">
+        <span class="corner">wordmark</span>
+      </div>
+      <div class="logo-cell logo-cell--paper" id="cell-lockup">
+        <span class="corner">lockup</span>
+      </div>
+      <div class="logo-cell logo-cell--ink" id="cell-mark-i">
+        <span class="corner">mark · inverse</span>
+      </div>
+      <div class="logo-cell logo-cell--ink" id="cell-word-i">
+        <span class="corner">wordmark · inverse</span>
+      </div>
+      <div class="logo-cell logo-cell--accent" id="cell-lockup-a">
+        <span class="corner">lockup · accent</span>
+      </div>
+    </div>
+
+    <div class="logo-construction">
+      <div>
+        <div class="label" style="margin-bottom:12px;">Construction · 12-unit grid</div>
+        <div class="construction-board" id="construction"></div>
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:12px;">Clearspace · ≥ x on all sides</div>
+        <div class="clearspace-board"><div class="frame" id="clear"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- COLOR -->
+  <section class="kit-section">
+    <div class="sec-head">
+      <span class="num">02 ──</span>
+      <h2 class="ttl">Color</h2>
+      <span class="meta">paper · ink · accent</span>
+    </div>
+
+    <div class="color-grid" id="colors"></div>
+
+    <p class="muted" style="margin-top:24px; max-width: 60ch; font-size: var(--t-sm);">
+      Two ground states (paper, ink) carry the system. Accent is a single warm amber,
+      reserved for stamps, callouts, and code-key emphasis. Saturation is held below
+      0.16 chroma — never electric, never decorative.
+    </p>
+  </section>
+
+  <!-- TYPE -->
+  <section class="kit-section">
+    <div class="sec-head">
+      <span class="num">03 ──</span>
+      <h2 class="ttl">Type</h2>
+      <span class="meta">JetBrains Mono · Newsreader</span>
+    </div>
+
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 64px;">
+      <div>
+        <div class="label" style="margin-bottom:16px;">Mono · JetBrains Mono</div>
+        <div class="type-row"><span class="lbl">display</span><span class="specimen mono" style="font-size:64px;font-weight:600;letter-spacing:-0.04em;">ctx_write</span><span class="spec">64 / 600</span></div>
+        <div class="type-row"><span class="lbl">title</span><span class="specimen mono" style="font-size:28px;font-weight:600;">/work/acme/notes</span><span class="spec">28 / 600</span></div>
+        <div class="type-row"><span class="lbl">body</span><span class="specimen mono" style="font-size:15px;">$ ctxd write --subject /a</span><span class="spec">15 / 400</span></div>
+        <div class="type-row"><span class="lbl">caption</span><span class="specimen mono" style="font-size:11px;text-transform:uppercase;letter-spacing:0.12em;color:var(--ink-3);">SHA-256 · UUIDV7 · BISCUIT</span><span class="spec">11 / 500</span></div>
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:16px;">Serif · Newsreader</div>
+        <div class="type-row"><span class="lbl">display</span><span class="specimen serif" style="font-size:64px;font-weight:500;letter-spacing:-0.02em;">substrate</span><span class="spec">64 / 500</span></div>
+        <div class="type-row"><span class="lbl">title</span><span class="specimen serif" style="font-size:28px;font-weight:500;font-style:italic;">addressed by path</span><span class="spec">28 / 500i</span></div>
+        <div class="type-row"><span class="lbl">body</span><span class="specimen serif" style="font-size:18px;">An append-only event log.</span><span class="spec">18 / 400</span></div>
+        <div class="type-row"><span class="lbl">caption</span><span class="specimen serif" style="font-size:13px;font-style:italic;color:var(--ink-2);">— used for accents only</span><span class="spec">13 / 400i</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SPACING -->
+  <section class="kit-section">
+    <div class="sec-head">
+      <span class="num">04 ──</span>
+      <h2 class="ttl">Spacing & grid</h2>
+      <span class="meta">4px base</span>
+    </div>
+
+    <div class="space-grid" id="spacing"></div>
+
+    <div style="display:grid; grid-template-columns: repeat(12, 1fr); gap: 8px; margin-top: 64px; height: 80px;">
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">1</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">2</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">3</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">4</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">5</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">6</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">7</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">8</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">9</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">10</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">11</div>
+      <div style="background: var(--accent-soft); border: 1px solid var(--accent); display:grid;place-items:center;font-size:11px;color:var(--accent-ink);">12</div>
+    </div>
+    <p class="muted" style="margin-top:12px; font-size:var(--t-xs); text-transform:uppercase; letter-spacing:0.1em;">12-col grid · 32px gutter · 1240 max</p>
+  </section>
+
+  <!-- COMPONENTS -->
+  <section class="kit-section">
+    <div class="sec-head">
+      <span class="num">05 ──</span>
+      <h2 class="ttl">Primitives</h2>
+      <span class="meta">buttons · tags · code · cards</span>
+    </div>
+
+    <div class="comp-grid">
+      <div class="comp-cell">
+        <div class="comp-label">Buttons</div>
+        <div class="row">
+          <button class="btn btn--primary">install ctxd <span class="arrow">→</span></button>
+          <button class="btn">read docs</button>
+          <button class="btn btn--ghost">github</button>
+        </div>
+        <div class="row">
+          <button class="btn btn--primary btn--sm">grant</button>
+          <button class="btn btn--sm">revoke</button>
+          <button class="btn btn--ghost btn--sm">verify</button>
+        </div>
+      </div>
+
+      <div class="comp-cell">
+        <div class="comp-label">Tags & status</div>
+        <div class="row">
+          <span class="tag">v0.1</span>
+          <span class="tag tag--solid">apache-2.0</span>
+          <span class="tag tag--accent"><span class="dot"></span>append-only</span>
+          <span class="tag"><span class="dot" style="background:var(--ok)"></span>healthy</span>
+          <span class="tag"><span class="dot" style="background:var(--warn)"></span>chain break</span>
+        </div>
+      </div>
+
+      <div class="comp-cell" style="grid-column: span 2;">
+        <div class="comp-label">Code block</div>
+<pre class="code"><span class="c-prompt">$</span> <span class="c-fn">ctxd</span> <span class="c-arg">write</span> <span class="c-flag">--subject</span> <span class="c-key">/work/acme/notes/standup</span> \
+    <span class="c-flag">--type</span> <span class="c-key">ctx.note</span> <span class="c-flag">--data</span> <span class="c-str">'{"content":"Ship auth by Friday"}'</span>
+<span class="c-com"># → 019756a3-1234-7000-8000-000000000001</span></pre>
+      </div>
+
+      <div class="comp-cell">
+        <div class="comp-label">Card · default</div>
+        <div class="card">
+          <div class="label">subject</div>
+          <div class="mono" style="font-size:var(--t-md); margin-top: 4px;">/work/acme/customers/cust-42</div>
+          <hr class="rule" style="margin: 12px 0;"/>
+          <div class="muted" style="font-size:var(--t-sm);">14 events · last write 3m ago</div>
+        </div>
+      </div>
+
+      <div class="comp-cell">
+        <div class="comp-label">Card · ink</div>
+        <div class="card card--ink">
+          <div class="label" style="color:#807a6c;">subject</div>
+          <div class="mono" style="font-size:var(--t-md); margin-top: 4px;">/personal/journal/2026-04-24</div>
+          <hr class="rule" style="margin: 12px 0; background: #ffffff22;"/>
+          <div style="font-size:var(--t-sm); color:#b8b3a4;">2 events · last write 1h ago</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="kit-foot">
+    <span>ctxd · context substrate</span>
+    <span>specimen sheet · 01 of 01</span>
+  </footer>
+
+</div>
+
+<!-- React for logo rendering -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="logo.jsx"></script>
+<script type="text/babel">
+  const root = (id, el) => ReactDOM.createRoot(document.getElementById(id)).render(el);
+  root('cell-mark',     <Mark size={64} />);
+  root('cell-word',     <Wordmark size={48} />);
+  root('cell-lockup',   <Lockup size={36} />);
+  root('cell-mark-i',   <Mark size={64} color="var(--paper)" />);
+  root('cell-word-i',   <Wordmark size={48} color="var(--paper)" />);
+  root('cell-lockup-a', <Lockup size={36} color="var(--ink)" />);
+  root('construction',  <Mark size={300} />);
+  root('clear',         <Mark size={120} />);
+</script>
+
+<script>
+  // colors
+  const colors = [
+    { name: 'paper',     v: '--paper',     hex: '#f1ede4' },
+    { name: 'paper · 2', v: '--paper-2',   hex: '#e8e3d6' },
+    { name: 'paper · 3', v: '--paper-3',   hex: '#d9d3c2' },
+    { name: 'rule',      v: '--rule-3',    hex: 'ink @ 30%' },
+    { name: 'ink',       v: '--ink',       hex: '#14110b' },
+    { name: 'ink · 2',   v: '--ink-2',     hex: '#4a463c' },
+    { name: 'ink · 3',   v: '--ink-3',     hex: '#7a7466' },
+    { name: 'accent',    v: '--accent',    hex: 'oklch(70 .15 60)' },
+  ];
+  const cgrid = document.getElementById('colors');
+  cgrid.innerHTML = colors.map(c => `
+    <div class="swatch">
+      <div class="chip" style="background: var(${c.v});"></div>
+      <div class="name">${c.name}</div>
+      <div class="var">${c.v}</div>
+      <div class="hex">${c.hex}</div>
+    </div>`).join('');
+
+  // spacing
+  const sizes = [4,8,12,16,24,32,48,64,96,128];
+  const sgrid = document.getElementById('spacing');
+  sgrid.innerHTML = sizes.map((s,i) => `
+    <div class="space-cell">
+      <div class="space-block" style="height:${s}px;"></div>
+      <div class="lbl">s-${i+1} · ${s}px</div>
+    </div>`).join('');
+</script>
+</body>
+</html>

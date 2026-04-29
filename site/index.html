@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ctxd · context substrate for AI agents</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg"/>
+<link rel="stylesheet" href="tokens.css"/>
+<link rel="stylesheet" href="landing.css"/>
+</head>
+<body data-theme="terminal" data-density="default">
+
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="logo.jsx"></script>
+<script type="text/babel" src="landing-sections.jsx"></script>
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+
+<script type="text/babel" data-presets="env,react">
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "theme": "terminal",
+  "density": "default",
+  "fontPair": "mono+newsreader",
+  "heroVariant": "substrate"
+}/*EDITMODE-END*/;
+
+const HERO_VARIANTS = {
+  substrate: {
+    eyebrow: "context substrate · v0.3 · apache-2.0",
+    title: <>The <em>memory</em><br/>your agents<br/>keep <span className="stamp">forgetting.</span></>,
+    lede: <>ctxd is a <strong>headless context substrate</strong> for AI agents. One binary, one SQLite file, an append-only event log addressed by subject paths and gated by capability tokens. Your agent gets memory that persists across sessions, tools, and models — without a vector DB, an agent framework, or a SaaS in the loop.</>
+  },
+  daemon: {
+    eyebrow: "single binary · single sqlite file · zero services",
+    title: <>One <em>daemon.</em><br/>Every agent's<br/><span className="stamp">long-term memory.</span></>,
+    lede: <>ctxd is the substrate underneath your agents — a Rust daemon exposing the same append-only log over MCP, a wire protocol, and HTTP. Write context once from anywhere; every model, every session, every tool reads from the same source of truth.</>
+  },
+  log: {
+    eyebrow: "append-only · cloudevents · biscuit · MCP-native",
+    title: <><em>Append.</em> Address.<br/>Attenuate.<br/><span className="stamp">A log for agents.</span></>,
+    lede: <>ctxd treats agent context as events on an append-only log. Each event is filed at a subject path, hash-chained to its predecessor, and reachable through MCP, a length-prefixed TCP wire protocol, or HTTP. Capability tokens decide who reads what — narrowly, expirably, never widening.</>
+  },
+};
+
+const FONT_PAIRS = {
+  "mono+newsreader": { mono: "'JetBrains Mono', ui-monospace, monospace", serif: "'Newsreader', Georgia, serif" },
+  "ibm+spectral":    { mono: "'IBM Plex Mono', ui-monospace, monospace",   serif: "'Spectral', Georgia, serif" },
+  "geist+fraunces":  { mono: "'Geist Mono', ui-monospace, monospace",      serif: "'Instrument Serif', Georgia, serif" },
+};
+
+// Inject extra Google Font imports lazily so swapping is instant
+function ensureFont(family, weights = "400;500;600;700") {
+  const id = "gf-" + family.replace(/\W/g, "");
+  if (document.getElementById(id)) return;
+  const l = document.createElement("link");
+  l.id = id;
+  l.rel = "stylesheet";
+  l.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family)}:wght@${weights}&display=swap`;
+  document.head.appendChild(l);
+}
+
+function App() {
+  const [t, setT, isOpen] = useTweaks(TWEAK_DEFAULTS);
+
+  React.useEffect(() => {
+    document.body.dataset.theme = t.theme;
+    document.body.dataset.density = t.density;
+
+    const pair = FONT_PAIRS[t.fontPair] || FONT_PAIRS["mono+newsreader"];
+    if (t.fontPair === "ibm+spectral") { ensureFont("IBM+Plex+Mono"); ensureFont("Spectral"); }
+    if (t.fontPair === "geist+fraunces") { ensureFont("Geist+Mono"); ensureFont("Instrument+Serif", "400"); }
+    document.documentElement.style.setProperty('--font-mono', pair.mono);
+    document.documentElement.style.setProperty('--font-serif', pair.serif);
+  }, [t]);
+
+  const hero = HERO_VARIANTS[t.heroVariant] || HERO_VARIANTS.substrate;
+
+  return (
+    <>
+      {/* ——— HERO ——— */}
+      <header className="hero">
+        <div className="shell">
+          <div className="hero__top">
+            <span>◆ {hero.eyebrow.split(" · ")[0]}</span>
+            <span className="dash"></span>
+            <span>{hero.eyebrow.split(" · ").slice(1).join(" · ")}</span>
+          </div>
+
+          <h1 className="hero__h1">{hero.title}</h1>
+
+          <div className="hero__sub">
+            <p className="hero__lede">{hero.lede}</p>
+            <div>
+              <div className="hero__install" id="install">
+                <span className="cmd"><span style={{color:"var(--ink-3)"}}>$ </span>cargo install ctxd</span>
+                <button className="copy" onClick={(e)=>{
+                  navigator.clipboard?.writeText("cargo install ctxd");
+                  e.currentTarget.textContent = "copied";
+                  setTimeout(()=>{ e.currentTarget.textContent = "copy"; }, 1200);
+                }}>copy</button>
+              </div>
+              <div className="hero__cta">
+                <a className="btn btn--primary" href="#demo">see it run <span className="arrow">→</span></a>
+                <a className="btn" href="#arch">architecture</a>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </header>
+
+      {/* ——— TERMINAL DEMO ——— */}
+      <section className="section" id="demo">
+        <div className="shell">
+          <h2 className="ttl-bare">Sixty seconds, end to end.</h2>
+          <TerminalDemo />
+        </div>
+      </section>
+
+      {/* ——— CODE SNIPPETS ——— */}
+      <section className="section">
+        <div className="shell">
+          <h2 className="ttl-bare">Three verbs do the work.</h2>
+
+          <div className="snippets">
+            <div className="snip">
+              <div className="snip__head"><span className="snip__verb">Write</span><span className="snip__num">VERB · 01</span></div>
+              <p className="snip__desc">Append a CloudEvents-shaped event at a subject path. Hash-chained to its predecessor, atomic with view updates.</p>
+              <pre><span style={{color:"var(--ink-3)"}}>$ </span>ctxd write \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--subject</span> /work/acme/notes/standup \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--type</span> ctx.note \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--data</span> '{`{"content":"ship Friday"}`}'</pre>
+            </div>
+
+            <div className="snip">
+              <div className="snip__head"><span className="snip__verb">Read</span><span className="snip__num">VERB · 02</span></div>
+              <p className="snip__desc">Fetch the chain at an exact subject, or recursively across descendants. Ordered by sequence, never mutated.</p>
+              <pre><span style={{color:"var(--ink-3)"}}>$ </span>ctxd read \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--subject</span> /work/acme \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--recursive</span>{"\n\n"}
+<span style={{color:"var(--ink-3)",fontStyle:"italic"}}># /work/acme/notes/standup{"\n"}
+# /work/acme/customers/cust-42</span></pre>
+            </div>
+
+            <div className="snip">
+              <div className="snip__head"><span className="snip__verb">Grant</span><span className="snip__num">VERB · 03</span></div>
+              <p className="snip__desc">Mint a biscuit token scoped to a glob and an op set. Hand it to a sub-agent. They can attenuate further. They cannot widen.</p>
+              <pre><span style={{color:"var(--ink-3)"}}>$ </span>ctxd grant \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--subject</span> "/work/acme/**" \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--operations</span> "read,subjects" \{"\n"}
+  <span style={{color:"var(--accent-ink)",fontWeight:600}}>--expires</span> 1h{"\n\n"}
+<span style={{color:"var(--ink-3)",fontStyle:"italic"}}># EpAB...biscuit-token...A4Yg</span></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ——— ARCHITECTURE ——— */}
+      <section className="section" id="arch">
+        <div className="shell">
+          <h2 className="ttl-bare">One log. Three surfaces. Many views.</h2>
+          <Architecture />
+          <p className="muted" style={{textAlign:"center", marginTop: 32, fontSize: 14, maxWidth: '60ch', marginInline:'auto'}}>
+            All views are derived from the append-only event log and can be rebuilt from it. Crash mid-write = transactional rollback. Views never diverge from the log.
+          </p>
+        </div>
+      </section>
+
+      {/* ——— MCP ——— */}
+      <section className="section" id="mcp">
+        <div className="shell">
+          <h2 className="ttl-bare">MCP-native. Five tools. Stdio.</h2>
+          <McpBlock />
+        </div>
+      </section>
+
+      {/* ——— CAPABILITIES ——— */}
+      <section className="section" id="capabilities">
+        <div className="shell">
+          <CapabilitySection />
+        </div>
+      </section>
+
+      {/* ——— COMPARE ——— */}
+      <section className="section">
+        <div className="shell">
+          <h2 className="ttl-bare">What ctxd is. And isn't.</h2>
+          <Compare />
+        </div>
+      </section>
+
+      {/* ——— FOOTER ——— */}
+      <footer className="foot">
+        <div className="foot__inner">
+          <h2 className="foot__big">Stop re-deriving context from scratch.</h2>
+
+          <div className="foot__cols">
+            <div>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+                <Lockup size={20} />
+              </div>
+              <p style={{margin:0, fontFamily:"var(--font-mono)", fontSize:13, color:"#b8b3a4", maxWidth:'40ch'}}>
+                A headless context substrate for AI agents. Single binary. Single SQLite file. Apache-2.0.
+              </p>
+            </div>
+            <div>
+              <h4>docs</h4>
+              <ul>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/architecture.md">architecture</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/events.md">events</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/subjects.md">subjects</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/capabilities.md">capabilities</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/mcp.md">mcp</a></li>
+              </ul>
+            </div>
+            <div>
+              <h4>protocol</h4>
+              <ul>
+                <li><a href="https://github.com/keeprlabs/ctxd/tree/main/docs/api">api contract</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/federation.md">federation</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/adapter-guide.md">adapter guide</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/docs/benchmark-results.md">benchmarks</a></li>
+              </ul>
+            </div>
+            <div>
+              <h4>project</h4>
+              <ul>
+                <li><a href="https://github.com/keeprlabs/ctxd">github</a></li>
+                <li><a href="brand-kit.html">brand kit</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/tree/main/docs/decisions">decisions</a></li>
+                <li><a href="https://github.com/keeprlabs/ctxd/blob/main/CHANGELOG.md">changelog</a></li>
+              </ul>
+            </div>
+          </div>
+
+          <div className="foot__bot">
+            <span>ctxd · v0.3 · apache-2.0</span>
+            <span>not a vector db · not a framework · not a graph</span>
+            <span>headless by design</span>
+          </div>
+        </div>
+      </footer>
+
+      {/* ——— TWEAKS ——— */}
+      {isOpen && (
+        <TweaksPanel title="Tweaks">
+          <TweakSection title="Theme">
+            <TweakRadio label="palette"
+              value={t.theme}
+              onChange={(v)=>setT({theme:v})}
+              options={[
+                {value:"terminal", label:"dark"},
+                {value:"paper",    label:"light"},
+              ]}
+            />
+          </TweakSection>
+
+          <TweakSection title="Layout & type">
+            <TweakRadio label="density"
+              value={t.density}
+              onChange={(v)=>setT({density:v})}
+              options={[
+                {value:"tight",   label:"tight"},
+                {value:"default", label:"default"},
+                {value:"loose",   label:"loose"},
+              ]}
+            />
+            <TweakSelect label="font pair" value={t.fontPair} onChange={(v)=>setT({fontPair:v})}
+              options={[
+                {value:"mono+newsreader", label:"JetBrains × Newsreader"},
+                {value:"ibm+spectral",    label:"IBM Plex × Spectral"},
+                {value:"geist+fraunces",  label:"Geist × Instrument Serif"},
+              ]}
+            />
+          </TweakSection>
+
+          <TweakSection title="Hero copy">
+            <TweakRadio label="variant"
+              value={t.heroVariant}
+              onChange={(v)=>setT({heroVariant:v})}
+              options={[
+                {value:"substrate", label:"substrate (memory)"},
+                {value:"daemon",    label:"daemon (one binary)"},
+                {value:"log",       label:"log (append/address/attenuate)"},
+              ]}
+            />
+          </TweakSection>
+        </TweaksPanel>
+      )}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
