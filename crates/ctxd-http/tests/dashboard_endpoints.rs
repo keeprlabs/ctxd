@@ -45,7 +45,8 @@ async fn json_get(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::
         .unwrap();
     let status = resp.status();
     let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let json =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
     (status, json)
 }
 
@@ -77,16 +78,14 @@ async fn list_events_newest_first_with_cursor_pagination() {
 
     // Second page: opaque cursor.
     let cursor = page1["next_cursor"].as_str().unwrap();
-    let (_, page2) =
-        json_get(&router, &format!("/v1/events?limit=2&before={cursor}")).await;
+    let (_, page2) = json_get(&router, &format!("/v1/events?limit=2&before={cursor}")).await;
     let evs = page2["events"].as_array().unwrap();
     assert_eq!(evs.len(), 2);
     assert_eq!(evs[0]["id"], serde_json::Value::String(ids[2].to_string()));
 
     // Past end: empty.
     let cursor = page2["next_cursor"].as_str().unwrap();
-    let (_, page3) =
-        json_get(&router, &format!("/v1/events?limit=2&before={cursor}")).await;
+    let (_, page3) = json_get(&router, &format!("/v1/events?limit=2&before={cursor}")).await;
     let evs = page3["events"].as_array().unwrap();
     assert_eq!(evs.len(), 1);
     assert_eq!(evs[0]["id"], serde_json::Value::String(ids[0].to_string()));
@@ -108,11 +107,7 @@ async fn event_by_id_hit_and_404_and_400() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(ev["id"], serde_json::Value::String(stored.id.to_string()));
 
-    let (s, _) = json_get(
-        &router,
-        "/v1/events/00000000-0000-0000-0000-000000000000",
-    )
-    .await;
+    let (s, _) = json_get(&router, "/v1/events/00000000-0000-0000-0000-000000000000").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
     let (s, _) = json_get(&router, "/v1/events/not-a-uuid").await;

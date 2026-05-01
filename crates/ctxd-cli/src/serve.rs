@@ -118,8 +118,8 @@ pub async fn serve(
 
     // Construct the embedder up front so we fail loudly on
     // misconfiguration rather than at first auto-embed.
-    let choice = crate::embedder::EmbedderChoice::parse(&cfg.embedder)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let choice =
+        crate::embedder::EmbedderChoice::parse(&cfg.embedder).map_err(|e| anyhow::anyhow!(e))?;
     let embed_opts = crate::embedder::EmbedderOpts {
         model: cfg.embedder_model,
         url: cfg.embedder_url,
@@ -169,10 +169,7 @@ pub async fn serve(
         allowed_hosts_for_bind(addr),
     );
     let frontend = ctxd_dashboard::router::<()>();
-    let app = ctxd_dashboard::apply_localhost_or_cap_token(
-        api.merge(frontend),
-        cap_engine.clone(),
-    );
+    let app = ctxd_dashboard::apply_localhost_or_cap_token(api.merge(frontend), cap_engine.clone());
     // Bind synchronously so EADDRINUSE is returned as an error from
     // serve() rather than killing a spawned worker task. Callers
     // (including `ctxd dashboard`) rely on this to print friendly
@@ -319,9 +316,13 @@ pub async fn serve(
         let server_clone = mcp_server.clone();
         let shutdown_clone = shutdown.clone();
         http_mcp_handle = Some(tokio::spawn(async move {
-            if let Err(e) =
-                ctxd_mcp::transport::run_streamable_http(server_clone, http_addr, policy, shutdown_clone)
-                    .await
+            if let Err(e) = ctxd_mcp::transport::run_streamable_http(
+                server_clone,
+                http_addr,
+                policy,
+                shutdown_clone,
+            )
+            .await
             {
                 tracing::error!(error = %e, "streamable-HTTP transport ended");
             }

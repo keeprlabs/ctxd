@@ -8,12 +8,12 @@ use crate::handlers;
 use crate::middleware::{apply_host_check, defensive_headers, DEFAULT_ALLOWED_HOSTS};
 use axum::routing::{delete, get, post};
 use axum::Router;
-use tower_http::trace::TraceLayer;
 use ctxd_cap::state::CaveatState;
 use ctxd_cap::CapEngine;
 use ctxd_store::EventStore;
 use std::sync::Arc;
 use std::time::Instant;
+use tower_http::trace::TraceLayer;
 
 /// Shared state for HTTP handlers.
 #[derive(Clone)]
@@ -56,7 +56,10 @@ pub fn build_router(
 /// Default v0.4 host allow-list: `127.0.0.1:7777`, `localhost:7777`,
 /// `[::1]:7777`. Used when the daemon binds the standard port.
 pub fn default_allowed_hosts() -> Vec<String> {
-    DEFAULT_ALLOWED_HOSTS.iter().map(|s| s.to_string()).collect()
+    DEFAULT_ALLOWED_HOSTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Derive the allow-list from the daemon's actual bind address. Always
@@ -124,6 +127,5 @@ pub fn build_router_with_hosts(
     // Compose middleware outermost-first: defensive headers wrap
     // everything (so host-check rejections also get them), then
     // host-check rejects bad Host before any handler runs.
-    apply_host_check(routes, allowed_hosts)
-        .layer(axum::middleware::from_fn(defensive_headers))
+    apply_host_check(routes, allowed_hosts).layer(axum::middleware::from_fn(defensive_headers))
 }

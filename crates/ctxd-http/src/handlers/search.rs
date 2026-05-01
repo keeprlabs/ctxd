@@ -38,10 +38,9 @@ pub(crate) async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
-    let query = q
-        .q
-        .as_deref()
-        .ok_or((StatusCode::BAD_REQUEST, "missing q parameter".to_string()))?;
+    let query =
+        q.q.as_deref()
+            .ok_or((StatusCode::BAD_REQUEST, "missing q parameter".to_string()))?;
     if query.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "q must not be empty".to_string()));
     }

@@ -55,8 +55,7 @@ pub async fn localhost_or_cap_token(
                 "localhost_or_cap_token: ConnectInfo missing — bind site \
                  must use into_make_service_with_connect_info::<SocketAddr>()"
             );
-            return (StatusCode::INTERNAL_SERVER_ERROR, "connect-info missing")
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "connect-info missing").into_response();
         }
     };
 
@@ -83,8 +82,7 @@ pub async fn localhost_or_cap_token(
             match raw.map(str::trim).filter(|t| !t.is_empty()) {
                 Some(t) => t.to_string(),
                 None => {
-                    return (StatusCode::UNAUTHORIZED, "missing bearer token")
-                        .into_response();
+                    return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
                 }
             }
         }
@@ -96,8 +94,7 @@ pub async fn localhost_or_cap_token(
     let token = match CapEngine::token_from_base64(&token_b64) {
         Ok(t) => t,
         Err(e) => {
-            return (StatusCode::FORBIDDEN, format!("invalid token: {e}"))
-                .into_response();
+            return (StatusCode::FORBIDDEN, format!("invalid token: {e}")).into_response();
         }
     };
     if let Err(e) = state.cap_engine.verify(&token, "/", Operation::Admin, None) {

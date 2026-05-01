@@ -54,9 +54,7 @@ async fn spawn_server() -> std::net::SocketAddr {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .build()
-        .expect("reqwest client")
+    reqwest::Client::builder().build().expect("reqwest client")
 }
 
 #[tokio::test]

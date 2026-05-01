@@ -14,11 +14,7 @@ use axum::response::IntoResponse;
 /// Default Host header values accepted by [`host_check`] when the
 /// daemon binds 127.0.0.1:7777. Composed in order of expected
 /// frequency.
-pub const DEFAULT_ALLOWED_HOSTS: &[&str] = &[
-    "127.0.0.1:7777",
-    "localhost:7777",
-    "[::1]:7777",
-];
+pub const DEFAULT_ALLOWED_HOSTS: &[&str] = &["127.0.0.1:7777", "localhost:7777", "[::1]:7777"];
 
 /// Reject any request whose `Host:` header is not in the configured
 /// allow-list with `421 Misdirected Request`. This is the primary
@@ -51,27 +47,18 @@ pub async fn host_check(
         // Host header is canonically lowercase but some clients send
         // uppercase, and ports are case-irrelevant anyway.
         let host_lower = host.to_ascii_lowercase();
-        let ok = allowed
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(&host_lower));
+        let ok = allowed.iter().any(|a| a.eq_ignore_ascii_case(&host_lower));
         if ok {
             return next.run(req).await;
         }
     }
-    (
-        StatusCode::MISDIRECTED_REQUEST,
-        "host header not allowed",
-    )
-        .into_response()
+    (StatusCode::MISDIRECTED_REQUEST, "host header not allowed").into_response()
 }
 
 /// Apply the host-check layer to a router with a fixed allow-list.
 /// Wrapper around `axum::middleware::from_fn_with_state` that hides
 /// the verbose closure and `Arc` plumbing at the call site.
-pub fn apply_host_check<S>(
-    router: axum::Router<S>,
-    allowed: Vec<String>,
-) -> axum::Router<S>
+pub fn apply_host_check<S>(router: axum::Router<S>, allowed: Vec<String>) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {

@@ -73,7 +73,10 @@ fn mime_for_path(name: &str) -> &'static str {
 fn error_response(status: StatusCode, msg: &'static str) -> Response<Body> {
     Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"))
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )
         .body(Body::from(msg))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }

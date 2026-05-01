@@ -972,17 +972,19 @@ impl EventStore {
 
         let rows: Vec<SeqEventRow> = match (subject, recursive) {
             (None, _) => match before_seq {
-                Some(s) => sqlx::query_as(&format!(
-                    "{select} WHERE seq < ? ORDER BY seq DESC LIMIT ?",
-                ))
-                .bind(s)
-                .bind(limit_i64)
-                .fetch_all(&self.pool)
-                .await?,
-                None => sqlx::query_as(&format!("{select} ORDER BY seq DESC LIMIT ?",))
-                    .bind(limit_i64)
-                    .fetch_all(&self.pool)
-                    .await?,
+                Some(s) => {
+                    sqlx::query_as(&format!("{select} WHERE seq < ? ORDER BY seq DESC LIMIT ?",))
+                        .bind(s)
+                        .bind(limit_i64)
+                        .fetch_all(&self.pool)
+                        .await?
+                }
+                None => {
+                    sqlx::query_as(&format!("{select} ORDER BY seq DESC LIMIT ?",))
+                        .bind(limit_i64)
+                        .fetch_all(&self.pool)
+                        .await?
+                }
             },
             (Some(sub), true) => {
                 let pattern = if sub.as_str() == "/" {
@@ -1011,21 +1013,25 @@ impl EventStore {
                 }
             }
             (Some(sub), false) => match before_seq {
-                Some(s) => sqlx::query_as(&format!(
-                    "{select} WHERE subject = ? AND seq < ? ORDER BY seq DESC LIMIT ?",
-                ))
-                .bind(sub.as_str())
-                .bind(s)
-                .bind(limit_i64)
-                .fetch_all(&self.pool)
-                .await?,
-                None => sqlx::query_as(&format!(
-                    "{select} WHERE subject = ? ORDER BY seq DESC LIMIT ?",
-                ))
-                .bind(sub.as_str())
-                .bind(limit_i64)
-                .fetch_all(&self.pool)
-                .await?,
+                Some(s) => {
+                    sqlx::query_as(&format!(
+                        "{select} WHERE subject = ? AND seq < ? ORDER BY seq DESC LIMIT ?",
+                    ))
+                    .bind(sub.as_str())
+                    .bind(s)
+                    .bind(limit_i64)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                None => {
+                    sqlx::query_as(&format!(
+                        "{select} WHERE subject = ? ORDER BY seq DESC LIMIT ?",
+                    ))
+                    .bind(sub.as_str())
+                    .bind(limit_i64)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
             },
         };
         rows.into_iter()

@@ -24,8 +24,7 @@ use ctxd_core::subject::Subject;
 const HELLO_SUBJECT: &str = "/dashboard/tutorial/hello";
 
 /// Hardcoded body for the tutorial event.
-const HELLO_BODY: &str =
-    "Hello from your ctxd dashboard. This is your first event.";
+const HELLO_BODY: &str = "Hello from your ctxd dashboard. This is your first event.";
 
 /// `POST /v1/dashboard/hello-world` — write one fixed event.
 ///
@@ -50,7 +49,8 @@ pub(crate) async fn hello_world(
 
     let event = Event::new(
         "ctxd://dashboard".to_string(),
-        Subject::new(HELLO_SUBJECT).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        Subject::new(HELLO_SUBJECT)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
         "ctx.note".to_string(),
         serde_json::json!({"content": HELLO_BODY}),
     );

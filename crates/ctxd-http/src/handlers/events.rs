@@ -67,7 +67,9 @@ pub(crate) async fn list_events(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let next_cursor = rows.last().map(|(seq, _)| EventsCursor { seq: *seq }.encode());
+    let next_cursor = rows
+        .last()
+        .map(|(seq, _)| EventsCursor { seq: *seq }.encode());
     let events: Vec<&Event> = rows.iter().map(|(_, e)| e).collect();
     Ok(Json(serde_json::json!({
         "events": events,
@@ -114,9 +116,7 @@ pub(crate) async fn stream_events(
                 .json_data(&ev)
                 .unwrap_or_else(|_| SseEvent::default().event("error")),
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                SseEvent::default()
-                    .event("lagged")
-                    .data(n.to_string())
+                SseEvent::default().event("lagged").data(n.to_string())
             }
         };
         Ok::<_, Infallible>(frame)

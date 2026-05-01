@@ -65,8 +65,10 @@ async fn subject_counts_groups_correctly() {
     append(&store, "/me/preferences", "p").await;
 
     let all = store.subject_counts(None).await.unwrap();
-    let map: std::collections::HashMap<String, u64> =
-        all.iter().map(|(s, n)| (s.as_str().to_string(), *n)).collect();
+    let map: std::collections::HashMap<String, u64> = all
+        .iter()
+        .map(|(s, n)| (s.as_str().to_string(), *n))
+        .collect();
     assert_eq!(map.get("/work/local/files/a.md").copied(), Some(2));
     assert_eq!(map.get("/work/local/files/b.md").copied(), Some(1));
     assert_eq!(map.get("/me/preferences").copied(), Some(1));

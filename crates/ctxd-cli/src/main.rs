@@ -438,14 +438,8 @@ async fn main() -> Result<()> {
                 storage_uri,
                 federation: true,
             };
-            ctxd_cli::serve::serve(
-                cfg,
-                store,
-                cap_engine,
-                caveat_state,
-                pending_approval_tx,
-            )
-            .await?;
+            ctxd_cli::serve::serve(cfg, store, cap_engine, caveat_state, pending_approval_tx)
+                .await?;
         }
 
         Commands::Dashboard { bind, no_open } => {
@@ -487,36 +481,30 @@ async fn main() -> Result<()> {
             }
             // Run the serve loop. EADDRINUSE etc. surface as anyhow
             // errors with a friendly hint when the bind fails.
-            ctxd_cli::serve::serve(
-                cfg,
-                store,
-                cap_engine,
-                caveat_state,
-                pending_approval_tx,
-            )
-            .await
-            .map_err(|e| {
-                // anyhow's Display only shows the top context; the
-                // underlying io::Error lives in the chain. Walk it so
-                // we can surface a friendly message for the common
-                // "another daemon is already running on this port"
-                // case.
-                let in_use = e.chain().any(|cause| {
-                    let s = cause.to_string();
-                    s.contains("Address already in use") || s.contains("address in use")
-                });
-                if in_use {
-                    anyhow::anyhow!(
-                        "port {} is already in use. a ctxd daemon may already \
+            ctxd_cli::serve::serve(cfg, store, cap_engine, caveat_state, pending_approval_tx)
+                .await
+                .map_err(|e| {
+                    // anyhow's Display only shows the top context; the
+                    // underlying io::Error lives in the chain. Walk it so
+                    // we can surface a friendly message for the common
+                    // "another daemon is already running on this port"
+                    // case.
+                    let in_use = e.chain().any(|cause| {
+                        let s = cause.to_string();
+                        s.contains("Address already in use") || s.contains("address in use")
+                    });
+                    if in_use {
+                        anyhow::anyhow!(
+                            "port {} is already in use. a ctxd daemon may already \
                          be running — visit http://{}/ in your browser, or \
                          stop the existing daemon and try again.",
-                        bind,
-                        bind
-                    )
-                } else {
-                    e
-                }
-            })?;
+                            bind,
+                            bind
+                        )
+                    } else {
+                        e
+                    }
+                })?;
         }
 
         Commands::Write {
