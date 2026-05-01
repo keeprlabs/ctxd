@@ -266,6 +266,67 @@ main {
   padding: 1px 2px; border-radius: 2px;
 }
 
+/* —— Event detail ————————————————————————————————— */
+.event-back {
+  display: inline-block;
+  color: var(--ink-2);
+  font-size: var(--t-sm);
+  margin-bottom: var(--s-3);
+  padding: 4px 0;
+}
+.event-back:hover { color: var(--accent); }
+
+.event-content { padding: 0; }
+.event-text {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: var(--t-md);
+  line-height: 1.6;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 72ch;
+}
+.event-json {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
+.event-meta {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: var(--s-2) var(--s-4);
+  margin: 0;
+  font-size: var(--t-xs);
+}
+.event-meta dt {
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.event-meta dd {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+.event-raw summary {
+  cursor: pointer;
+  color: var(--ink-2);
+  font-size: var(--t-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: var(--s-2);
+}
+.event-raw summary:hover { color: var(--accent); }
+.event-raw[open] summary { color: var(--ink); }
+
 /* —— Peers ——————————————————————————————————————— */
 .peer-row, .approval-row {
   padding: var(--s-3) 0;

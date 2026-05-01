@@ -89,6 +89,7 @@
     subjects: renderSubjects,
     search: renderSearch,
     peers: renderPeers,
+    event: renderEvent,
   };
 
   let currentRoute = null;
@@ -97,13 +98,15 @@
   function parseRoute() {
     const hash = location.hash.replace(/^#\/?/, '') || '';
     const [path, query] = hash.split('?');
-    const route = path.split('/')[0] || 'overview';
+    const segments = path.split('/').filter(Boolean);
+    const route = segments[0] || 'overview';
+    const rest = segments.slice(1);
     const params = new URLSearchParams(query || '');
-    return { route, params };
+    return { route, rest, params };
   }
 
   function navigate() {
-    const { route, params } = parseRoute();
+    const { route, rest, params } = parseRoute();
     if (currentCleanup) {
       currentCleanup();
       currentCleanup = null;
@@ -116,7 +119,7 @@
     });
     const main = $('#main');
     main.innerHTML = '<p class="loading">loading…</p>';
-    Promise.resolve(renderer(main, params)).catch((err) => {
+    Promise.resolve(renderer(main, params, rest)).catch((err) => {
       main.innerHTML = '';
       main.append(errorPanel(`failed to render ${route}`, err));
     });
@@ -442,6 +445,90 @@
         el('span', { class: 'ty' }, hit.type || ''),
         el('span', { class: 'sub' }, hit.subject)),
       el('div', { class: 'snippet', html: renderSnippet(hit.snippet) }));
+  }
+
+  // ───────── Event detail view ─────────
+  //
+  // Renders /v1/events/<id>. Lead with the actual content (the
+  // memory you wrote), then metadata + signature/parents/attestation
+  // for the technically curious. Hash route: #/event/<id>.
+
+  async function renderEvent(main, _params, rest) {
+    main.innerHTML = '';
+    const id = rest[0];
+    if (!id) {
+      main.append(errorPanel('no event id', new Error('expected #/event/<id>')));
+      return;
+    }
+
+    const back = el('a', { class: 'event-back', href: 'javascript:history.back()' },
+      '← back');
+    main.append(back);
+
+    let event;
+    try {
+      event = await api(`/v1/events/${encodeURIComponent(id)}`);
+    } catch (e) {
+      if (e.status === 404) {
+        main.append(emptyMsg('event not found',
+          `no event with id ${id}. it may have been from a different database, or the id may be malformed.`));
+      } else {
+        main.append(errorPanel('couldn\'t load event', e));
+      }
+      return;
+    }
+
+    // Headline: the content. data.content for ctx.note / ctx.fact /
+    // etc.; falls back to pretty-printed JSON for events that don't
+    // follow that convention.
+    const contentHost = el('div', { class: 'event-content' });
+    const content = event.data && typeof event.data === 'object'
+      ? event.data.content
+      : null;
+    if (typeof content === 'string' && content.length > 0) {
+      contentHost.append(el('pre', { class: 'event-text' }, content));
+    } else {
+      // No `content` field — show the whole `data` blob.
+      contentHost.append(el('pre', { class: 'event-json' }, prettyJson(event.data)));
+    }
+    main.append(panel('Content', contentHost));
+
+    // Metadata table (subject, type, time, source).
+    const meta = el('dl', { class: 'event-meta' });
+    addMetaRow(meta, 'subject', event.subject);
+    addMetaRow(meta, 'type', event.type || event.event_type);
+    addMetaRow(meta, 'time', `${event.time} (${fmtTime(event.time)})`);
+    if (event.source) addMetaRow(meta, 'source', event.source);
+    addMetaRow(meta, 'id', event.id);
+    main.append(panel('Metadata', meta));
+
+    // Provenance: predecessor hash, parents, signature, attestation.
+    // Most events have these blank or null; only render the section
+    // if at least one is set so we don't waste vertical space.
+    const provHost = el('dl', { class: 'event-meta' });
+    let hasProv = false;
+    if (event.predecessorhash) { addMetaRow(provHost, 'predecessor', event.predecessorhash); hasProv = true; }
+    if (event.parents && event.parents.length) { addMetaRow(provHost, 'parents', event.parents.join(', ')); hasProv = true; }
+    if (event.signature) { addMetaRow(provHost, 'signature', event.signature); hasProv = true; }
+    if (event.attestation) { addMetaRow(provHost, 'attestation', `${event.attestation.length} bytes`); hasProv = true; }
+    if (hasProv) main.append(panel('Provenance', provHost));
+
+    // Raw JSON, collapsed by default — for the "I trust nothing,
+    // show me the wire form" power user.
+    const detail = el('details', { class: 'event-raw' },
+      el('summary', {}, 'raw event JSON'),
+      el('pre', { class: 'event-json' }, prettyJson(event)));
+    main.append(panel('Raw', detail));
+  }
+
+  function addMetaRow(dl, label, value) {
+    dl.append(el('dt', {}, label));
+    dl.append(el('dd', {}, String(value == null ? '' : value)));
+  }
+
+  function prettyJson(v) {
+    try { return JSON.stringify(v, null, 2); }
+    catch (_) { return String(v); }
   }
 
   // ───────── Peers view ─────————
