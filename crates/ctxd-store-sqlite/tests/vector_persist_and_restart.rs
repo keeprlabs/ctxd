@@ -78,8 +78,7 @@ async fn embeddings_survive_close_and_reopen() {
         let mut store = EventStore::open(&path).await.unwrap();
         let idx = store.ensure_vector_index(cfg()).await.unwrap();
         assert_eq!(idx.len(), 100);
-        let valid: std::collections::HashSet<&str> =
-            event_ids.iter().map(|s| s.as_str()).collect();
+        let valid: std::collections::HashSet<&str> = event_ids.iter().map(|s| s.as_str()).collect();
         for (i, want) in event_ids.iter().enumerate() {
             let q = rand_vec(i as u64);
             let r = idx.search(&q, 10).unwrap();
