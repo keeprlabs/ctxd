@@ -4,6 +4,7 @@ description = "Core types for ctxd: events, subjects, hash chains"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
