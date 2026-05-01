@@ -173,15 +173,20 @@ pub async fn serve(
         api.merge(frontend),
         cap_engine.clone(),
     );
+    // Bind synchronously so EADDRINUSE is returned as an error from
+    // serve() rather than killing a spawned worker task. Callers
+    // (including `ctxd dashboard`) rely on this to print friendly
+    // port-already-in-use guidance.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind HTTP admin to {addr}"))?;
+    tracing::info!("HTTP admin API + dashboard listening on {addr}");
     let http_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        tracing::info!("HTTP admin API + dashboard listening on {addr}");
-        axum::serve(
+        let _ = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .await
-        .unwrap();
+        .await;
     });
 
     // Federation bootstrap (signing key + peer manager + replication

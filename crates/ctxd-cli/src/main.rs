@@ -117,6 +117,22 @@ enum Commands {
         storage_uri: Option<String>,
     },
 
+    /// Open the embedded web dashboard at `http://127.0.0.1:7777/`.
+    ///
+    /// Starts an HTTP-only daemon (no wire, no MCP, no federation)
+    /// against the same SQLite database `ctxd serve` uses, then opens
+    /// the URL in the system browser. Read-only by default — writes
+    /// still go through MCP, the wire protocol, or the CLI.
+    Dashboard {
+        /// Address to bind the dashboard's HTTP server.
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        bind: String,
+
+        /// Skip opening a browser. Useful in CI or over SSH.
+        #[arg(long, default_value_t = false)]
+        no_open: bool,
+    },
+
     /// Append an event to the store.
     Write {
         /// Subject path.
@@ -430,6 +446,77 @@ async fn main() -> Result<()> {
                 pending_approval_tx,
             )
             .await?;
+        }
+
+        Commands::Dashboard { bind, no_open } => {
+            // Dashboard mode: HTTP only. No wire, no MCP, no
+            // federation. Reuses serve()'s composition (HTTP admin +
+            // dashboard frontend + loopback middleware) — the
+            // refactor in step 0 made this a four-line subcommand.
+            let cfg = ctxd_cli::serve::ServeConfig {
+                bind: bind.clone(),
+                wire_bind: None,
+                mcp_stdio: false,
+                mcp_sse: None,
+                mcp_http: None,
+                require_auth: false,
+                embedder: "null".to_string(),
+                embedder_model: None,
+                embedder_url: None,
+                embedder_api_key: None,
+                storage: "sqlite".to_string(),
+                storage_uri: None,
+                federation: false,
+            };
+            // Spawn a deferred opener that fires once the bind has
+            // had a moment to come up. Doing this *before* the
+            // serve() future is awaited would race; doing it *after*
+            // would never fire (serve runs forever). Tokio task it.
+            if !no_open {
+                let url = format!("http://{}/", bind);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    if let Err(e) = open_browser(&url) {
+                        tracing::warn!(error = %e, "couldn't open browser; visit {url} manually");
+                    } else {
+                        tracing::info!("opened dashboard at {url}");
+                    }
+                });
+            } else {
+                tracing::info!("ctxd dashboard listening on http://{bind}/");
+            }
+            // Run the serve loop. EADDRINUSE etc. surface as anyhow
+            // errors with a friendly hint when the bind fails.
+            ctxd_cli::serve::serve(
+                cfg,
+                store,
+                cap_engine,
+                caveat_state,
+                pending_approval_tx,
+            )
+            .await
+            .map_err(|e| {
+                // anyhow's Display only shows the top context; the
+                // underlying io::Error lives in the chain. Walk it so
+                // we can surface a friendly message for the common
+                // "another daemon is already running on this port"
+                // case.
+                let in_use = e.chain().any(|cause| {
+                    let s = cause.to_string();
+                    s.contains("Address already in use") || s.contains("address in use")
+                });
+                if in_use {
+                    anyhow::anyhow!(
+                        "port {} is already in use. a ctxd daemon may already \
+                         be running — visit http://{}/ in your browser, or \
+                         stop the existing daemon and try again.",
+                        bind,
+                        bind
+                    )
+                } else {
+                    e
+                }
+            })?;
         }
 
         Commands::Write {
@@ -909,6 +996,38 @@ impl Drop for OtelGuard {
             }
         }
     }
+}
+
+/// Open `url` in the system browser. Cross-platform via the OS-native
+/// `open` (macOS), `xdg-open` (Linux), `cmd /c start ""` (Windows).
+/// No external dependency.
+fn open_browser(url: &str) -> Result<()> {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        // The leading "" is the title for `start`; without it `start`
+        // treats the URL as a window title and does nothing.
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let status = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("failed to spawn browser opener for {url}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "browser opener exited with non-zero status: {status}"
+        ));
+    }
+    Ok(())
 }
 
 /// Initialize the tracing subscriber. If `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
