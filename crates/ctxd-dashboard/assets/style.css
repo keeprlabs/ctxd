@@ -158,6 +158,13 @@ main {
   letter-spacing: 0.08em;
   color: var(--ink-2);
 }
+.panel-head .panel-meta {
+  margin-left: var(--s-3);
+  font-size: var(--t-xs);
+  color: var(--ink-3);
+  text-transform: none;
+  letter-spacing: 0;
+}
 
 /* —— Stats strip ——————————————————————————————— */
 .stats {
@@ -235,7 +242,10 @@ main {
 }
 .tree-node:hover { background: var(--paper-3); }
 .tree-node .chev { color: var(--ink-3); width: 12px; display: inline-block; }
+.tree-node .chev--btn { cursor: pointer; }
+.tree-node .chev--btn:hover { color: var(--accent); }
 .tree-node .nm { color: var(--ink); }
+.tree-node a.nm:hover { color: var(--accent); }
 .tree-node .ct { color: var(--ink-3); font-variant-numeric: tabular-nums; margin-left: var(--s-2); }
 
 /* —— Search —————————————————————————————————————— */

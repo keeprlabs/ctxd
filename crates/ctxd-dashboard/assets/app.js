@@ -90,6 +90,7 @@
     search: renderSearch,
     peers: renderPeers,
     event: renderEvent,
+    subject: renderSubjectDetail,
   };
 
   let currentRoute = null;
@@ -356,29 +357,129 @@
     for (const child of (node.children || [])) {
       const li = el('li');
       const expandable = (child.children || []).length > 0;
+
+      // Chevron toggles expand/collapse; the name is a real link to
+      // the subject's events. Two distinct click targets so the user
+      // can drill into either dimension without "click the name to
+      // expand, click the name *again* to view events" ambiguity.
+      const chev = el('span', {
+        class: 'chev' + (expandable ? ' chev--btn' : ''),
+        role: expandable ? 'button' : null,
+        'aria-label': expandable ? 'toggle children' : null,
+      }, expandable ? '▸' : ' ');
+
+      const nameLink = el('a', {
+        class: 'nm',
+        href: `#/subject/${encodeURIComponent(child.name)}`,
+        title: `view events under ${child.name}`,
+      }, child.name);
+
       const nodeLine = el('span', { class: 'tree-node', role: 'treeitem' },
-        el('span', { class: 'chev' }, expandable ? '▸' : ' '),
-        el('span', { class: 'nm' }, child.name),
+        chev,
+        nameLink,
         el('span', { class: 'ct' }, fmtCount(child.count)));
       li.append(nodeLine);
+
       if (expandable) {
         let expanded = depth < 1;
         const subUl = expanded ? buildTreeNode(child, depth + 1) : null;
         if (subUl) li.append(subUl);
-        nodeLine.addEventListener('click', () => {
+        chev.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
           expanded = !expanded;
-          nodeLine.querySelector('.chev').textContent = expanded ? '▾' : '▸';
+          chev.textContent = expanded ? '▾' : '▸';
           if (expanded) {
             li.append(buildTreeNode(child, depth + 1));
           } else {
             li.querySelector('ul')?.remove();
           }
         });
-        if (subUl) nodeLine.querySelector('.chev').textContent = '▾';
+        if (subUl) chev.textContent = '▾';
       }
       ul.append(li);
     }
     return ul;
+  }
+
+  // ───────── Subject detail view ─────────
+  //
+  // Renders events under a given subject (recursive). Hash route:
+  // #/subject/<url-encoded-path>. Reached by clicking a subject name
+  // in the tree, or by typing the URL.
+  //
+  // The subject path is URL-encoded as a single segment so paths like
+  // `/work/local/files/a.md` survive routing without the slashes
+  // confusing parseRoute.
+
+  async function renderSubjectDetail(main, _params, rest) {
+    main.innerHTML = '';
+    const subject = rest.length ? decodeURIComponent(rest[0]) : null;
+    if (!subject) {
+      main.append(errorPanel('no subject', new Error('expected #/subject/<path>')));
+      return;
+    }
+
+    const back = el('a', { class: 'event-back', href: '#/subjects' }, '← all subjects');
+    main.append(back);
+
+    // Header panel: subject path + count.
+    const head = el('div', { class: 'panel-head' },
+      el('h2', {}, subject));
+    const headPanel = el('section', { class: 'panel' }, head);
+    const eventsHost = el('div', { class: 'events', id: 'subject-events' },
+      ...shimmerRows(8));
+    headPanel.append(eventsHost);
+    main.append(headPanel);
+
+    // Pull events under this subject (recursive). The endpoint's
+    // subject filter implies recursive descent.
+    let page;
+    try {
+      page = await api(`/v1/events?subject=${encodeURIComponent(subject)}&limit=200`);
+    } catch (e) {
+      eventsHost.replaceWith(errorPanel('couldn\'t load events', e));
+      return;
+    }
+
+    // Update the head with the count once we know it.
+    head.append(el('span', { class: 'panel-meta' }, `${page.events.length} event${page.events.length === 1 ? '' : 's'}`));
+
+    eventsHost.innerHTML = '';
+    if (!page.events.length) {
+      eventsHost.append(emptyMsg(
+        `no events under ${subject}`,
+        'this subject is empty or has only descendants. try the parent prefix to see them.'));
+      return;
+    }
+    for (const e of page.events) eventsHost.append(eventRow(e, false));
+
+    // If there's a next page, surface a "load more" button.
+    if (page.next_cursor) {
+      const more = el('button', { class: 'btn btn--ghost btn--sm', type: 'button' },
+        `load older (cursor: ${page.next_cursor.slice(0, 8)}…)`);
+      let cursor = page.next_cursor;
+      more.addEventListener('click', async () => {
+        more.disabled = true;
+        more.textContent = 'loading…';
+        try {
+          const next = await api(
+            `/v1/events?subject=${encodeURIComponent(subject)}&before=${encodeURIComponent(cursor)}&limit=200`);
+          for (const e of next.events) eventsHost.append(eventRow(e, false));
+          if (next.next_cursor) {
+            cursor = next.next_cursor;
+            more.disabled = false;
+            more.textContent = `load older (cursor: ${cursor.slice(0, 8)}…)`;
+          } else {
+            more.remove();
+          }
+        } catch (e) {
+          more.textContent = 'failed — click to retry';
+          more.disabled = false;
+        }
+      });
+      headPanel.append(more);
+    }
   }
 
   // ───────── Search view ─────────
