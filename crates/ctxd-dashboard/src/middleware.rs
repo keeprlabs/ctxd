@@ -1,13 +1,13 @@
 //! Loopback bypass middleware for the dashboard.
 //!
 //! The flow:
-//!   loopback peer (127.0.0.0/8 or ::1) → allow
-//!   else → require an admin cap-token (existing ctxd-cap behavior)
+//!   - loopback peer (127.0.0.0/8 or ::1) → allow
+//!   - else → require an admin cap-token (existing ctxd-cap behavior)
 //!
-//! Apply via [`apply_localhost_or_cap_token`] to the merged dashboard
-//! + ctxd-http router in `ctxd-cli/src/serve.rs` (step 6). For routes
-//! that already require admin (e.g. /v1/grant), this middleware is
-//! a no-op for token-bearing callers — they already pass.
+//! Apply via [`apply_localhost_or_cap_token`] to the merged
+//! dashboard-and-ctxd-http router in `ctxd-cli/src/serve.rs` (step 6).
+//! For routes that already require admin (e.g. /v1/grant), this
+//! middleware is a no-op for token-bearing callers — they already pass.
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;

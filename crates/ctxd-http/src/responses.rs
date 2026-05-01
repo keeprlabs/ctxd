@@ -79,6 +79,21 @@ pub struct EventsCursor {
     pub seq: i64,
 }
 
+/// Returned when [`EventsCursor::decode`] fails. Carries no detail —
+/// the cursor is opaque to clients, so "invalid cursor" is all we'd
+/// ever say. A real type (rather than `()`) lets callers `?` it
+/// against richer error enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidCursor;
+
+impl std::fmt::Display for InvalidCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid cursor")
+    }
+}
+
+impl std::error::Error for InvalidCursor {}
+
 impl EventsCursor {
     /// Encode as base64-url-no-pad of the JSON form.
     pub fn encode(&self) -> String {
@@ -87,15 +102,12 @@ impl EventsCursor {
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).unwrap_or_default())
     }
 
-    /// Parse a cursor string. Returns `Err` on malformed input — the
-    /// HTTP handler maps this to a 400. The error type carries no
-    /// detail because the cursor is opaque to clients; "invalid
-    /// cursor" is all we'd ever say.
-    pub fn decode(s: &str) -> Result<Self, ()> {
+    /// Parse a cursor string. The HTTP handler maps `Err` to a 400.
+    pub fn decode(s: &str) -> Result<Self, InvalidCursor> {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        let bytes = URL_SAFE_NO_PAD.decode(s).map_err(|_| ())?;
-        serde_json::from_slice(&bytes).map_err(|_| ())
+        let bytes = URL_SAFE_NO_PAD.decode(s).map_err(|_| InvalidCursor)?;
+        serde_json::from_slice(&bytes).map_err(|_| InvalidCursor)
     }
 }
 

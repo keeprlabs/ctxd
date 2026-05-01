@@ -42,7 +42,7 @@ pub(crate) async fn list_events(
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let before_seq = match q.before.as_deref() {
         Some(s) => Some(

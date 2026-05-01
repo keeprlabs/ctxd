@@ -44,7 +44,7 @@ pub(crate) async fn search(
     if query.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "q must not be empty".to_string()));
     }
-    let k = q.k.unwrap_or(DEFAULT_K).min(MAX_K).max(1);
+    let k = q.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K);
 
     let started = Instant::now();
     let hits = state
