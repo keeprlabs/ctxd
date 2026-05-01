@@ -1119,7 +1119,7 @@ impl Drop for OtelGuard {
 /// Otherwise only the plain fmt layer is used (zero OTEL overhead).
 fn init_tracing() -> OtelGuard {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let fmt_layer = tracing_subscriber::fmt::layer();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
         // Build OTLP exporter and tracer provider.
