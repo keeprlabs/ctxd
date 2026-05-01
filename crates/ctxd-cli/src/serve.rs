@@ -150,18 +150,38 @@ pub async fn serve(
         .await
         .context("failed to open HNSW vector index")?;
 
-    // Daemon path: wire the production host-check allow-list so the
-    // DNS-rebinding defense is on by default.
-    let router = build_router_with_hosts(
+    // Daemon path: compose the JSON API, the dashboard frontend, and
+    // the loopback-or-cap-token middleware that fronts both.
+    //
+    // Composition order (outermost layer wins):
+    //   1. host_check + defensive_headers (already inside build_router_with_hosts)
+    //   2. localhost_or_cap_token (added below)
+    // Loopback callers (the dashboard's browser) bypass cap-token; remote
+    // callers with a valid admin token still pass; everyone else gets 403.
+    //
+    // The bind site MUST use into_make_service_with_connect_info so the
+    // ConnectInfo<SocketAddr> extension is populated — otherwise the
+    // loopback middleware fails closed with a 500.
+    let api = build_router_with_hosts(
         store.clone(),
         cap_engine.clone(),
         caveat_state.clone(),
         default_allowed_hosts(),
     );
+    let frontend = ctxd_dashboard::router::<()>();
+    let app = ctxd_dashboard::apply_localhost_or_cap_token(
+        api.merge(frontend),
+        cap_engine.clone(),
+    );
     let http_handle = tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        tracing::info!("HTTP admin API listening on {addr}");
-        axum::serve(listener, router).await.unwrap();
+        tracing::info!("HTTP admin API + dashboard listening on {addr}");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     // Federation bootstrap (signing key + peer manager + replication
@@ -433,8 +453,17 @@ async fn run_minimal_serve(
         .await
         .context("bind minimal admin")?;
     tracing::info!("minimal HTTP admin listening on {addr}");
-    axum::serve(listener, router)
-        .await
-        .context("minimal serve")?;
+    // Even in the minimal-serve path we go through
+    // into_make_service_with_connect_info so the ConnectInfo
+    // extension is consistent across both serve paths. The minimal
+    // router doesn't currently use ConnectInfo, but downstream
+    // middleware (e.g. when the dashboard composes onto this path
+    // post-v0.4) will expect it.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("minimal serve")?;
     Ok(())
 }
