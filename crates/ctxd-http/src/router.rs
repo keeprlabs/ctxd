@@ -7,6 +7,7 @@
 use crate::handlers;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use tower_http::trace::TraceLayer;
 use ctxd_cap::state::CaveatState;
 use ctxd_cap::CapEngine;
 use ctxd_store::EventStore;
@@ -55,5 +56,17 @@ pub fn build_router(
         )
         .route("/v1/peers", get(handlers::peers::list_peers))
         .route("/v1/peers/{peer_id}", delete(handlers::peers::remove_peer))
+        // v0.4 dashboard surface — read-only events / subjects / search,
+        // SSE live tail, and the loopback-only hello-world tutorial write.
+        .route("/v1/events", get(handlers::events::list_events))
+        .route("/v1/events/stream", get(handlers::events::stream_events))
+        .route("/v1/events/{id}", get(handlers::events::event_by_id))
+        .route("/v1/subjects/tree", get(handlers::subjects::subject_tree))
+        .route("/v1/search", get(handlers::search::search))
+        .route(
+            "/v1/dashboard/hello-world",
+            post(handlers::dashboard::hello_world),
+        )
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

@@ -69,6 +69,36 @@ pub struct PeerListResponse {
     pub peers: Vec<PeerListItem>,
 }
 
+/// Opaque cursor for `/v1/events` pagination. Encodes the row's
+/// SQLite `seq` so the next page is `seq < before`. base64-url with no
+/// padding, JSON-shaped underneath so we can extend with extra fields
+/// (e.g. subject filter snapshot) without breaking existing clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventsCursor {
+    /// Sqlite seq of the row this cursor points BEFORE.
+    pub seq: i64,
+}
+
+impl EventsCursor {
+    /// Encode as base64-url-no-pad of the JSON form.
+    pub fn encode(&self) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    /// Parse a cursor string. Returns `Err` on malformed input — the
+    /// HTTP handler maps this to a 400. The error type carries no
+    /// detail because the cursor is opaque to clients; "invalid
+    /// cursor" is all we'd ever say.
+    pub fn decode(s: &str) -> Result<Self, ()> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let bytes = URL_SAFE_NO_PAD.decode(s).map_err(|_| ())?;
+        serde_json::from_slice(&bytes).map_err(|_| ())
+    }
+}
+
 /// Lowercase hex encoding without external deps. Each byte → two
 /// chars from `0123456789abcdef`.
 fn hex_lower(bytes: &[u8]) -> String {
@@ -94,6 +124,24 @@ mod tests {
         // 32-byte ed25519-shaped input.
         let bytes: Vec<u8> = (0..32).collect();
         assert_eq!(hex_lower(&bytes).len(), 64);
+    }
+
+    #[test]
+    fn events_cursor_round_trip() {
+        let c = EventsCursor { seq: 1247 };
+        let encoded = c.encode();
+        // base64-url-no-pad has no `=` padding and no `+`/`/`.
+        assert!(!encoded.contains('='));
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        let back = EventsCursor::decode(&encoded).expect("decode");
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn events_cursor_decode_rejects_garbage() {
+        assert!(EventsCursor::decode("@@@invalid@@@").is_err());
+        assert!(EventsCursor::decode("aGVsbG8").is_err()); // valid b64 but not JSON
     }
 
     #[test]

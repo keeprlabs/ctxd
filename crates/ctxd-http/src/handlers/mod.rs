@@ -5,11 +5,14 @@
 //! else lives here.
 
 pub mod approvals;
+pub mod dashboard;
+pub mod events;
 pub mod grants;
 pub mod health;
 pub mod peers;
+pub mod search;
 pub mod stats;
-// Step 3 (dashboard plan v0.5) adds: events, subjects, search, dashboard.
+pub mod subjects;
 
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use ctxd_cap::{CapEngine, Operation};
