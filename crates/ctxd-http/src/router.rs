@@ -54,9 +54,31 @@ pub fn build_router(
 }
 
 /// Default v0.4 host allow-list: `127.0.0.1:7777`, `localhost:7777`,
-/// `[::1]:7777`. Used by the daemon when it binds the standard port.
+/// `[::1]:7777`. Used when the daemon binds the standard port.
 pub fn default_allowed_hosts() -> Vec<String> {
     DEFAULT_ALLOWED_HOSTS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Derive the allow-list from the daemon's actual bind address. Always
+/// includes the bind address itself plus the matching `localhost:<port>`
+/// and `[::1]:<port>` aliases. Use this instead of
+/// [`default_allowed_hosts`] when the daemon binds a non-default port,
+/// otherwise the dashboard 421s every fetch.
+pub fn allowed_hosts_for_bind(addr: std::net::SocketAddr) -> Vec<String> {
+    let port = addr.port();
+    let mut hosts = vec![
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ];
+    // If the bind itself is a different IP (e.g. someone explicitly
+    // binds 0.0.0.0 — discouraged but possible), include it too so
+    // browsers using the bind hostname don't get rejected.
+    let bind_str = addr.to_string();
+    if !hosts.iter().any(|h| h == &bind_str) {
+        hosts.push(bind_str);
+    }
+    hosts
 }
 
 /// Same as [`build_router`] but lets the caller override the

@@ -13,7 +13,7 @@ use ctxd_cap::state::{CaveatState, PendingApproval};
 use ctxd_cap::CapEngine;
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
-use ctxd_http::router::{build_router_with_hosts, default_allowed_hosts};
+use ctxd_http::router::{allowed_hosts_for_bind, build_router_with_hosts};
 use ctxd_mcp::CtxdMcpServer;
 use ctxd_store::EventStore;
 use std::net::SocketAddr;
@@ -166,7 +166,7 @@ pub async fn serve(
         store.clone(),
         cap_engine.clone(),
         caveat_state.clone(),
-        default_allowed_hosts(),
+        allowed_hosts_for_bind(addr),
     );
     let frontend = ctxd_dashboard::router::<()>();
     let app = ctxd_dashboard::apply_localhost_or_cap_token(
