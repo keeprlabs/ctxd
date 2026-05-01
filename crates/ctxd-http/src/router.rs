@@ -5,6 +5,7 @@
 //! (the canonical router builder).
 
 use crate::handlers;
+use crate::middleware::{apply_host_check, defensive_headers, DEFAULT_ALLOWED_HOSTS};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
@@ -34,10 +35,38 @@ pub struct AppState {
 }
 
 /// Build the axum router with all admin endpoints.
+///
+/// **No host check**: equivalent to `build_router_with_hosts(..., vec![])`.
+/// This is the test-friendly default — `tower::oneshot` and similar
+/// helpers don't set a `Host:` header, so a default-on host check would
+/// break every existing integration test. Production daemons that want
+/// DNS-rebinding defense should call [`build_router_with_hosts`]
+/// directly with a non-empty list (or pass `DEFAULT_ALLOWED_HOSTS`).
+///
+/// Defensive headers (CSP, X-Content-Type-Options, X-Frame-Options,
+/// Referrer-Policy) are applied unconditionally either way.
 pub fn build_router(
     store: EventStore,
     cap_engine: Arc<CapEngine>,
     caveat_state: Arc<dyn CaveatState>,
+) -> Router {
+    build_router_with_hosts(store, cap_engine, caveat_state, Vec::new())
+}
+
+/// Default v0.4 host allow-list: `127.0.0.1:7777`, `localhost:7777`,
+/// `[::1]:7777`. Used by the daemon when it binds the standard port.
+pub fn default_allowed_hosts() -> Vec<String> {
+    DEFAULT_ALLOWED_HOSTS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Same as [`build_router`] but lets the caller override the
+/// `Host:`-header allow-list (used in tests, and when the daemon binds
+/// to a non-default port).
+pub fn build_router_with_hosts(
+    store: EventStore,
+    cap_engine: Arc<CapEngine>,
+    caveat_state: Arc<dyn CaveatState>,
+    allowed_hosts: Vec<String>,
 ) -> Router {
     let state = AppState {
         store,
@@ -45,7 +74,7 @@ pub fn build_router(
         caveat_state,
         start_time: Instant::now(),
     };
-    Router::new()
+    let routes = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/v1/grant", post(handlers::grants::grant))
         .route("/v1/stats", get(handlers::stats::stats))
@@ -68,5 +97,11 @@ pub fn build_router(
             post(handlers::dashboard::hello_world),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state);
+
+    // Compose middleware outermost-first: defensive headers wrap
+    // everything (so host-check rejections also get them), then
+    // host-check rejects bad Host before any handler runs.
+    apply_host_check(routes, allowed_hosts)
+        .layer(axum::middleware::from_fn(defensive_headers))
 }

@@ -10,6 +10,7 @@
 //! - `POST /v1/approvals/:id/decide` — allow/deny an approval (admin)
 
 pub mod handlers;
+pub mod middleware;
 pub mod responses;
 pub mod router;
 

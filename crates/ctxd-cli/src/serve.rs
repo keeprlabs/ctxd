@@ -13,7 +13,7 @@ use ctxd_cap::state::{CaveatState, PendingApproval};
 use ctxd_cap::CapEngine;
 use ctxd_core::event::Event;
 use ctxd_core::subject::Subject;
-use ctxd_http::build_router;
+use ctxd_http::router::{build_router_with_hosts, default_allowed_hosts};
 use ctxd_mcp::CtxdMcpServer;
 use ctxd_store::EventStore;
 use std::net::SocketAddr;
@@ -150,7 +150,14 @@ pub async fn serve(
         .await
         .context("failed to open HNSW vector index")?;
 
-    let router = build_router(store.clone(), cap_engine.clone(), caveat_state.clone());
+    // Daemon path: wire the production host-check allow-list so the
+    // DNS-rebinding defense is on by default.
+    let router = build_router_with_hosts(
+        store.clone(),
+        cap_engine.clone(),
+        caveat_state.clone(),
+        default_allowed_hosts(),
+    );
     let http_handle = tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         tracing::info!("HTTP admin API listening on {addr}");
