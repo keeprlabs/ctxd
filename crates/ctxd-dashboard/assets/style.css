@@ -1,0 +1,17 @@
+/* Step 7 (frontend HTML/CSS/JS) replaces this with the full design
+   system. This stub gives Step 5's static-asset handler something to
+   serve so the rust-embed wiring is testable end-to-end. */
+:root {
+  color-scheme: dark;
+  --bg: #0d0d0d;
+  --fg: #e8e8e8;
+  --mono: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 14px;
+  padding: 32px;
+}

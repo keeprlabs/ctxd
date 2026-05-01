@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <rect width="16" height="16" fill="#0d0d0d"/>
+  <text x="8" y="11" text-anchor="middle" font-family="SF Mono, Menlo, monospace"
+        font-size="9" font-weight="700" fill="#d97757">c</text>
+</svg>
