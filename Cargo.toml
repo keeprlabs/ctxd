@@ -11,6 +11,7 @@ members = [
     "crates/ctxd-embed",
     "crates/ctxd-mcp",
     "crates/ctxd-http",
+    "crates/ctxd-dashboard",
     "crates/ctxd-wire",
     "crates/ctxd-cli",
     "crates/ctxd-adapter-core",

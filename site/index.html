@@ -44,6 +44,11 @@ const HERO_VARIANTS = {
     title: <><em>Append.</em> Address.<br/>Attenuate.<br/><span className="stamp">A log for agents.</span></>,
     lede: <>ctxd treats agent context as events on an append-only log. Each event is filed at a subject path, hash-chained to its predecessor, and reachable through MCP, a length-prefixed TCP wire protocol, or HTTP. Capability tokens decide who reads what — narrowly, expirably, never widening.</>
   },
+  dashboard: {
+    eyebrow: "embedded web ui · v0.4 · localhost-only",
+    title: <>See what's<br/>in your <em>substrate.</em><br/><span className="stamp">Live.</span></>,
+    lede: <>One command — <code style={{fontFamily:"var(--font-mono)"}}>ctxd dashboard</code> — opens a built-in viewer at <code style={{fontFamily:"var(--font-mono)"}}>http://127.0.0.1:7777/</code>. Watch your event count fill up, browse the subject tree, search the log, tail new events live via SSE. Read-only. Localhost-only. No second binary, no second install step. The dashboard ships in the daemon.</>
+  },
 };
 
 const FONT_PAIRS = {

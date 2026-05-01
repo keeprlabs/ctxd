@@ -69,6 +69,48 @@ pub struct PeerListResponse {
     pub peers: Vec<PeerListItem>,
 }
 
+/// Opaque cursor for `/v1/events` pagination. Encodes the row's
+/// SQLite `seq` so the next page is `seq < before`. base64-url with no
+/// padding, JSON-shaped underneath so we can extend with extra fields
+/// (e.g. subject filter snapshot) without breaking existing clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventsCursor {
+    /// Sqlite seq of the row this cursor points BEFORE.
+    pub seq: i64,
+}
+
+/// Returned when [`EventsCursor::decode`] fails. Carries no detail —
+/// the cursor is opaque to clients, so "invalid cursor" is all we'd
+/// ever say. A real type (rather than `()`) lets callers `?` it
+/// against richer error enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidCursor;
+
+impl std::fmt::Display for InvalidCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid cursor")
+    }
+}
+
+impl std::error::Error for InvalidCursor {}
+
+impl EventsCursor {
+    /// Encode as base64-url-no-pad of the JSON form.
+    pub fn encode(&self) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    /// Parse a cursor string. The HTTP handler maps `Err` to a 400.
+    pub fn decode(s: &str) -> Result<Self, InvalidCursor> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let bytes = URL_SAFE_NO_PAD.decode(s).map_err(|_| InvalidCursor)?;
+        serde_json::from_slice(&bytes).map_err(|_| InvalidCursor)
+    }
+}
+
 /// Lowercase hex encoding without external deps. Each byte → two
 /// chars from `0123456789abcdef`.
 fn hex_lower(bytes: &[u8]) -> String {
@@ -94,6 +136,24 @@ mod tests {
         // 32-byte ed25519-shaped input.
         let bytes: Vec<u8> = (0..32).collect();
         assert_eq!(hex_lower(&bytes).len(), 64);
+    }
+
+    #[test]
+    fn events_cursor_round_trip() {
+        let c = EventsCursor { seq: 1247 };
+        let encoded = c.encode();
+        // base64-url-no-pad has no `=` padding and no `+`/`/`.
+        assert!(!encoded.contains('='));
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        let back = EventsCursor::decode(&encoded).expect("decode");
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn events_cursor_decode_rejects_garbage() {
+        assert!(EventsCursor::decode("@@@invalid@@@").is_err());
+        assert!(EventsCursor::decode("aGVsbG8").is_err()); // valid b64 but not JSON
     }
 
     #[test]

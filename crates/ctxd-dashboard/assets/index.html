@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ctxd</title>
+  <meta name="theme-color" content="#0a0a0a" />
+  <meta name="description" content="ctxd dashboard — context substrate viewer" />
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body data-theme="terminal">
+  <header role="banner" class="hdr">
+    <a href="#/" class="hdr-brand" aria-label="ctxd home">
+      <span class="hdr-glyph">c</span>
+      <span class="hdr-name">ctxd</span>
+    </a>
+    <nav class="hdr-nav" aria-label="primary">
+      <a href="#/" data-route="overview">overview</a>
+      <a href="#/subjects" data-route="subjects">subjects</a>
+      <a href="#/search" data-route="search">search</a>
+      <a href="#/peers" data-route="peers">peers</a>
+    </nav>
+    <div class="hdr-right">
+      <span id="live-badge" class="live live-off" aria-live="polite" title="live tail status">
+        <span class="live-dot"></span>
+        <span class="live-text">offline</span>
+      </span>
+      <button id="refresh-btn" class="btn btn--sm btn--ghost" type="button" aria-label="refresh">
+        ↻ refresh
+      </button>
+    </div>
+  </header>
+
+  <main id="main" role="main">
+    <p class="loading">loading…</p>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -9,8 +9,10 @@
 //! - `GET /v1/approvals` — list pending HumanApproval requests
 //! - `POST /v1/approvals/:id/decide` — allow/deny an approval (admin)
 
+pub mod handlers;
+pub mod middleware;
 pub mod responses;
 pub mod router;
 
 pub use responses::{PeerListItem, PeerListResponse};
-pub use router::build_router;
+pub use router::{build_router, AppState};

@@ -34,6 +34,21 @@ pub enum StoreError {
     Subject(#[from] ctxd_core::subject::SubjectError),
 }
 
+/// A search hit returned by [`EventStore::search_with_snippets`]:
+/// the matching event, an FTS5 snippet around the matched terms, and
+/// the BM25 rank (lower is a better match in SQLite's bm25 ordering).
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    /// The matching event.
+    pub event: Event,
+    /// FTS5 `snippet(...)` of the event's `data` column with `<mark>`
+    /// tags around matched terms.
+    pub snippet: String,
+    /// BM25 rank as returned by SQLite. Smaller (more negative) is a
+    /// better match.
+    pub rank: f32,
+}
+
 /// The main event store. Owns a SQLite connection pool and provides
 /// append/read operations with hash chain verification.
 #[derive(Clone)]
@@ -53,6 +68,15 @@ pub struct EventStore {
     /// Path to the underlying database file (None for in-memory).
     /// Used to derive the `<db>.hnsw` index path.
     db_path: Option<PathBuf>,
+    /// Broadcast channel for live-tail subscribers (dashboard SSE,
+    /// future MCP `ctx_subscribe` consumers). Every successful
+    /// [`EventStore::append`] fans the stored event out here on a
+    /// best-effort basis — when there are no receivers the send
+    /// silently no-ops. Buffer is 256: slow consumers fall behind and
+    /// the broadcast channel surfaces a `Lagged` error on receive,
+    /// which the SSE handler rephrases as a "snapshot, please
+    /// re-fetch" event for the client.
+    event_tx: tokio::sync::broadcast::Sender<Event>,
 }
 
 impl std::fmt::Debug for EventStore {
@@ -62,6 +86,7 @@ impl std::fmt::Debug for EventStore {
             .field("has_embedder", &self.embedder.is_some())
             .field("has_vector_index", &self.vector_index.is_some())
             .field("db_path", &self.db_path)
+            .field("subscribers", &self.event_tx.receiver_count())
             .finish()
     }
 }
@@ -74,12 +99,14 @@ impl EventStore {
             .max_connections(5)
             .connect(&url)
             .await?;
+        let (event_tx, _initial_rx) = tokio::sync::broadcast::channel(256);
         let store = Self {
             pool,
             signing_key: None,
             embedder: None,
             vector_index: None,
             db_path: Some(path.to_path_buf()),
+            event_tx,
         };
         store.initialize().await?;
         Ok(store)
@@ -91,12 +118,14 @@ impl EventStore {
             .max_connections(1)
             .connect("sqlite::memory:")
             .await?;
+        let (event_tx, _initial_rx) = tokio::sync::broadcast::channel(256);
         let store = Self {
             pool,
             signing_key: None,
             embedder: None,
             vector_index: None,
             db_path: None,
+            event_tx,
         };
         store.initialize().await?;
         Ok(store)
@@ -683,6 +712,10 @@ impl EventStore {
             }
         }
 
+        // Live-tail fan-out. Best-effort: no receivers → SendError, ignored.
+        // The event is already durable; subscribers are a view.
+        let _ = self.event_tx.send(event.clone());
+
         Ok(event)
     }
 
@@ -827,6 +860,257 @@ impl EventStore {
 
         rows.into_iter().map(|r| r.into_event()).collect()
     }
+
+    // ─── Dashboard / live-tail surface (v0.4) ────────────────────────────
+    //
+    // Inherent methods consumed by `ctxd-http` and `ctxd-dashboard`. Kept
+    // off the `Store` trait deliberately — no non-SQLite backend needs
+    // them yet, and adding them would force every backend (Postgres,
+    // duckdb-object, future ones) to implement six methods that may
+    // never be called.
+
+    /// Total number of rows in the events table. O(1) on SQLite via the
+    /// rowid count.
+    pub async fn event_count(&self) -> Result<u64, StoreError> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// Total number of vector embeddings persisted.
+    pub async fn vector_embedding_count(&self) -> Result<u64, StoreError> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vector_embeddings")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// Look up a single event by its UUID. Returns `None` if no row
+    /// matches. The `events.id` column has a UNIQUE constraint, so this
+    /// is an indexed point lookup.
+    pub async fn event_by_id(&self, id: uuid::Uuid) -> Result<Option<Event>, StoreError> {
+        let row: Option<EventRow> = sqlx::query_as(
+            "SELECT id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(r.into_event()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Per-subject event counts, optionally narrowed to a prefix.
+    ///
+    /// Mirrors [`EventStore::read`]'s SQL pattern: under prefix `/foo`,
+    /// the row for subject `/foo` itself plus rows under `/foo/...` are
+    /// counted, but a sibling like `/foobar` is not (the `'foo/%'` LIKE
+    /// pattern explicitly anchors on the `/` separator).
+    pub async fn subject_counts(
+        &self,
+        prefix: Option<&Subject>,
+    ) -> Result<Vec<(Subject, u64)>, StoreError> {
+        let rows: Vec<(String, i64)> = if let Some(pfx) = prefix {
+            let pattern = if pfx.as_str() == "/" {
+                "/%".to_string()
+            } else {
+                format!("{}/%", pfx.as_str())
+            };
+            sqlx::query_as(
+                "SELECT subject, COUNT(*) AS n FROM events WHERE subject = ? OR subject LIKE ? GROUP BY subject ORDER BY subject",
+            )
+            .bind(pfx.as_str())
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT subject, COUNT(*) AS n FROM events GROUP BY subject ORDER BY subject",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        rows.into_iter()
+            .map(|(s, n)| Subject::new(&s).map(|sub| (sub, n.max(0) as u64)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Read events newest-first with cursor pagination. Used by the
+    /// dashboard's `/v1/events` and "load more" behavior.
+    ///
+    /// `before_seq`: opaque cursor (the row's `seq`). `None` returns
+    /// the most recent `limit` events. `Some(s)` returns the most
+    /// recent `limit` events with `seq < s`. The seq column is the
+    /// canonical insertion order — global, monotonic, stable across
+    /// concurrent writers — so a cursor stays valid even as new events
+    /// land.
+    ///
+    /// `subject`: optional filter. When `recursive`, descendants are
+    /// included via the same `'prefix/%' OR exact` LIKE pattern as
+    /// [`EventStore::read`].
+    ///
+    /// Returns rows ordered `seq DESC`. Caller decodes `seq` from each
+    /// returned event for the next-cursor by reading the last item's
+    /// position in the ordered tail (via [`EventStore::seq_of`] —
+    /// see below).
+    pub async fn read_paginated(
+        &self,
+        subject: Option<&Subject>,
+        before_seq: Option<i64>,
+        limit: usize,
+        recursive: bool,
+    ) -> Result<Vec<(i64, Event)>, StoreError> {
+        // Returning (seq, Event) lets the handler encode an opaque cursor
+        // from the last row's seq without a second query. seq is an
+        // implementation detail not exposed beyond the handler.
+        let limit_i64 = limit as i64;
+        let select =
+            "SELECT seq, id, source, subject, event_type, time, datacontenttype, data, predecessorhash, signature, specversion, parents, attestation FROM events";
+
+        let rows: Vec<SeqEventRow> = match (subject, recursive) {
+            (None, _) => match before_seq {
+                Some(s) => {
+                    sqlx::query_as(&format!("{select} WHERE seq < ? ORDER BY seq DESC LIMIT ?",))
+                        .bind(s)
+                        .bind(limit_i64)
+                        .fetch_all(&self.pool)
+                        .await?
+                }
+                None => {
+                    sqlx::query_as(&format!("{select} ORDER BY seq DESC LIMIT ?",))
+                        .bind(limit_i64)
+                        .fetch_all(&self.pool)
+                        .await?
+                }
+            },
+            (Some(sub), true) => {
+                let pattern = if sub.as_str() == "/" {
+                    "/%".to_string()
+                } else {
+                    format!("{}/%", sub.as_str())
+                };
+                match before_seq {
+                    Some(s) => sqlx::query_as(&format!(
+                        "{select} WHERE (subject = ? OR subject LIKE ?) AND seq < ? ORDER BY seq DESC LIMIT ?",
+                    ))
+                    .bind(sub.as_str())
+                    .bind(&pattern)
+                    .bind(s)
+                    .bind(limit_i64)
+                    .fetch_all(&self.pool)
+                    .await?,
+                    None => sqlx::query_as(&format!(
+                        "{select} WHERE subject = ? OR subject LIKE ? ORDER BY seq DESC LIMIT ?",
+                    ))
+                    .bind(sub.as_str())
+                    .bind(&pattern)
+                    .bind(limit_i64)
+                    .fetch_all(&self.pool)
+                    .await?,
+                }
+            }
+            (Some(sub), false) => match before_seq {
+                Some(s) => {
+                    sqlx::query_as(&format!(
+                        "{select} WHERE subject = ? AND seq < ? ORDER BY seq DESC LIMIT ?",
+                    ))
+                    .bind(sub.as_str())
+                    .bind(s)
+                    .bind(limit_i64)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                None => {
+                    sqlx::query_as(&format!(
+                        "{select} WHERE subject = ? ORDER BY seq DESC LIMIT ?",
+                    ))
+                    .bind(sub.as_str())
+                    .bind(limit_i64)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+            },
+        };
+        rows.into_iter()
+            .map(|r| {
+                let seq = r.seq;
+                r.row.into_event().map(|ev| (seq, ev))
+            })
+            .collect()
+    }
+
+    /// FTS5 full-text search returning the matching event, a snippet of
+    /// the event's `data` column with `<mark>` tags around matched
+    /// terms, and the BM25 rank.
+    ///
+    /// Ordered by BM25 (best match first), in contrast to the existing
+    /// [`EventStore::search`] which orders by `seq ASC` (insertion
+    /// order) for back-compat with the wire-protocol's snapshot view.
+    /// The dashboard wants relevance order; the wire protocol wants
+    /// insertion order. Two methods, two orderings.
+    #[tracing::instrument(skip(self))]
+    pub async fn search_with_snippets(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<SearchHit>, StoreError> {
+        // bm25(fts_view) is SQLite's built-in BM25 ranking; smaller is
+        // a better match, so we ORDER BY ASC. `rank` is a special
+        // hidden FTS5 column, so the alias must avoid that name —
+        // using `bm25_score`. Snippets are computed in Rust (see the
+        // doc comment for why FTS5's snippet() can't be used here).
+        let sql = r#"
+            SELECT
+                e.id, e.source, e.subject, e.event_type, e.time, e.datacontenttype, e.data, e.predecessorhash, e.signature, e.specversion, e.parents, e.attestation,
+                bm25(fts_view) AS bm25_score
+            FROM events e
+            JOIN fts_view ON e.seq = fts_view.rowid
+            WHERE fts_view MATCH ?
+            ORDER BY bm25_score ASC
+            LIMIT ?
+        "#;
+        let rows: Vec<RankedEventRow> = sqlx::query_as(sql)
+            .bind(query)
+            .bind(k as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                let rank = r.bm25_score;
+                r.row.into_event().map(|ev| {
+                    let snippet = compute_snippet(&ev, query);
+                    SearchHit {
+                        event: ev,
+                        snippet,
+                        rank,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Subscribe to live appends. Every successful [`EventStore::append`]
+    /// fans the stored event out to all current subscribers on a 256-slot
+    /// broadcast channel. Slow consumers may receive
+    /// `RecvError::Lagged(n)` and should treat that as a hint to reload
+    /// a recent slice from `read_paginated`.
+    ///
+    /// `subject_pattern` is reserved for future server-side filtering;
+    /// in v0.4 the receiver gets every event and the caller filters
+    /// client-side. Callers that need filtering today should compose a
+    /// `tokio_stream::StreamExt::filter` on the receiver.
+    pub fn subscribe(
+        &self,
+        subject_pattern: Option<&Subject>,
+    ) -> tokio::sync::broadcast::Receiver<Event> {
+        let _ = subject_pattern; // forward-compat: ignored in v0.4
+        self.event_tx.subscribe()
+    }
+
+    // ─── End dashboard surface ───────────────────────────────────────────
 
     /// Get the latest value for a subject from the KV view.
     pub async fn kv_get(&self, subject: &str) -> Result<Option<serde_json::Value>, StoreError> {
@@ -1054,6 +1338,97 @@ struct EventRow {
     parents: Option<String>,
     /// v0.3: raw attestation bytes.
     attestation: Option<Vec<u8>>,
+}
+
+/// `EventRow` plus the row's `seq` column for cursor pagination.
+#[derive(sqlx::FromRow)]
+struct SeqEventRow {
+    seq: i64,
+    #[sqlx(flatten)]
+    row: EventRow,
+}
+
+/// `EventRow` plus the FTS5 `bm25()` output. (The snippet is computed
+/// in Rust — see `search_with_snippets` for why.)
+#[derive(sqlx::FromRow)]
+struct RankedEventRow {
+    #[sqlx(flatten)]
+    row: EventRow,
+    bm25_score: f32,
+}
+
+/// Compute a `<mark>`-tagged snippet of the event's data field around
+/// the first occurrence of any query token. Falls back to the leading
+/// slice if no token is found in the chosen text (can happen when FTS5
+/// matched on subject or event_type rather than data).
+fn compute_snippet(ev: &Event, query: &str) -> String {
+    use std::borrow::Cow;
+    // Prefer `data.content` (the string field most events use). Fall
+    // back to the JSON-stringified data so search hits on non-content
+    // fields still get a snippet.
+    let text: Cow<'_, str> = match ev.data.get("content").and_then(|v| v.as_str()) {
+        Some(s) => Cow::Borrowed(s),
+        None => Cow::Owned(ev.data.to_string()),
+    };
+    simple_snippet(&text, query, 24)
+}
+
+/// Find the first occurrence of any whitespace-separated token of
+/// `query` in `text` (case-insensitive) and return a `<mark>`-wrapped
+/// snippet with `ctx` chars on each side, eliding with `…` where
+/// truncated. Falls back to a leading slice if no token is found.
+fn simple_snippet(text: &str, query: &str, ctx: usize) -> String {
+    let lower = text.to_lowercase();
+    let qlower = query.to_lowercase();
+    let tokens: Vec<&str> = qlower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut best: Option<(usize, usize)> = None; // (byte_pos, byte_len)
+    for tok in &tokens {
+        if let Some(pos) = lower.find(tok) {
+            let len = tok.len();
+            match best {
+                None => best = Some((pos, len)),
+                Some((p, _)) if pos < p => best = Some((pos, len)),
+                _ => {}
+            }
+        }
+    }
+    match best {
+        Some((pos, len)) => {
+            let start = floor_char_boundary(text, pos.saturating_sub(ctx));
+            let end = ceil_char_boundary(text, (pos + len + ctx).min(text.len()));
+            let prefix = if start > 0 { "…" } else { "" };
+            let suffix = if end < text.len() { "…" } else { "" };
+            let before = &text[start..pos];
+            let mid = &text[pos..pos + len];
+            let after = &text[pos + len..end];
+            format!("{prefix}{before}<mark>{mid}</mark>{after}{suffix}")
+        }
+        None => {
+            let end = ceil_char_boundary(text, (ctx * 2).min(text.len()));
+            if end < text.len() {
+                format!("{}…", &text[..end])
+            } else {
+                text.to_string()
+            }
+        }
+    }
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 impl EventRow {

@@ -33,6 +33,7 @@ ctxd-store-core = { path = "../ctxd-store-core" }
 ctxd-cap = { path = "../ctxd-cap" }
 ctxd-mcp = { path = "../ctxd-mcp", features = ["http-transports"] }
 ctxd-http = { path = "../ctxd-http" }
+ctxd-dashboard = { path = "../ctxd-dashboard" }
 ctxd-wire = { path = "../ctxd-wire" }
 ctxd-embed = { path = "../ctxd-embed" }
 # Optional alternate backends — gated by feature flags above.
@@ -61,3 +62,4 @@ tracing-opentelemetry = "0.29"
 [dev-dependencies]
 tempfile = { workspace = true }
 ctxd-store-sqlite = { path = "../ctxd-store-sqlite" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
