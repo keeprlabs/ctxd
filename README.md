@@ -64,6 +64,16 @@ The same flow against a real daemon — write, read, grant, serve. Generated fro
 
 ![ctxd terminal demo](assets/img/terminal.gif)
 
+## Dashboard
+
+```bash
+ctxd dashboard
+```
+
+Opens an embedded web UI at `http://127.0.0.1:7777/`. See your event count fill up, browse the subject tree, search the log, watch new events stream in live via SSE. Read-only by default — writes still go through MCP, the wire protocol, or the CLI. Localhost-only with DNS-rebinding defenses (host-header check, CSP, X-Frame-Options).
+
+If `ctxd serve` is already running, point your browser at `http://127.0.0.1:7777/` directly — the dashboard ships in the daemon, not as a separate process. See [docs/dashboard.md](docs/dashboard.md) for the security model and what each view shows.
+
 ## How it fits
 
 <p align="center">
