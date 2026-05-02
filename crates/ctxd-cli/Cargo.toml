@@ -39,6 +39,17 @@ ctxd-embed = { path = "../ctxd-embed" }
 # Optional alternate backends — gated by feature flags above.
 ctxd-store-postgres = { path = "../ctxd-store-postgres", optional = true }
 ctxd-store-duckobj = { path = "../ctxd-store-duckobj", optional = true }
+# In-process adapter wiring (phase 3B). On by default; an operator
+# who wants a slim binary can disable via `--no-default-features`.
+ctxd-adapter-core = { path = "../ctxd-adapter-core" }
+ctxd-adapter-fs = { path = "../ctxd-adapter-fs" }
+async-trait = "0.1"
+toml = "0.8"
+# Used by the MCP-stdio proxy (phase 2C) to relay JSON-RPC frames
+# from a stdio subprocess up to the running daemon's HTTP MCP
+# transport. rustls-tls is included so the same dep covers
+# integration tests that hit external HTTPS endpoints.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -54,12 +65,22 @@ rmp-serde = "1"
 uuid = { workspace = true }
 chrono = { workspace = true }
 hex = "0.4"
+directories = "5"
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.29"
 
+# Unix-only: pidfile uses kill(pid, 0) for liveness probes.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Linux-only: systemd Type=notify support. No-op on macOS / Windows.
+# Pinned at <0.5 so we keep `sd_notify::notify` taking a slice (the
+# 0.5 surface restructured the API slightly).
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = "0.4"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 ctxd-store-sqlite = { path = "../ctxd-store-sqlite" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

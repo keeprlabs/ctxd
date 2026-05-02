@@ -18,10 +18,10 @@
 
 ```bash
 brew install keeprlabs/tap/ctxd
-ctxd serve
+ctxd onboard
 ```
 
-Now any MCP-aware agent — or one of the [three first-party SDKs](#build-a-client) — can write to `/work/notes/...` and read it back from anywhere else.
+`ctxd onboard` installs ctxd as a background service, configures Claude Desktop / Claude Code / Codex to use it over MCP, mints scoped capability tokens per app, and seeds a baseline `/me/**` so every connected AI starts with non-empty context. One command, two minutes, your AI tools share memory.
 
 ---
 
@@ -37,26 +37,30 @@ ctxd is the place that context lives. Write once over MCP or HTTP, query from an
 # 1. Install
 brew install keeprlabs/tap/ctxd
 
-# 2. Run
-ctxd serve                   # HTTP admin :7777, MCP on stdio
+# 2. One-time setup (installs the daemon as a service,
+#    configures Claude Desktop / Code / Codex)
+ctxd onboard
 
-# 3. Use
+# 3. Use any of your AI tools — they all share the same memory now.
+#    Or write directly via the CLI:
 ctxd write --subject /work/notes/standup --type ctx.note \
   --data '{"content":"Ship auth by Friday"}'
 ctxd read --subject /work --recursive
 ```
 
-Point Claude Desktop at it (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "ctxd": { "command": "/opt/homebrew/bin/ctxd", "args": ["serve", "--mcp-stdio"] }
-  }
-}
-```
+`ctxd onboard` is idempotent — re-running it updates configs and re-mints caps without losing data. Use `ctxd offboard` to fully reverse the install (restore client configs from snapshot, stop the service, optionally delete the DB with `--purge`). See [docs/onboarding.md](docs/onboarding.md) for the full step-by-step.
 
 You now have eight MCP tools wired to your context: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`, `ctx_entities`, `ctx_related`, `ctx_timeline`.
+
+### Foreground / advanced
+
+If you'd rather run ctxd in a terminal tab without installing a service, use `ctxd serve` directly:
+
+```bash
+ctxd serve                   # HTTP admin :7777, MCP on stdio
+```
+
+You'll need to wire Claude Desktop / Code / Codex by hand. The MCP entry is documented in [docs/onboarding.md](docs/onboarding.md#manual-client-config).
 
 ## See it run
 

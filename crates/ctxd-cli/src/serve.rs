@@ -17,7 +17,11 @@ use ctxd_http::router::{allowed_hosts_for_bind, build_router_with_hosts};
 use ctxd_mcp::CtxdMcpServer;
 use ctxd_store::EventStore;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::pidfile::{self, DaemonState, PidFile, PidfileGuard};
+use crate::ready;
 
 /// Configuration for the daemon serve loop.
 ///
@@ -68,6 +72,24 @@ pub struct ServeConfig {
     /// tasks). `false` skips federation entirely — used by `ctxd
     /// dashboard`.
     pub federation: bool,
+
+    /// Path to the SQLite DB the daemon is opened against. `Some`
+    /// enables the pidfile lock (written next to the DB at
+    /// `<db_path>.pid`) and the cross-platform "ready" signal. `None`
+    /// disables both, which is appropriate for in-memory test
+    /// fixtures and the `--storage` non-default backends that don't
+    /// have a single canonical local path.
+    pub db_path: Option<PathBuf>,
+
+    /// Cap-files to read at startup. When the daemon is invoked as
+    /// a stdio subprocess (MCP client spawning `ctxd serve
+    /// --mcp-stdio --cap-file <path>`) and a long-running daemon
+    /// already owns the same DB, the subprocess becomes a
+    /// stdio↔HTTP-MCP proxy using the first cap-file as the bearer
+    /// token (phase 2C). When the daemon is the long-running one
+    /// itself, the cap-files are read but enforcement is deferred
+    /// — they're informational so the doctor can verify them.
+    pub cap_files: Vec<PathBuf>,
 }
 
 /// Run the ctxd daemon with the given configuration.
@@ -112,6 +134,73 @@ pub async fn serve(
     let _ = cfg.storage_uri; // unused for sqlite default path
     let addr: SocketAddr = cfg.bind.parse().context("invalid bind address")?;
     tracing::info!("starting ctxd daemon on {addr}");
+
+    // Pre-flight: if the pidfile alongside our DB names a live
+    // daemon that's still answering /health, refuse to start. This
+    // converts the EADDRINUSE-deep-in-bind footgun (which the user
+    // sees as a stack of context-wrapped IO errors) into a friendly
+    // single-line refusal at the top of the function.
+    //
+    // Special case for phase 2C: if --mcp-stdio + --cap-file are
+    // set, we're a stdio subprocess spawned by an MCP client. In
+    // that case, instead of refusing to start, become a stdio↔HTTP
+    // MCP proxy and forward to the running daemon. This is the
+    // technical key of v0.4 onboarding — without it Claude Desktop
+    // sessions can't share memory with the user's daemon.
+    //
+    // Stale and unresponsive pidfiles are tolerated — we log and
+    // continue. The bind() call below is the actual mutual-exclusion
+    // boundary, and a real port collision still surfaces as EADDRINUSE
+    // with the existing friendly hint in main.rs's `Dashboard` arm.
+    if let Some(db_path) = &cfg.db_path {
+        match pidfile::detect(db_path).await {
+            DaemonState::Running(pf) => {
+                if cfg.mcp_stdio && !cfg.cap_files.is_empty() {
+                    let cap_path = &cfg.cap_files[0];
+                    let cap_b64 = crate::mcp_proxy::read_cap_file(cap_path)
+                        .with_context(|| format!("read cap-file {cap_path:?} for proxy"))?;
+                    tracing::info!(
+                        daemon_pid = pf.pid,
+                        admin = %pf.admin_bind,
+                        "MCP-stdio proxy mode: forwarding to running daemon"
+                    );
+                    return crate::mcp_proxy::run(&pf.admin_bind, &cap_b64)
+                        .await
+                        .context("MCP stdio proxy");
+                }
+                anyhow::bail!(
+                    "ctxd is already running:\n  \
+                     pid:        {pid}\n  \
+                     admin URL:  http://{admin}\n  \
+                     started:    {started}\n  \
+                     version:    {version}\n\n\
+                     Stop it first (`kill {pid}` or `ctxd offboard --service-only`), \
+                     or pass --bind 127.0.0.1:0 with a separate --db to start an \
+                     additional daemon on a different port.",
+                    pid = pf.pid,
+                    admin = pf.admin_bind,
+                    started = pf.started_at.to_rfc3339(),
+                    version = pf.version,
+                );
+            }
+            DaemonState::Unresponsive(pf) => {
+                tracing::warn!(
+                    pid = pf.pid,
+                    admin = %pf.admin_bind,
+                    "another ctxd process holds the pidfile but its /health is \
+                     unresponsive; continuing — bind may fail with EADDRINUSE if it \
+                     actually still owns the port"
+                );
+            }
+            DaemonState::Stale(pf) => {
+                tracing::info!(
+                    pid = pf.pid,
+                    "stale pidfile from prior daemon (pid is dead); will overwrite"
+                );
+            }
+            DaemonState::NotRunning => {}
+        }
+    }
     // Keep the broadcast sender alive for the lifetime of `serve`
     // so future adapters can `.subscribe()` at any point.
     let _approval_tx = pending_approval_tx.clone();
@@ -177,7 +266,39 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind HTTP admin to {addr}"))?;
-    tracing::info!("HTTP admin API + dashboard listening on {addr}");
+    let bound_addr = listener.local_addr().unwrap_or(addr);
+    tracing::info!("HTTP admin API + dashboard listening on {bound_addr}");
+
+    // Pidfile is written **after** bind succeeds (so we don't lie if
+    // bind fails) but **before** we spawn the serve task (so any
+    // observer who saw the marker line below can rely on the
+    // pidfile being present). The guard removes the file on Drop —
+    // including on the panic / cancellation paths — so long as it
+    // still names this PID. `None` means we're a transient (in-memory
+    // tests, --storage non-default) and skip the pidfile entirely.
+    let _pidfile_guard = if let Some(db_path) = cfg.db_path.as_deref() {
+        let pf = PidFile {
+            pid: std::process::id(),
+            admin_bind: bound_addr.to_string(),
+            wire_bind: cfg.wire_bind.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: chrono::Utc::now(),
+            db_path: db_path.to_string_lossy().into_owned(),
+        };
+        Some(PidfileGuard::install(db_path, &pf).context("install pidfile")?)
+    } else {
+        None
+    };
+
+    // Notify launchd / systemd / external pollers that the daemon
+    // has finished startup. On Linux this fires `READY=1` so a
+    // `Type=notify` unit transitions out of activating; on macOS we
+    // emit a parseable stderr marker line that launchd's
+    // StandardErrorPath can be tailed for.
+    let admin_url = format!("http://{bound_addr}");
+    let wire_url_owned = cfg.wire_bind.as_deref().map(|w| format!("tcp://{w}"));
+    ready::signal_ready(&admin_url, wire_url_owned.as_deref());
+
     let http_handle = tokio::spawn(async move {
         let _ = axum::serve(
             listener,
@@ -344,11 +465,39 @@ pub async fn serve(
         None
     };
 
+    // Phase 3B: spawn in-process adapters declared in skills.toml
+    // (under <config_dir>/ctxd/skills.toml). Each enabled adapter
+    // becomes a tokio task using a daemon-owned StoreSink. Failures
+    // are logged but do not crash the daemon.
+    let adapter_handles = match crate::onboard::paths::config_dir() {
+        Ok(cfg_dir) => {
+            let manifest_path = cfg_dir.join("skills.toml");
+            match crate::onboard::adapter_runtime::spawn_enabled(&store, &manifest_path) {
+                Ok(handles) => {
+                    if !handles.is_empty() {
+                        tracing::info!(
+                            count = handles.len(),
+                            manifest = %manifest_path.to_string_lossy(),
+                            "spawned in-process adapters"
+                        );
+                    }
+                    handles
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to spawn adapters from skills.toml; continuing without");
+                    Vec::new()
+                }
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
     // Wait on whichever transports we started. The HTTP admin
     // API is always running; we always join its handle. The
     // wire protocol may be present depending on cfg. MCP
     // transports are optional — join when present.
     let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![http_handle];
+    handles.extend(adapter_handles);
     if let Some(h) = wire_handle {
         handles.push(h);
     }
