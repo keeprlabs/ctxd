@@ -296,6 +296,11 @@ fn step_service_install(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
             cfg.bind.clone(),
             "--wire-bind".into(),
             cfg.wire_bind.clone(),
+            // Enable HTTP MCP transport so phase 2C's stdio→HTTP
+            // proxy in subprocess-spawned `ctxd serve --mcp-stdio`
+            // calls has somewhere to forward to. Convention: 7780.
+            "--mcp-http".into(),
+            "127.0.0.1:7780".into(),
         ],
         at_login: cfg.at_login,
         working_dir,

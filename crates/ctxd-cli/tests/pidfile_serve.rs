@@ -61,6 +61,7 @@ fn cfg_for(db_path: &Path, bind: &str) -> ServeConfig {
         storage_uri: None,
         federation: false,
         db_path: Some(db_path.to_path_buf()),
+        cap_files: vec![],
     }
 }
 

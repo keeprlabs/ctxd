@@ -605,6 +605,7 @@ async fn main() -> Result<()> {
                 storage_uri,
                 federation: true,
                 db_path: Some(cli.db.clone()),
+                cap_files: cap_file,
             };
             ctxd_cli::serve::serve(cfg, store, cap_engine, caveat_state, pending_approval_tx)
                 .await?;
@@ -630,6 +631,7 @@ async fn main() -> Result<()> {
                 storage_uri: None,
                 federation: false,
                 db_path: Some(cli.db.clone()),
+                cap_files: vec![],
             };
             // Spawn a deferred opener that fires once the bind has
             // had a moment to come up. Doing this *before* the

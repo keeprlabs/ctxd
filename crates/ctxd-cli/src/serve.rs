@@ -80,6 +80,16 @@ pub struct ServeConfig {
     /// fixtures and the `--storage` non-default backends that don't
     /// have a single canonical local path.
     pub db_path: Option<PathBuf>,
+
+    /// Cap-files to read at startup. When the daemon is invoked as
+    /// a stdio subprocess (MCP client spawning `ctxd serve
+    /// --mcp-stdio --cap-file <path>`) and a long-running daemon
+    /// already owns the same DB, the subprocess becomes a
+    /// stdio↔HTTP-MCP proxy using the first cap-file as the bearer
+    /// token (phase 2C). When the daemon is the long-running one
+    /// itself, the cap-files are read but enforcement is deferred
+    /// — they're informational so the doctor can verify them.
+    pub cap_files: Vec<PathBuf>,
 }
 
 /// Run the ctxd daemon with the given configuration.
@@ -131,6 +141,13 @@ pub async fn serve(
     // sees as a stack of context-wrapped IO errors) into a friendly
     // single-line refusal at the top of the function.
     //
+    // Special case for phase 2C: if --mcp-stdio + --cap-file are
+    // set, we're a stdio subprocess spawned by an MCP client. In
+    // that case, instead of refusing to start, become a stdio↔HTTP
+    // MCP proxy and forward to the running daemon. This is the
+    // technical key of v0.4 onboarding — without it Claude Desktop
+    // sessions can't share memory with the user's daemon.
+    //
     // Stale and unresponsive pidfiles are tolerated — we log and
     // continue. The bind() call below is the actual mutual-exclusion
     // boundary, and a real port collision still surfaces as EADDRINUSE
@@ -138,6 +155,19 @@ pub async fn serve(
     if let Some(db_path) = &cfg.db_path {
         match pidfile::detect(db_path).await {
             DaemonState::Running(pf) => {
+                if cfg.mcp_stdio && !cfg.cap_files.is_empty() {
+                    let cap_path = &cfg.cap_files[0];
+                    let cap_b64 = crate::mcp_proxy::read_cap_file(cap_path)
+                        .with_context(|| format!("read cap-file {cap_path:?} for proxy"))?;
+                    tracing::info!(
+                        daemon_pid = pf.pid,
+                        admin = %pf.admin_bind,
+                        "MCP-stdio proxy mode: forwarding to running daemon"
+                    );
+                    return crate::mcp_proxy::run(&pf.admin_bind, &cap_b64)
+                        .await
+                        .context("MCP stdio proxy");
+                }
                 anyhow::bail!(
                     "ctxd is already running:\n  \
                      pid:        {pid}\n  \

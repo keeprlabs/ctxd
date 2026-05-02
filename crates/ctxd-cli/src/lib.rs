@@ -8,6 +8,7 @@
 
 pub mod embedder;
 pub mod federation;
+pub mod mcp_proxy;
 pub mod onboard;
 pub mod pidfile;
 pub mod protocol;
