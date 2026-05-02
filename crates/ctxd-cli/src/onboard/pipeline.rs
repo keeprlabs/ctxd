@@ -110,7 +110,7 @@ pub async fn onboard(cfg: PipelineConfig) -> Result<Outcome> {
     let emitter = Emitter::new(cfg.mode);
 
     // Step 1 (after snapshot pre-flight): service-install.
-    step_snapshot(&cfg, &emitter)?;
+    step_snapshot(&cfg, &emitter).await?;
     step_service_install(&cfg, &emitter)?;
     step_service_start(&cfg, &emitter).await?;
     step_configure_clients(&cfg, &emitter)?;
@@ -129,10 +129,45 @@ pub async fn onboard(cfg: PipelineConfig) -> Result<Outcome> {
     Ok(outcome)
 }
 
-/// Reverse what onboard did. Stops the service and removes the
-/// unit file. With `purge`, also removes the SQLite DB. Idempotent.
+/// Reverse what onboard did. Restores client config files from the
+/// most recent snapshot, stops + uninstalls the service, and (with
+/// `purge`) removes the SQLite DB. Idempotent.
 pub async fn offboard(cfg: PipelineConfig, purge: bool) -> Result<()> {
     let emitter = Emitter::new(cfg.mode);
+
+    // Restore client configs from the most recent snapshot. This is
+    // the part that makes offboard "actually undo what we did" rather
+    // than "best-effort delete." On a clean system (no snapshot)
+    // it's a no-op.
+    if !cfg.dry_run {
+        match crate::onboard::snapshot::latest_snapshot()? {
+            Some(p) => match crate::onboard::snapshot::read(&p) {
+                Ok(snap) => {
+                    let report = crate::onboard::snapshot::restore(&snap)?;
+                    emitter.step_ok(
+                        StepName::ConfigureClients,
+                        serde_json::json!({
+                            "action": "restored-from-snapshot",
+                            "snapshot": p.to_string_lossy(),
+                            "restored": report.restored,
+                            "skipped": report.skipped,
+                        }),
+                    );
+                }
+                Err(e) => emitter.error(
+                    StepName::ConfigureClients,
+                    format!("could not read snapshot: {e}"),
+                    Some(format!("`rm {}` and re-run offboard", p.to_string_lossy())),
+                ),
+            },
+            None => emitter.step_skipped(
+                StepName::ConfigureClients,
+                "no snapshot found — onboard never ran or snapshots were deleted",
+            ),
+        }
+    } else {
+        emitter.step_skipped(StepName::ConfigureClients, "dry-run");
+    }
 
     // Stop + uninstall the service. Skipped on unsupported platforms.
     if cfg.skip_service || !service::is_supported() {
@@ -184,14 +219,40 @@ pub async fn offboard(cfg: PipelineConfig, purge: bool) -> Result<()> {
 
 // ---- step implementations ------------------------------------------
 
-fn step_snapshot(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+async fn step_snapshot(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
     if !cfg.includes(StepName::Snapshot) {
         return Ok(());
     }
     emitter.step_started(StepName::Snapshot);
-    emitter.step_skipped(
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::Snapshot, "dry-run");
+        return Ok(());
+    }
+    let snap = crate::onboard::snapshot::capture(&cfg.db_path)
+        .await
+        .with_context_msg("capture snapshot")?;
+    let path = crate::onboard::snapshot::persist(&snap).with_context_msg("persist snapshot")?;
+    let running = snap.running_daemon.as_ref().map(|d| {
+        serde_json::json!({
+            "pid": d.pid,
+            "admin_url": format!("http://{}", d.admin_bind),
+            "version": d.version,
+        })
+    });
+    let existing_clients: Vec<&str> = snap
+        .client_configs
+        .iter()
+        .filter(|c| c.existed)
+        .map(|c| c.client.as_str())
+        .collect();
+    emitter.step_ok(
         StepName::Snapshot,
-        "phase 3A — pre-flight snapshot not yet wired",
+        serde_json::json!({
+            "snapshot_path": path.to_string_lossy(),
+            "running_daemon": running,
+            "existing_clients": existing_clients,
+            "captured_configs": snap.client_configs.len(),
+        }),
     );
     Ok(())
 }
