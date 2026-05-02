@@ -18,5 +18,6 @@
 
 pub mod doctor;
 pub mod paths;
+pub mod pipeline;
 pub mod protocol;
 pub mod service;

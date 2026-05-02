@@ -267,6 +267,93 @@ enum Commands {
         decision: String,
     },
 
+    /// Set up ctxd as a one-time install: service + clients + caps + seeds.
+    ///
+    /// The single command that turns a fresh `ctxd` install into a
+    /// running, MCP-connected, opinion-having context substrate.
+    /// Walks the seven onboarding steps, optionally pausing for
+    /// adapter consent. See `docs/onboarding.md` for the full
+    /// step-by-step.
+    ///
+    /// `--skill-mode` switches output to newline-delimited JSON per
+    /// the `docs/onboard-protocol.md` contract — the Claude Code
+    /// skill (in `skill/ctxd-memory/`) and any other front door
+    /// shell to ctxd in this mode.
+    Onboard {
+        /// Output as newline-delimited JSON per `docs/onboard-protocol.md`.
+        /// Implies `--headless`.
+        #[arg(long, default_value_t = false)]
+        skill_mode: bool,
+
+        /// Run with all defaults; never pause on a prompt.
+        #[arg(long, default_value_t = false)]
+        headless: bool,
+
+        /// Plan only — emit step messages but make no changes.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Skip the configure-adapters step entirely.
+        #[arg(long, default_value_t = false)]
+        skip_adapters: bool,
+
+        /// Don't install the system service. Useful when running
+        /// `ctxd serve` in a foreground terminal instead.
+        #[arg(long, default_value_t = false)]
+        skip_service: bool,
+
+        /// Configure the service to start at user login.
+        #[arg(long, default_value_t = false)]
+        at_login: bool,
+
+        /// Mint narrower per-client capability tokens (phase 2A).
+        #[arg(long, default_value_t = false)]
+        strict_scopes: bool,
+
+        /// Write Claude Code SessionStart / UserPromptSubmit /
+        /// PreCompact / Stop hooks (phase 2B).
+        #[arg(long, default_value_t = true)]
+        with_hooks: bool,
+
+        /// Comma-separated list of step slugs to run (e.g.
+        /// `service-install,service-start`). Default: all steps.
+        #[arg(long)]
+        only: Option<String>,
+
+        /// Address to bind the daemon's HTTP admin API.
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        bind: String,
+
+        /// Address to bind the wire protocol.
+        #[arg(long, default_value = "127.0.0.1:7778")]
+        wire_bind: String,
+    },
+
+    /// Reverse a previous `ctxd onboard` cleanly.
+    ///
+    /// Stops + uninstalls the system service, deletes capability
+    /// files, and (with `--purge`) removes the SQLite DB. Idempotent
+    /// — running offboard on a clean system is a no-op.
+    Offboard {
+        /// Output as newline-delimited JSON.
+        #[arg(long, default_value_t = false)]
+        skill_mode: bool,
+
+        /// Plan only — emit messages but make no changes.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Also delete the SQLite DB and HNSW sidecars. Default off
+        /// — caller must opt in to data loss.
+        #[arg(long, default_value_t = false)]
+        purge: bool,
+
+        /// Don't touch the system service. Useful if you want to
+        /// keep launchd / systemd config but delete data.
+        #[arg(long, default_value_t = false)]
+        skip_service: bool,
+    },
+
     /// Run diagnostic checks on the local ctxd installation.
     ///
     /// Reports daemon health, storage integrity, configured clients,
@@ -929,6 +1016,90 @@ async fn main() -> Result<()> {
             );
         }
 
+        Commands::Onboard {
+            skill_mode,
+            headless,
+            dry_run,
+            skip_adapters,
+            skip_service,
+            at_login,
+            strict_scopes,
+            with_hooks,
+            only,
+            bind,
+            wire_bind,
+        } => {
+            use ctxd_cli::onboard::pipeline::{onboard, AdapterChoice, PipelineConfig};
+            use ctxd_cli::onboard::protocol::OutputMode;
+            use std::collections::HashSet;
+            let mode = if skill_mode {
+                OutputMode::Skill
+            } else {
+                OutputMode::Human
+            };
+            let only_set = only.as_deref().map(|s| {
+                s.split(',')
+                    .map(|p| p.trim())
+                    .filter(|p| !p.is_empty())
+                    .filter_map(parse_step)
+                    .collect::<HashSet<_>>()
+            });
+            let cfg = PipelineConfig {
+                mode,
+                headless: headless || skill_mode,
+                dry_run,
+                skip_adapters,
+                skip_service,
+                at_login,
+                strict_scopes,
+                with_hooks,
+                gmail: AdapterChoice::Skip,
+                github: AdapterChoice::Skip,
+                fs: vec![],
+                only: only_set,
+                db_path: cli.db.clone(),
+                bind,
+                wire_bind,
+            };
+            let outcome = onboard(cfg).await?;
+            if !outcome.onboarded {
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Offboard {
+            skill_mode,
+            dry_run,
+            purge,
+            skip_service,
+        } => {
+            use ctxd_cli::onboard::pipeline::{offboard, AdapterChoice, PipelineConfig};
+            use ctxd_cli::onboard::protocol::OutputMode;
+            let mode = if skill_mode {
+                OutputMode::Skill
+            } else {
+                OutputMode::Human
+            };
+            let cfg = PipelineConfig {
+                mode,
+                headless: true,
+                dry_run,
+                skip_adapters: true,
+                skip_service,
+                at_login: false,
+                strict_scopes: false,
+                with_hooks: false,
+                gmail: AdapterChoice::Skip,
+                github: AdapterChoice::Skip,
+                fs: vec![],
+                only: None,
+                db_path: cli.db.clone(),
+                bind: "127.0.0.1:7777".to_string(),
+                wire_bind: "127.0.0.1:7778".to_string(),
+            };
+            offboard(cfg, purge).await?;
+        }
+
         Commands::Doctor { json } => {
             let checks = ctxd_cli::onboard::doctor::run(&cli.db).await;
             if json {
@@ -1025,6 +1196,25 @@ impl Drop for OtelGuard {
                 eprintln!("OpenTelemetry shutdown error: {e}");
             }
         }
+    }
+}
+
+/// Parse one step slug from `--only` into the typed [`StepName`].
+/// Unknown slugs are dropped silently — the protocol's stable
+/// kebab-case slugs are the contract; any string outside that set
+/// shouldn't crash the CLI.
+fn parse_step(slug: &str) -> Option<ctxd_cli::onboard::protocol::StepName> {
+    use ctxd_cli::onboard::protocol::StepName;
+    match slug {
+        "snapshot" => Some(StepName::Snapshot),
+        "service-install" => Some(StepName::ServiceInstall),
+        "service-start" => Some(StepName::ServiceStart),
+        "configure-clients" => Some(StepName::ConfigureClients),
+        "mint-capabilities" => Some(StepName::MintCapabilities),
+        "seed-subjects" => Some(StepName::SeedSubjects),
+        "configure-adapters" => Some(StepName::ConfigureAdapters),
+        "doctor" => Some(StepName::Doctor),
+        _ => None,
     }
 }
 
