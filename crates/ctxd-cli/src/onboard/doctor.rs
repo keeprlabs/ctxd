@@ -20,6 +20,7 @@
 //! render a stable checklist regardless of which phases have shipped.
 
 use crate::onboard::caps::{self, ClientId};
+use crate::onboard::clients::{ClaudeCode, ClaudeDesktop, ClientSpec, ClientWriter, Codex};
 use crate::onboard::paths;
 use crate::onboard::service::{self, ServiceStatus};
 use crate::pidfile::{self, DaemonState};
@@ -114,18 +115,17 @@ pub async fn run(db_path: &Path) -> Vec<Check> {
     // in its phase. Listed in pipeline order to match the protocol's
     // `step` taxonomy.
     checks.push(check_service_installed());
-    checks.push(stub(
+    checks.push(check_client_config(
+        db_path,
+        &ClaudeDesktop,
         "claude-desktop-config",
-        "phase 2B — client config writers not yet wired",
     ));
-    checks.push(stub(
+    checks.push(check_client_config(
+        db_path,
+        &ClaudeCode,
         "claude-code-config",
-        "phase 2B — client config writers not yet wired",
     ));
-    checks.push(stub(
-        "codex-config",
-        "phase 2B — Codex paste-instructions writer not yet wired",
-    ));
+    checks.push(check_client_config(db_path, &Codex, "codex-config"));
     checks.push(check_caps_valid(db_path).await);
     checks.push(stub(
         "adapters",
@@ -346,6 +346,82 @@ fn check_service_installed() -> Check {
             name: "service-installed".into(),
             status: CheckStatus::Failed,
             remediation: Some(format!("service backend ({}) error", backend.name())),
+            detail: serde_json::json!({"error": e.to_string()}),
+        },
+    }
+}
+
+/// `<client>-config` — the client's settings file contains an
+/// `mcpServers.ctxd` entry that matches what onboard would write
+/// today (i.e. same binary, same DB, same cap-file pointer).
+fn check_client_config(db_path: &Path, writer: &dyn ClientWriter, name: &str) -> Check {
+    let binary = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            return Check {
+                name: name.into(),
+                status: CheckStatus::Failed,
+                remediation: Some("could not resolve current ctxd binary".into()),
+                detail: serde_json::json!({"error": e.to_string()}),
+            };
+        }
+    };
+    let spec = ClientSpec {
+        binary,
+        db_path: db_path.to_path_buf(),
+        with_hooks: false,
+    };
+    let path = match writer.config_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Check {
+                name: name.into(),
+                status: CheckStatus::Failed,
+                remediation: Some("could not resolve client config path".into()),
+                detail: serde_json::json!({"error": e.to_string()}),
+            };
+        }
+    };
+    // Codex is special: its writer reports verify=true when the
+    // snippet file we wrote is on disk, but it doesn't represent the
+    // user actually pasting it. Surface as `Warn` (with manual-pending
+    // wording in remediation) rather than `Ok` so the user knows.
+    let is_codex = matches!(writer.client_id(), ClientId::Codex);
+    match writer.verify(&spec) {
+        Ok(true) => Check {
+            name: name.into(),
+            status: if is_codex {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Ok
+            },
+            remediation: if is_codex {
+                Some(format!(
+                    "Codex requires a manual paste — see {}",
+                    path.to_string_lossy()
+                ))
+            } else {
+                None
+            },
+            detail: serde_json::json!({"path": path.to_string_lossy()}),
+        },
+        Ok(false) => Check {
+            name: name.into(),
+            status: if writer.detect() {
+                CheckStatus::Failed
+            } else {
+                CheckStatus::Skipped
+            },
+            remediation: Some(format!(
+                "{} not configured — run `ctxd onboard --only configure-clients`",
+                writer.client_id().display()
+            )),
+            detail: serde_json::json!({"path": path.to_string_lossy(), "detected": writer.detect()}),
+        },
+        Err(e) => Check {
+            name: name.into(),
+            status: CheckStatus::Failed,
+            remediation: Some("could not verify client config".into()),
             detail: serde_json::json!({"error": e.to_string()}),
         },
     }

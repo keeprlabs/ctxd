@@ -17,6 +17,7 @@
 //! against a stable contract in parallel.
 
 pub mod caps;
+pub mod clients;
 pub mod doctor;
 pub mod paths;
 pub mod pipeline;

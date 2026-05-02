@@ -33,6 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::onboard::caps::{self, ClientId};
+use crate::onboard::clients::{self, ApplyAction, ClientSpec};
 use crate::onboard::doctor;
 use crate::onboard::paths;
 use crate::onboard::protocol::{DoctorSummary, Emitter, Outcome, OutputMode, StepName, StepStatus};
@@ -323,11 +324,75 @@ fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()>
         return Ok(());
     }
     emitter.step_started(StepName::ConfigureClients);
-    emitter.step_skipped(
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::ConfigureClients, "dry-run");
+        return Ok(());
+    }
+    let binary = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not resolve current ctxd binary: {e}"))?;
+    let spec = ClientSpec {
+        binary,
+        db_path: cfg.db_path.clone(),
+        with_hooks: cfg.with_hooks,
+    };
+    let results = clients::apply_all(&spec);
+    let mut summary = serde_json::Map::new();
+    let mut config_paths = Vec::new();
+    for (cid, res) in &results {
+        let label = cid.slug();
+        match res {
+            Ok(action) => {
+                let s = match action {
+                    ApplyAction::Created => "configured",
+                    ApplyAction::EntryAdded => "configured",
+                    ApplyAction::EntryUpdated => "configured",
+                    ApplyAction::Unchanged => "configured",
+                    ApplyAction::ManualPending => "manual-pending",
+                };
+                summary.insert(label.to_string(), serde_json::Value::String(s.into()));
+            }
+            Err(e) => {
+                summary.insert(
+                    label.to_string(),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+            }
+        }
+    }
+    // Best-effort path collection — used by the skill's UI to deep-link.
+    for cid in [
+        ClientId::ClaudeDesktop,
+        ClientId::ClaudeCode,
+        ClientId::Codex,
+    ] {
+        if let Some(p) = path_for_client(cid) {
+            config_paths.push(p);
+        }
+    }
+    emitter.step_ok(
         StepName::ConfigureClients,
-        "phase 2B — Claude Desktop / Code / Codex writers not yet wired",
+        serde_json::json!({
+            "clients": serde_json::Value::Object(summary),
+            "config_paths": config_paths,
+            "with_hooks": cfg.with_hooks,
+        }),
     );
     Ok(())
+}
+
+fn path_for_client(cid: ClientId) -> Option<String> {
+    match cid {
+        ClientId::ClaudeDesktop => paths::claude_desktop_config()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        ClientId::ClaudeCode => paths::claude_code_config()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        ClientId::Codex => paths::config_dir()
+            .ok()
+            .map(|p| p.join("codex.snippet.toml").to_string_lossy().into_owned()),
+        _ => None,
+    }
 }
 
 async fn step_mint_capabilities(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
