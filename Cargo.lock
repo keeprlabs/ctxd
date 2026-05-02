@@ -1142,6 +1142,7 @@ dependencies = [
  "ctxd-store-sqlite",
  "ctxd-wire",
  "directories",
+ "futures",
  "hex",
  "libc",
  "opentelemetry",

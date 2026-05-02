@@ -226,6 +226,35 @@ enum Commands {
         public_key: String,
     },
 
+    /// Live tail of new events, optionally filtered by subject pattern.
+    ///
+    /// Connects to the running daemon's `/v1/events/stream` SSE endpoint
+    /// and prints each event as one JSON Line on stdout. Exits when
+    /// stdin closes (or on the configured timeout). Used by the
+    /// `ctxd-memory` skill's first-use demo: skill says "open Claude
+    /// Desktop, say X, come back," then runs
+    /// `ctxd watch /me/preferences --timeout 30s` to confirm the write
+    /// landed within a window.
+    Watch {
+        /// Subject pattern to filter on (substring match against the
+        /// event's subject path). Empty = all events.
+        #[arg(default_value = "")]
+        pattern: String,
+
+        /// Connect to this admin URL. Defaults to the pidfile-resolved
+        /// daemon at `<db_path>.pid`.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Stop after this many seconds. Default: forever.
+        #[arg(long)]
+        timeout_s: Option<u64>,
+
+        /// Stop after this many matching events.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
     /// Receive a Claude Code hook payload on stdin and append it to the
     /// event log under `/me/sessions/<slug>`.
     ///
@@ -1167,6 +1196,139 @@ async fn main() -> Result<()> {
                 wire_bind: "127.0.0.1:7778".to_string(),
             };
             offboard(cfg, purge).await?;
+        }
+
+        Commands::Watch {
+            pattern,
+            url,
+            timeout_s,
+            limit,
+        } => {
+            // Resolve the daemon URL: explicit --url overrides; else
+            // read the pidfile alongside --db.
+            let admin_url = match url {
+                Some(u) => u,
+                None => {
+                    let pf = ctxd_cli::pidfile::read(&cli.db).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no pidfile at {} — daemon not running, or pass --url",
+                            ctxd_cli::pidfile::pidfile_path(&cli.db).to_string_lossy()
+                        )
+                    })?;
+                    format!("http://{}", pf.admin_bind)
+                }
+            };
+            let host_header = admin_url
+                .strip_prefix("http://")
+                .or_else(|| admin_url.strip_prefix("https://"))
+                .unwrap_or(&admin_url)
+                .to_string();
+            // Raw TCP + manual HTTP/1.1 request. We can't use
+            // reqwest's bytes_stream() here because hyper buffers
+            // chunked-transfer responses opaquely on some macOS
+            // builds, never delivering bytes until the connection
+            // closes — which never happens for an SSE stream.
+            // Loopback-only, no TLS needed.
+            let connect_target = host_header.clone();
+            let mut tcp_stream = tokio::net::TcpStream::connect(&connect_target)
+                .await
+                .with_context(|| format!("connect to {connect_target}"))?;
+            let req_line = format!(
+                "GET /v1/events/stream HTTP/1.1\r\n\
+                 Host: {host_header}\r\n\
+                 Accept: text/event-stream\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n"
+            );
+            use tokio::io::AsyncWriteExt;
+            tcp_stream
+                .write_all(req_line.as_bytes())
+                .await
+                .context("write SSE request")?;
+            tcp_stream.flush().await.context("flush SSE request")?;
+            let mut buf = String::new();
+            let deadline =
+                timeout_s.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+            let mut emitted = 0usize;
+            'outer: loop {
+                if let Some(d) = deadline {
+                    if std::time::Instant::now() >= d {
+                        break;
+                    }
+                }
+                use tokio::io::AsyncReadExt;
+                let mut chunk_buf = [0u8; 4096];
+                let n = if let Some(d) = deadline {
+                    let remaining = d.saturating_duration_since(std::time::Instant::now());
+                    match tokio::time::timeout(remaining, tcp_stream.read(&mut chunk_buf)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => return Err(e).context("read SSE bytes"),
+                        Err(_) => break,
+                    }
+                } else {
+                    match tcp_stream.read(&mut chunk_buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => return Err(e).context("read SSE bytes"),
+                    }
+                };
+                buf.push_str(&String::from_utf8_lossy(&chunk_buf[..n]));
+                // Normalise CRLF to LF so the frame split tolerates
+                // both axum/hyper's \r\n\r\n and bare \n\n.
+                buf = buf.replace("\r\n", "\n");
+                // Hyper sends chunked transfer encoding, interleaving
+                // hex chunk-size lines with SSE framing. Rather than
+                // parse chunked encoding by hand, scan for `data:`
+                // lines anywhere in the buffer — chunk-size lines
+                // are pure hex and never start with "data:".
+                while let Some(start) = buf.find("data:") {
+                    let after = &buf[start..];
+                    let nl = match after.find('\n') {
+                        Some(n) => n,
+                        None => break, // partial; wait for more bytes
+                    };
+                    let line = &after[..nl];
+                    let payload = line
+                        .strip_prefix("data:")
+                        .map(|s| s.trim_start())
+                        .unwrap_or("")
+                        .to_string();
+                    let consumed = start + nl + 1;
+                    buf.drain(..consumed);
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&payload);
+                    let matched = if pattern.is_empty() {
+                        parsed.is_ok()
+                    } else {
+                        parsed
+                            .as_ref()
+                            .ok()
+                            .and_then(|v| {
+                                v.get("subject").and_then(|s| s.as_str()).map(String::from)
+                            })
+                            .map(|s| s.contains(&pattern))
+                            .unwrap_or(false)
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    println!("{payload}");
+                    emitted += 1;
+                    if let Some(l) = limit {
+                        if emitted >= l {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            // Exit code conveys whether anything matched, so scripts
+            // can branch on "watcher saw 0 events" vs "watcher saw N."
+            if emitted == 0 {
+                std::process::exit(2);
+            }
         }
 
         Commands::Hook { slug, cap_file } => {

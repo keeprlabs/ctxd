@@ -184,13 +184,39 @@ The whole point of all that setup. Tell the user:
 >    TypeScript for new projects."**
 > 2. Come back here and press enter.
 
-After they press enter, run:
+Before they press enter, kick off a 30-second watcher in a
+background shell. The watcher subscribes to the running daemon's
+SSE stream and waits for one matching event:
+
+```bash
+ctxd watch /me/preferences --timeout-s 30 --limit 1
+```
+
+This blocks until either an event lands at `/me/preferences*` or
+the timeout elapses. When an event arrives, the watcher prints one
+JSON Line on stdout and exits 0. Otherwise it exits 2.
+
+After they press enter, the watcher's output is the proof. Show
+them the captured event:
+
+```json
+{
+  "id": "...",
+  "subject": "/me/preferences",
+  "type": "ctx.note",
+  "data": { "text": "user prefers TypeScript for new projects" },
+  "source": "claude-desktop://...",
+  "time": "..."
+}
+```
+
+For a wider view, you can also run:
 
 ```bash
 ctxd query 'FROM e IN events WHERE e.subject LIKE "/me/preferences/%" ORDER BY e.time DESC LIMIT 3'
 ```
 
-Show the user the resulting events. They should see:
+Which surfaces the seed event alongside the new one:
 
 ```json
 [
