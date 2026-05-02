@@ -435,11 +435,39 @@ pub async fn serve(
         None
     };
 
+    // Phase 3B: spawn in-process adapters declared in skills.toml
+    // (under <config_dir>/ctxd/skills.toml). Each enabled adapter
+    // becomes a tokio task using a daemon-owned StoreSink. Failures
+    // are logged but do not crash the daemon.
+    let adapter_handles = match crate::onboard::paths::config_dir() {
+        Ok(cfg_dir) => {
+            let manifest_path = cfg_dir.join("skills.toml");
+            match crate::onboard::adapter_runtime::spawn_enabled(&store, &manifest_path) {
+                Ok(handles) => {
+                    if !handles.is_empty() {
+                        tracing::info!(
+                            count = handles.len(),
+                            manifest = %manifest_path.to_string_lossy(),
+                            "spawned in-process adapters"
+                        );
+                    }
+                    handles
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to spawn adapters from skills.toml; continuing without");
+                    Vec::new()
+                }
+            }
+        }
+        Err(_) => Vec::new(),
+    };
+
     // Wait on whichever transports we started. The HTTP admin
     // API is always running; we always join its handle. The
     // wire protocol may be present depending on cfg. MCP
     // transports are optional — join when present.
     let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![http_handle];
+    handles.extend(adapter_handles);
     if let Some(h) = wire_handle {
         handles.push(h);
     }

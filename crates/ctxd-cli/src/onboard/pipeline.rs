@@ -589,9 +589,65 @@ fn step_configure_adapters(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()
         emitter.step_skipped(StepName::ConfigureAdapters, "--skip-adapters");
         return Ok(());
     }
-    emitter.step_skipped(
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::ConfigureAdapters, "dry-run");
+        return Ok(());
+    }
+
+    // Read existing manifest so we don't clobber sibling adapter
+    // entries (e.g. the user enabled gmail by hand and we're only
+    // updating fs).
+    let mut manifest = crate::onboard::skills_toml::read().unwrap_or_default();
+    let mut summary = serde_json::Map::new();
+    let mut enabled_slugs = Vec::<String>::new();
+
+    // fs adapter: enabled iff the user passed --fs=<paths>.
+    if cfg.fs.is_empty() {
+        // Disable the entry if it existed before; we don't silently
+        // keep an old config when the user re-runs onboard without
+        // the flag.
+        manifest.fs = Some(crate::onboard::skills_toml::FsSkill {
+            enabled: false,
+            paths: vec![],
+        });
+        summary.insert("fs".into(), serde_json::Value::String("skipped".into()));
+    } else {
+        manifest.fs = Some(crate::onboard::skills_toml::FsSkill {
+            enabled: true,
+            paths: cfg.fs.clone(),
+        });
+        summary.insert(
+            "fs".into(),
+            serde_json::json!({"enabled": true, "paths": cfg.fs}),
+        );
+        enabled_slugs.push("fs".into());
+    }
+
+    // Gmail / GitHub: declared in manifest but spawn is deferred to
+    // the next 3B drop (OAuth + PAT plumbing). The doctor will
+    // surface them as `manual-pending` until then.
+    if !matches!(cfg.gmail, AdapterChoice::Skip) {
+        summary.insert(
+            "gmail".into(),
+            serde_json::Value::String("manual-pending".into()),
+        );
+    }
+    if !matches!(cfg.github, AdapterChoice::Skip) {
+        summary.insert(
+            "github".into(),
+            serde_json::Value::String("manual-pending".into()),
+        );
+    }
+
+    let path =
+        crate::onboard::skills_toml::write(&manifest).with_context_msg("write skills.toml")?;
+    emitter.step_ok(
         StepName::ConfigureAdapters,
-        "phase 3B — adapter spawning not yet wired",
+        serde_json::json!({
+            "skills_toml": path.to_string_lossy(),
+            "adapters": serde_json::Value::Object(summary),
+            "enabled_slugs": enabled_slugs,
+        }),
     );
     Ok(())
 }

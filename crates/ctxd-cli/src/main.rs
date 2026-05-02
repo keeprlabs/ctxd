@@ -371,6 +371,12 @@ enum Commands {
         /// Address to bind the wire protocol.
         #[arg(long, default_value = "127.0.0.1:7778")]
         wire_bind: String,
+
+        /// Comma- or repeat-separated absolute paths to watch with
+        /// the in-process fs adapter. Empty = skip. Each path
+        /// landing in `/me/fs/<relative-path>`.
+        #[arg(long, value_delimiter = ',')]
+        fs: Vec<PathBuf>,
     },
 
     /// Reverse a previous `ctxd onboard` cleanly.
@@ -1088,6 +1094,7 @@ async fn main() -> Result<()> {
             only,
             bind,
             wire_bind,
+            fs,
         } => {
             use ctxd_cli::onboard::pipeline::{onboard, AdapterChoice, PipelineConfig};
             use ctxd_cli::onboard::protocol::OutputMode;
@@ -1115,7 +1122,7 @@ async fn main() -> Result<()> {
                 with_hooks,
                 gmail: AdapterChoice::Skip,
                 github: AdapterChoice::Skip,
-                fs: vec![],
+                fs,
                 only: only_set,
                 db_path: cli.db.clone(),
                 bind,

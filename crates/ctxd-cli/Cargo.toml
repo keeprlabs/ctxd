@@ -39,6 +39,12 @@ ctxd-embed = { path = "../ctxd-embed" }
 # Optional alternate backends — gated by feature flags above.
 ctxd-store-postgres = { path = "../ctxd-store-postgres", optional = true }
 ctxd-store-duckobj = { path = "../ctxd-store-duckobj", optional = true }
+# In-process adapter wiring (phase 3B). On by default; an operator
+# who wants a slim binary can disable via `--no-default-features`.
+ctxd-adapter-core = { path = "../ctxd-adapter-core" }
+ctxd-adapter-fs = { path = "../ctxd-adapter-fs" }
+async-trait = "0.1"
+toml = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

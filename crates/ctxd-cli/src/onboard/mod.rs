@@ -16,6 +16,7 @@
 //! protocol primitives so the skill team and the binary team can build
 //! against a stable contract in parallel.
 
+pub mod adapter_runtime;
 pub mod caps;
 pub mod clients;
 pub mod doctor;
@@ -24,4 +25,5 @@ pub mod pipeline;
 pub mod protocol;
 pub mod seeds;
 pub mod service;
+pub mod skills_toml;
 pub mod snapshot;

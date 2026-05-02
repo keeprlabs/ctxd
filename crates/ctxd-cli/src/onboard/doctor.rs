@@ -127,10 +127,7 @@ pub async fn run(db_path: &Path) -> Vec<Check> {
     ));
     checks.push(check_client_config(db_path, &Codex, "codex-config"));
     checks.push(check_caps_valid(db_path).await);
-    checks.push(stub(
-        "adapters",
-        "phase 3B — in-process adapter spawning + skills.toml not yet wired",
-    ));
+    checks.push(check_adapters());
     checks
 }
 
@@ -572,12 +569,118 @@ async fn check_caps_valid(db_path: &Path) -> Check {
     }
 }
 
-fn stub(name: &str, reason: &str) -> Check {
+/// `adapters` — read skills.toml and surface what's enabled and
+/// (for adapters whose spawn is wired) whether the supporting
+/// state (paths exist, token files present) is in place.
+fn check_adapters() -> Check {
+    let manifest = match crate::onboard::skills_toml::read() {
+        Ok(m) => m,
+        Err(e) => {
+            return Check {
+                name: "adapters".into(),
+                status: CheckStatus::Failed,
+                remediation: Some(
+                    "could not read skills.toml; run `ctxd onboard --only configure-adapters`"
+                        .into(),
+                ),
+                detail: serde_json::json!({"error": e.to_string()}),
+            };
+        }
+    };
+
+    let mut detail = serde_json::Map::new();
+    let mut any_enabled = false;
+    let mut any_failed = false;
+
+    if let Some(fs) = manifest.fs {
+        if fs.enabled && !fs.paths.is_empty() {
+            any_enabled = true;
+            // Verify each path exists.
+            let missing: Vec<_> = fs
+                .paths
+                .iter()
+                .filter(|p| !p.exists())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            if missing.is_empty() {
+                detail.insert(
+                    "fs".into(),
+                    serde_json::json!({
+                        "status": "enabled",
+                        "paths": fs.paths,
+                    }),
+                );
+            } else {
+                any_failed = true;
+                detail.insert(
+                    "fs".into(),
+                    serde_json::json!({
+                        "status": "missing-paths",
+                        "missing": missing,
+                    }),
+                );
+            }
+        } else {
+            detail.insert("fs".into(), serde_json::json!({"status": "disabled"}));
+        }
+    } else {
+        detail.insert("fs".into(), serde_json::json!({"status": "not-configured"}));
+    }
+
+    if let Some(g) = manifest.gmail {
+        detail.insert(
+            "gmail".into(),
+            serde_json::json!({
+                "status": if g.enabled { "manual-pending" } else { "disabled" },
+                "token_file": g.token_file.to_string_lossy(),
+            }),
+        );
+    } else {
+        detail.insert(
+            "gmail".into(),
+            serde_json::json!({"status": "not-configured"}),
+        );
+    }
+    if let Some(g) = manifest.github {
+        detail.insert(
+            "github".into(),
+            serde_json::json!({
+                "status": if g.enabled { "manual-pending" } else { "disabled" },
+                "token_file": g.token_file.to_string_lossy(),
+            }),
+        );
+    } else {
+        detail.insert(
+            "github".into(),
+            serde_json::json!({"status": "not-configured"}),
+        );
+    }
+
+    let status = if any_failed {
+        CheckStatus::Failed
+    } else if any_enabled {
+        CheckStatus::Ok
+    } else {
+        CheckStatus::Skipped
+    };
+    let remediation = match status {
+        CheckStatus::Failed => Some(
+            "one or more configured adapter paths are missing — fix the path or re-run \
+             `ctxd onboard --only configure-adapters`"
+                .into(),
+        ),
+        CheckStatus::Skipped => Some(
+            "no adapters enabled — run `ctxd onboard --fs ~/Documents/notes` to start \
+             watching a directory"
+                .into(),
+        ),
+        _ => None,
+    };
     Check {
-        name: name.into(),
-        status: CheckStatus::Skipped,
-        remediation: Some(format!("not yet wired ({reason})")),
-        detail: serde_json::Value::Null,
+        name: "adapters".into(),
+        status,
+        remediation,
+        detail: serde_json::Value::Object(detail),
     }
 }
 
