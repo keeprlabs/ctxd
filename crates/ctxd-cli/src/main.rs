@@ -115,6 +115,19 @@ enum Commands {
         /// the duckdb-object backend's local-fs mode.
         #[arg(long = "storage-uri")]
         storage_uri: Option<String>,
+
+        /// Path to a base64-encoded capability token file (mode
+        /// `0600`). When set, the daemon reads the token at startup
+        /// for use as the bearer credential on inbound MCP-stdio
+        /// requests when this serve invocation is itself a stdio
+        /// subprocess spawned by an MCP client (Claude Desktop /
+        /// Code / Codex). v0.4 reads the file but defers full
+        /// stdio→HTTP proxy semantics — for now this argument is
+        /// accepted so onboard-written client configs don't fail
+        /// to launch. May be passed more than once for multi-tenant
+        /// scenarios.
+        #[arg(long = "cap-file")]
+        cap_file: Vec<PathBuf>,
     },
 
     /// Open the embedded web dashboard at `http://127.0.0.1:7777/`.
@@ -523,7 +536,23 @@ async fn main() -> Result<()> {
             embedder_api_key,
             storage,
             storage_uri,
+            cap_file,
         } => {
+            // Best-effort cap-file presence check. Non-fatal — the
+            // file may legitimately not exist yet (first-run race
+            // between client launch and onboard) and we'd rather
+            // start with a warning than refuse. Full enforcement
+            // (proxy stdio→HTTP MCP, validate caps on each tool call)
+            // is deferred from v0.4 — see docs/onboarding.md.
+            for p in &cap_file {
+                if !p.exists() {
+                    tracing::warn!(
+                        path = %p.to_string_lossy(),
+                        "cap-file does not exist yet; continuing without enforcement"
+                    );
+                }
+            }
+            let _ = &cap_file; // future use: stdio proxy auth
             let cfg = ctxd_cli::serve::ServeConfig {
                 bind,
                 wire_bind: Some(wire_bind),
