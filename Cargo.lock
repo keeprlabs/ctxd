@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "ctxd-dashboard"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "axum 0.8.9",
  "ctxd-cap",

@@ -8,6 +8,7 @@
 
 pub mod embedder;
 pub mod federation;
+pub mod onboard;
 pub mod protocol;
 pub mod query;
 pub mod rate_limit;
