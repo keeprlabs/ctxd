@@ -16,6 +16,7 @@
 //! protocol primitives so the skill team and the binary team can build
 //! against a stable contract in parallel.
 
+pub mod caps;
 pub mod doctor;
 pub mod paths;
 pub mod pipeline;

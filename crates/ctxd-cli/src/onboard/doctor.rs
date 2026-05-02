@@ -19,9 +19,11 @@
 //! Returning `Skipped` (rather than not appearing) lets the skill
 //! render a stable checklist regardless of which phases have shipped.
 
+use crate::onboard::caps::{self, ClientId};
 use crate::onboard::paths;
 use crate::onboard::service::{self, ServiceStatus};
 use crate::pidfile::{self, DaemonState};
+use ctxd_cap::CapEngine;
 use ctxd_store::EventStore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -124,10 +126,7 @@ pub async fn run(db_path: &Path) -> Vec<Check> {
         "codex-config",
         "phase 2B — Codex paste-instructions writer not yet wired",
     ));
-    checks.push(stub(
-        "caps-valid",
-        "phase 2A — capability file-pointer minting not yet wired",
-    ));
+    checks.push(check_caps_valid(db_path).await);
     checks.push(stub(
         "adapters",
         "phase 3B — in-process adapter spawning + skills.toml not yet wired",
@@ -349,6 +348,151 @@ fn check_service_installed() -> Check {
             remediation: Some(format!("service backend ({}) error", backend.name())),
             detail: serde_json::json!({"error": e.to_string()}),
         },
+    }
+}
+
+/// `caps-valid` — every minted cap-file decodes against the root
+/// key, has not expired, and grants the operation it should. Skipped
+/// when no caps directory exists yet (pre-onboard).
+async fn check_caps_valid(db_path: &Path) -> Check {
+    let caps_dir = match paths::caps_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            return Check {
+                name: "caps-valid".into(),
+                status: CheckStatus::Failed,
+                remediation: Some("could not resolve caps_dir; check $HOME".into()),
+                detail: serde_json::json!({"error": e.to_string()}),
+            };
+        }
+    };
+    if !caps_dir.exists() {
+        return Check {
+            name: "caps-valid".into(),
+            status: CheckStatus::Skipped,
+            remediation: Some(
+                "no cap files yet — run `ctxd onboard --only mint-capabilities` to mint".into(),
+            ),
+            detail: serde_json::Value::Null,
+        };
+    }
+    if !db_path.exists() {
+        return Check {
+            name: "caps-valid".into(),
+            status: CheckStatus::Skipped,
+            remediation: Some("no DB yet — caps cannot be verified without the root key".into()),
+            detail: serde_json::Value::Null,
+        };
+    }
+    // Open store + load root key. We can verify caps without a
+    // running daemon — verification is purely cryptographic.
+    let store = match EventStore::open(db_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Check {
+                name: "caps-valid".into(),
+                status: CheckStatus::Failed,
+                remediation: Some("could not open store to verify caps".into()),
+                detail: serde_json::json!({"error": e.to_string()}),
+            };
+        }
+    };
+    let root_bytes = match store.get_metadata("root_key").await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return Check {
+                name: "caps-valid".into(),
+                status: CheckStatus::Skipped,
+                remediation: Some(
+                    "no root_key persisted yet — first `ctxd serve` or onboard mint creates it"
+                        .into(),
+                ),
+                detail: serde_json::Value::Null,
+            };
+        }
+        Err(e) => {
+            return Check {
+                name: "caps-valid".into(),
+                status: CheckStatus::Failed,
+                remediation: Some("could not read root_key from store".into()),
+                detail: serde_json::json!({"error": e.to_string()}),
+            };
+        }
+    };
+    let cap_engine = match CapEngine::from_private_key(&root_bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            return Check {
+                name: "caps-valid".into(),
+                status: CheckStatus::Failed,
+                remediation: Some("stored root key is invalid; daemon may need re-init".into()),
+                detail: serde_json::json!({"error": format!("{e}")}),
+            };
+        }
+    };
+    let clients = [
+        ClientId::ClaudeDesktop,
+        ClientId::ClaudeCode,
+        ClientId::Codex,
+        ClientId::GmailAdapter,
+        ClientId::GithubAdapter,
+        ClientId::FsAdapter,
+    ];
+    let mut reports = Vec::new();
+    let mut failures = 0;
+    let mut missing = 0;
+    for c in clients {
+        let r = match caps::verify_persisted(&cap_engine, c) {
+            Ok(r) => r,
+            Err(e) => {
+                failures += 1;
+                reports.push(serde_json::json!({
+                    "client": c.slug(),
+                    "ok": false,
+                    "error": e.to_string(),
+                }));
+                continue;
+            }
+        };
+        if !r.present {
+            missing += 1;
+        } else if !r.decodes || !r.verifies_default_op {
+            failures += 1;
+        }
+        reports.push(serde_json::json!({
+            "client": r.client.slug(),
+            "present": r.present,
+            "decodes": r.decodes,
+            "verifies_default_op": r.verifies_default_op,
+            "error": r.error,
+        }));
+    }
+    let status = if failures > 0 {
+        CheckStatus::Failed
+    } else if missing > 0 {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Ok
+    };
+    let remediation = match status {
+        CheckStatus::Failed => {
+            Some("re-mint caps via `ctxd onboard --only mint-capabilities`".into())
+        }
+        CheckStatus::Warn => Some(format!(
+            "{missing} cap file(s) missing — `ctxd onboard --only mint-capabilities` to fill"
+        )),
+        _ => None,
+    };
+    Check {
+        name: "caps-valid".into(),
+        status,
+        remediation,
+        detail: serde_json::json!({
+            "checked": reports.len(),
+            "missing": missing,
+            "failures": failures,
+            "reports": reports,
+        }),
     }
 }
 

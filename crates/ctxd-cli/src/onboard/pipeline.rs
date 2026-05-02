@@ -32,11 +32,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::onboard::caps::{self, ClientId};
 use crate::onboard::doctor;
 use crate::onboard::paths;
 use crate::onboard::protocol::{DoctorSummary, Emitter, Outcome, OutputMode, StepName, StepStatus};
 use crate::onboard::service::{self, ServiceSpec};
 use crate::pidfile;
+use ctxd_cap::CapEngine;
+use ctxd_store::EventStore;
 
 /// Adapter user-choice. Each opt-in adapter (gmail, github, fs) takes
 /// one of these.
@@ -110,7 +113,7 @@ pub async fn onboard(cfg: PipelineConfig) -> Result<Outcome> {
     step_service_install(&cfg, &emitter)?;
     step_service_start(&cfg, &emitter).await?;
     step_configure_clients(&cfg, &emitter)?;
-    step_mint_capabilities(&cfg, &emitter)?;
+    step_mint_capabilities(&cfg, &emitter).await?;
     step_seed_subjects(&cfg, &emitter)?;
     step_configure_adapters(&cfg, &emitter)?;
     let doctor_summary = step_doctor(&cfg, &emitter).await?;
@@ -327,16 +330,105 @@ fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()>
     Ok(())
 }
 
-fn step_mint_capabilities(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+async fn step_mint_capabilities(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
     if !cfg.includes(StepName::MintCapabilities) {
         return Ok(());
     }
     emitter.step_started(StepName::MintCapabilities);
-    emitter.step_skipped(
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::MintCapabilities, "dry-run");
+        return Ok(());
+    }
+
+    // Open the store to get the root cap-engine key. The daemon's
+    // own setup persists this on first run; we mirror that logic
+    // here so onboard works pre-first-serve too.
+    let store = EventStore::open(&cfg.db_path)
+        .await
+        .with_context_msg("failed to open event store for cap minting")?;
+    let cap_engine = match store
+        .get_metadata("root_key")
+        .await
+        .with_context_msg("read root_key metadata")?
+    {
+        Some(key_bytes) => CapEngine::from_private_key(&key_bytes)
+            .map_err(|e| anyhow::anyhow!("stored root key invalid: {e}"))?,
+        None => {
+            let engine = CapEngine::new();
+            store
+                .set_metadata("root_key", &engine.private_key_bytes())
+                .await
+                .with_context_msg("persist root_key")?;
+            engine
+        }
+    };
+
+    // The set of clients onboard always mints for. Adapters get
+    // their cap-files in the configure-adapters step (phase 3B);
+    // they're listed here too so the file is staged regardless of
+    // whether the adapter is actually enabled — that way `ctxd
+    // doctor`'s caps-valid check has stable expectations.
+    let clients = [
+        ClientId::ClaudeDesktop,
+        ClientId::ClaudeCode,
+        ClientId::Codex,
+        ClientId::GmailAdapter,
+        ClientId::GithubAdapter,
+        ClientId::FsAdapter,
+    ];
+    let mut minted = Vec::new();
+    for c in clients {
+        let path = caps::mint_and_persist(&cap_engine, c, cfg.strict_scopes)
+            .with_context_msg("mint cap")?;
+        minted.push(serde_json::json!({
+            "client": c.slug(),
+            "path": path.to_string_lossy(),
+            "scope": c.default_scope(cfg.strict_scopes),
+            "operations": c
+                .default_operations(cfg.strict_scopes)
+                .iter()
+                .map(|op| op_slug(*op))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    emitter.step_ok(
         StepName::MintCapabilities,
-        "phase 2A — capability file-pointer minting not yet wired",
+        serde_json::json!({
+            "tokens_minted": minted.len(),
+            "stored_at": paths::caps_dir()?.to_string_lossy(),
+            "strict_scopes": cfg.strict_scopes,
+            "minted": minted,
+        }),
     );
     Ok(())
+}
+
+/// Translate a [`ctxd_cap::Operation`] back to its protocol slug for
+/// the mint-capabilities `detail.minted[].operations` field.
+fn op_slug(op: ctxd_cap::Operation) -> &'static str {
+    use ctxd_cap::Operation;
+    match op {
+        Operation::Read => "read",
+        Operation::Write => "write",
+        Operation::Search => "search",
+        Operation::Subjects => "subjects",
+        Operation::Admin => "admin",
+        Operation::Peer => "peer",
+        Operation::Subscribe => "subscribe",
+    }
+}
+
+trait WithContextMsg<T> {
+    fn with_context_msg(self, msg: &'static str) -> Result<T>;
+}
+
+impl<T, E> WithContextMsg<T> for std::result::Result<T, E>
+where
+    E: std::fmt::Display,
+{
+    fn with_context_msg(self, msg: &'static str) -> Result<T> {
+        self.map_err(|e| anyhow::anyhow!("{msg}: {e}"))
+    }
 }
 
 fn step_seed_subjects(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
