@@ -9,8 +9,10 @@
 pub mod embedder;
 pub mod federation;
 pub mod onboard;
+pub mod pidfile;
 pub mod protocol;
 pub mod query;
 pub mod rate_limit;
+pub mod ready;
 pub mod serve;
 pub mod storage_selector;

@@ -437,6 +437,7 @@ async fn main() -> Result<()> {
                 storage,
                 storage_uri,
                 federation: true,
+                db_path: Some(cli.db.clone()),
             };
             ctxd_cli::serve::serve(cfg, store, cap_engine, caveat_state, pending_approval_tx)
                 .await?;
@@ -461,6 +462,7 @@ async fn main() -> Result<()> {
                 storage: "sqlite".to_string(),
                 storage_uri: None,
                 federation: false,
+                db_path: Some(cli.db.clone()),
             };
             // Spawn a deferred opener that fires once the bind has
             // had a moment to come up. Doing this *before* the

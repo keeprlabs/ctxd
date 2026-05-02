@@ -59,6 +59,16 @@ opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.29"
 
+# Unix-only: pidfile uses kill(pid, 0) for liveness probes.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Linux-only: systemd Type=notify support. No-op on macOS / Windows.
+# Pinned at <0.5 so we keep `sd_notify::notify` taking a slice (the
+# 0.5 surface restructured the API slightly).
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = "0.4"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 ctxd-store-sqlite = { path = "../ctxd-store-sqlite" }
