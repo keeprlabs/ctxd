@@ -54,6 +54,7 @@ rmp-serde = "1"
 uuid = { workspace = true }
 chrono = { workspace = true }
 hex = "0.4"
+directories = "5"
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }

@@ -17,4 +17,6 @@
 //! against a stable contract in parallel.
 
 pub mod doctor;
+pub mod paths;
 pub mod protocol;
+pub mod service;

@@ -19,6 +19,8 @@
 //! Returning `Skipped` (rather than not appearing) lets the skill
 //! render a stable checklist regardless of which phases have shipped.
 
+use crate::onboard::paths;
+use crate::onboard::service::{self, ServiceStatus};
 use crate::pidfile::{self, DaemonState};
 use ctxd_store::EventStore;
 use serde::{Deserialize, Serialize};
@@ -109,10 +111,7 @@ pub async fn run(db_path: &Path) -> Vec<Check> {
     // skill renders a stable checklist; each will gain a real impl
     // in its phase. Listed in pipeline order to match the protocol's
     // `step` taxonomy.
-    checks.push(stub(
-        "service-installed",
-        "phase 1C — service-manager (launchd plist / systemd-user unit) not yet wired",
-    ));
+    checks.push(check_service_installed());
     checks.push(stub(
         "claude-desktop-config",
         "phase 2B — client config writers not yet wired",
@@ -272,6 +271,87 @@ async fn check_events_present(db_path: &Path) -> Check {
     }
 }
 
+/// `service-installed` — launchd plist / systemd unit is on disk.
+/// Reports `skipped` on Windows / unsupported platforms; never
+/// `failed` (a missing service is the user's choice — they may run
+/// `ctxd serve` in a foreground terminal).
+fn check_service_installed() -> Check {
+    if !service::is_supported() {
+        return Check {
+            name: "service-installed".into(),
+            status: CheckStatus::Skipped,
+            remediation: Some(
+                "service install not supported on this OS yet (v0.4 ships macOS + Linux); \
+                 run `ctxd serve` in a foreground terminal as a workaround"
+                    .into(),
+            ),
+            detail: serde_json::Value::Null,
+        };
+    }
+    let backend = match service::detect_backend(paths::SERVICE_LABEL) {
+        Ok(b) => b,
+        Err(e) => {
+            return Check {
+                name: "service-installed".into(),
+                status: CheckStatus::Failed,
+                remediation: Some("could not initialise service backend; check $HOME".into()),
+                detail: serde_json::json!({"error": e.to_string()}),
+            };
+        }
+    };
+    let unit_path = backend.unit_path();
+    match backend.status() {
+        Ok(ServiceStatus::Running { pid }) => Check {
+            name: "service-installed".into(),
+            status: CheckStatus::Ok,
+            remediation: None,
+            detail: serde_json::json!({
+                "backend": backend.name(),
+                "unit_path": unit_path.to_string_lossy(),
+                "state": "running",
+                "pid": pid,
+            }),
+        },
+        Ok(ServiceStatus::Stopped) => Check {
+            name: "service-installed".into(),
+            status: CheckStatus::Warn,
+            remediation: Some(format!(
+                "service unit installed but not running — start with `ctxd onboard --only service-start` \
+                 or `{}`",
+                if backend.name() == "launchd" {
+                    "launchctl bootstrap gui/$UID <plist>"
+                } else {
+                    "systemctl --user start ctxd"
+                }
+            )),
+            detail: serde_json::json!({
+                "backend": backend.name(),
+                "unit_path": unit_path.to_string_lossy(),
+                "state": "stopped",
+            }),
+        },
+        Ok(ServiceStatus::NotInstalled) => Check {
+            name: "service-installed".into(),
+            status: CheckStatus::Failed,
+            remediation: Some(
+                "no service installed — run `ctxd onboard --only service-install,service-start` \
+                 to install and start"
+                    .into(),
+            ),
+            detail: serde_json::json!({
+                "backend": backend.name(),
+                "expected_unit_path": unit_path.to_string_lossy(),
+            }),
+        },
+        Err(e) => Check {
+            name: "service-installed".into(),
+            status: CheckStatus::Failed,
+            remediation: Some(format!("service backend ({}) error", backend.name())),
+            detail: serde_json::json!({"error": e.to_string()}),
+        },
+    }
+}
+
 fn stub(name: &str, reason: &str) -> Check {
     Check {
         name: name.into(),
@@ -338,23 +418,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_install_doctor_has_no_failures_only_skips() {
-        // On a brand-new machine with no daemon, no DB, nothing
-        // configured: daemon-running fails (we want a friendly
-        // remediation, not a "your install is broken" panic). The
-        // other not-yet-onboarded checks must skip.
+    async fn fresh_install_doctor_failures_carry_remediations() {
+        // On a brand-new install we expect *some* failures (at minimum
+        // daemon-running; on supported OSes also service-installed if
+        // no plist/unit is on disk). The strict count varies by host
+        // because service-installed reads $HOME/Library/LaunchAgents
+        // (mac) or ~/.config/systemd/user (linux). The contract we
+        // DO pin: every failure carries a remediation string — that
+        // is the whole point of the doctor.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("ctxd.db");
         let checks = run(&db).await;
+        for c in &checks {
+            if matches!(c.status, CheckStatus::Failed) {
+                assert!(
+                    c.remediation.is_some(),
+                    "failed check `{}` has no remediation",
+                    c.name
+                );
+            }
+        }
+        // daemon-running must always fail on a fresh install (no
+        // pidfile, no listener).
+        let daemon = checks.iter().find(|c| c.name == "daemon-running").unwrap();
+        assert_eq!(daemon.status, CheckStatus::Failed);
+        // The not-yet-wired stubs should still be present and skipped.
         let summary = Summary::from_checks(&checks);
-        // daemon-running fails (expected — no daemon).
-        assert_eq!(
-            summary.failed, 1,
-            "only daemon-running should fail; got: {checks:#?}"
-        );
         assert!(
-            summary.skipped >= 7,
-            "expected most checks to be skipped on fresh install"
+            summary.skipped >= 5,
+            "expected ≥5 stub-skipped checks, got {} ({summary:?})",
+            summary.skipped
         );
     }
 
