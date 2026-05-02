@@ -454,10 +454,12 @@
     }
     for (const e of page.events) eventsHost.append(eventRow(e, false));
 
-    // If there's a next page, surface a "load more" button.
+    // If there's a next page, surface a "load older" button. The
+    // cursor is an API implementation detail (opaque base64 of seq);
+    // we don't show it in the UI.
     if (page.next_cursor) {
       const more = el('button', { class: 'btn btn--ghost btn--sm', type: 'button' },
-        `load older (cursor: ${page.next_cursor.slice(0, 8)}…)`);
+        'load older');
       let cursor = page.next_cursor;
       more.addEventListener('click', async () => {
         more.disabled = true;
@@ -469,7 +471,7 @@
           if (next.next_cursor) {
             cursor = next.next_cursor;
             more.disabled = false;
-            more.textContent = `load older (cursor: ${cursor.slice(0, 8)}…)`;
+            more.textContent = 'load older';
           } else {
             more.remove();
           }
