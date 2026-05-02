@@ -226,6 +226,37 @@ enum Commands {
         public_key: String,
     },
 
+    /// Receive a Claude Code hook payload on stdin and append it to the
+    /// event log under `/me/sessions/<slug>`.
+    ///
+    /// Wired into `~/.claude/settings.json` by `ctxd onboard
+    /// --with-hooks` (phase 2B). The skill installs four entries —
+    /// `session-start`, `user-prompt-submit`, `pre-compact`, `stop`
+    /// — each invoked by Claude Code at the corresponding lifecycle
+    /// event with a JSON payload on stdin. This subcommand reads
+    /// stdin (best-effort; up to 64 KiB), parses if possible, and
+    /// writes a single event so the agent's session lifecycle is
+    /// captured in `/me/sessions`.
+    ///
+    /// Failures are silent — if the cap-file is missing, the DB
+    /// can't be opened, etc., we exit 0 with a stderr warning so
+    /// Claude Code's stop event doesn't surface a noisy error to
+    /// the user. Hooks are best-effort instrumentation, not a
+    /// critical path.
+    Hook {
+        /// Event slug. One of `session-start`, `user-prompt-submit`,
+        /// `pre-compact`, `stop` (or any custom slug — we don't
+        /// gate on the set).
+        slug: String,
+
+        /// Capability file. Today the hook uses the local DB
+        /// directly without verification; the arg is accepted so
+        /// the settings.json command line matches what onboard
+        /// writes.
+        #[arg(long = "cap-file")]
+        cap_file: Option<PathBuf>,
+    },
+
     /// List subjects in the store.
     Subjects {
         /// Optional prefix to filter.
@@ -1127,6 +1158,52 @@ async fn main() -> Result<()> {
                 wire_bind: "127.0.0.1:7778".to_string(),
             };
             offboard(cfg, purge).await?;
+        }
+
+        Commands::Hook { slug, cap_file } => {
+            let _ = cap_file; // accepted; future: verify before append
+                              // Read up to 64 KiB from stdin. Hooks send small JSON
+                              // payloads; we cap to keep this pure overhead-free.
+            use std::io::Read as _;
+            let mut payload = Vec::with_capacity(4096);
+            let _ = std::io::stdin()
+                .lock()
+                .take(65_536)
+                .read_to_end(&mut payload);
+            let parsed: serde_json::Value = if payload.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&payload).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "raw": String::from_utf8_lossy(&payload).into_owned(),
+                    })
+                })
+            };
+            let subject_path = format!("/me/sessions/{slug}");
+            let subject = match Subject::new(&subject_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ctxd hook: invalid slug {slug:?}: {e}");
+                    return Ok(());
+                }
+            };
+            let data = serde_json::json!({
+                "event": slug,
+                "captured_at": chrono::Utc::now().to_rfc3339(),
+                "payload": parsed,
+            });
+            let event = Event::new(
+                "ctxd://hook".to_string(),
+                subject,
+                format!("hook.{slug}"),
+                data,
+            );
+            // Best-effort append; never panic from a hook.
+            if let Err(e) = store.append(event).await {
+                eprintln!("ctxd hook: append failed (best-effort): {e}");
+            }
+            // Exit 0 regardless — hooks must not surface errors to
+            // Claude Code or it spams the user on every Stop.
         }
 
         Commands::Doctor { json } => {
