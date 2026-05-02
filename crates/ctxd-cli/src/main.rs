@@ -267,6 +267,20 @@ enum Commands {
         decision: String,
     },
 
+    /// Run diagnostic checks on the local ctxd installation.
+    ///
+    /// Reports daemon health, storage integrity, configured clients,
+    /// minted capabilities, and adapter status. Each failed check
+    /// includes a remediation hint. Run anytime — standalone, or as
+    /// step 7 of `ctxd onboard`.
+    Doctor {
+        /// Emit JSON instead of human-readable output. Used by the
+        /// Claude Code skill and CI scripts. Schema mirrors
+        /// `onboard::doctor::Check`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Connect to a running ctxd daemon via the wire protocol.
     Connect {
         /// Address of the daemon's wire protocol endpoint.
@@ -913,6 +927,32 @@ async fn main() -> Result<()> {
                     "status": "ok",
                 }))?
             );
+        }
+
+        Commands::Doctor { json } => {
+            let checks = ctxd_cli::onboard::doctor::run(&cli.db).await;
+            if json {
+                let summary = ctxd_cli::onboard::doctor::Summary::from_checks(&checks);
+                let body = serde_json::json!({
+                    "checks": checks,
+                    "summary": {
+                        "total": summary.total,
+                        "ok": summary.ok,
+                        "warnings": summary.warnings,
+                        "failed": summary.failed,
+                        "skipped": summary.skipped,
+                    },
+                });
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                if !summary.all_ok() {
+                    std::process::exit(1);
+                }
+            } else {
+                let all_ok = ctxd_cli::onboard::doctor::render_human(&checks);
+                if !all_ok {
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Connect { addr, action } => {
