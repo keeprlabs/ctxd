@@ -662,11 +662,14 @@ mod tests {
         // pidfile, no listener).
         let daemon = checks.iter().find(|c| c.name == "daemon-running").unwrap();
         assert_eq!(daemon.status, CheckStatus::Failed);
-        // The not-yet-wired stubs should still be present and skipped.
+        // The fresh tempdir scenario has at least *some* skips —
+        // storage-healthy (no DB yet), events-present, caps-valid,
+        // and the still-stubbed `adapters` check. Don't pin the
+        // exact count; future phases land more real checks.
         let summary = Summary::from_checks(&checks);
         assert!(
-            summary.skipped >= 5,
-            "expected ≥5 stub-skipped checks, got {} ({summary:?})",
+            summary.skipped >= 1,
+            "expected ≥1 skipped check, got {} ({summary:?})",
             summary.skipped
         );
     }

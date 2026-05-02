@@ -115,7 +115,7 @@ pub async fn onboard(cfg: PipelineConfig) -> Result<Outcome> {
     step_service_start(&cfg, &emitter).await?;
     step_configure_clients(&cfg, &emitter)?;
     step_mint_capabilities(&cfg, &emitter).await?;
-    step_seed_subjects(&cfg, &emitter)?;
+    step_seed_subjects(&cfg, &emitter).await?;
     step_configure_adapters(&cfg, &emitter)?;
     let doctor_summary = step_doctor(&cfg, &emitter).await?;
 
@@ -496,14 +496,25 @@ where
     }
 }
 
-fn step_seed_subjects(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+async fn step_seed_subjects(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
     if !cfg.includes(StepName::SeedSubjects) {
         return Ok(());
     }
     emitter.step_started(StepName::SeedSubjects);
-    emitter.step_skipped(
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::SeedSubjects, "dry-run");
+        return Ok(());
+    }
+    let report = crate::onboard::seeds::seed_at_path(&cfg.db_path)
+        .await
+        .with_context_msg("seed /me/**")?;
+    emitter.step_ok(
         StepName::SeedSubjects,
-        "phase 2D — /me/** seeding not yet wired",
+        serde_json::json!({
+            "subjects_created": report.created,
+            "subjects_skipped": report.skipped,
+            "events_written": report.created.len(),
+        }),
     );
     Ok(())
 }
