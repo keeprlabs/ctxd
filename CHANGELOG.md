@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.4 — 2026-05-02
+
+The plug-and-play release. **Every AI on your machine, one memory** — installed in two commands.
+
+```bash
+brew install keeprlabs/tap/ctxd
+ctxd onboard
+```
+
+`ctxd onboard` is the headline. It installs the daemon as a user-scope service (launchd / systemd-user), wires Claude Desktop / Claude Code / Codex to use it over MCP, mints scoped capability tokens per app (mode `0600` — never in process args), seeds a baseline `/me/**` so a fresh AI conversation starts with non-empty context, and captures a snapshot of the prior state so `ctxd offboard` can fully reverse it. Idempotent. Two minutes from install to first stored fact.
+
+### What landed
+
+- **`ctxd onboard` / `ctxd offboard` / `ctxd doctor`** — the eight-step pipeline (snapshot → service-install → service-start → configure-clients → mint-capabilities → seed-subjects → configure-adapters → doctor) plus a stable nine-check diagnostic suite. `--skill-mode` emits the protocol described in [`docs/onboard-protocol.md`](docs/onboard-protocol.md) so the Claude Code skill and other front doors can drive it programmatically.
+- **Daemon pidfile lock + cross-platform ready signal.** `ctxd serve` writes a JSON pidfile next to the SQLite DB, refuses to start when a live daemon already owns the same DB, and emits `sd_notify(READY=1)` on Linux + a parseable `ctxd-ready: http://...` marker on macOS. Replaces the cryptic EADDRINUSE chain users hit when two daemons raced on the same file.
+- **Stdio↔HTTP MCP proxy.** When `ctxd serve --mcp-stdio --cap-file <path>` is invoked as a subprocess by Claude Desktop / Code / Codex AND a long-running daemon already owns the same DB, the subprocess becomes a thin proxy: read JSON-RPC from stdin, POST to the daemon's `/mcp` HTTP endpoint with the cap-file token as bearer auth. Every MCP-aware AI on the user's machine shares one daemon, one DB, one memory.
+- **Per-client capability files** at `<config_dir>/ctxd/caps/<client>.bk`, mode `0600`. Six identities pre-minted (claude-desktop, claude-code, codex, gmail-adapter, github-adapter, fs-adapter) with sensible default scopes; `--strict-scopes` drops clients to read+search only on `/me/**`. **No tokens in process args** — closes the leak vector where args were visible to `ps` and ended up in any backup of the user's app config.
+- **Client config writers** for Claude Desktop, Claude Code (with optional `--with-hooks` for SessionStart / UserPromptSubmit / PreCompact / Stop), and Codex (paste-ready snippet — Codex's MCP config story is still moving). Idempotent merge: existing `mcpServers.*` entries are preserved; only `mcpServers.ctxd` is updated.
+- **`/me/**` baseline seed.** `/me/profile` (hostname, platform, optional git identity), `/me/preferences` (placeholder), `/me/about` (welcome). Idempotent.
+- **In-process fs adapter spawn** via `<config_dir>/ctxd/skills.toml`. `ctxd onboard --fs ~/Documents/notes` writes the manifest entry; the daemon spawns the fs adapter as a tokio task at startup. Gmail / GitHub manifest sections are reserved with stable schema; their OAuth + PAT flows land in v0.4.1.
+- **Pre-flight snapshot + `offboard` restore.** Captures `claude_desktop_config.json` + `~/.claude/settings.json` byte-for-byte before mutating; `ctxd offboard` restores from the most recent snapshot. Solves the "I tried this and now my Claude Desktop config is broken" failure mode.
+- **`ctxd hook` subcommand** for the Claude Code hook entries `--with-hooks` writes. Reads up to 64 KiB of payload from stdin, appends one event under `/me/sessions/<slug>`. Best-effort: hook failures never bubble back to Claude Code.
+- **`ctxd watch [pattern] --timeout-s --limit`** SSE-tail subcommand. Used by the `ctxd-memory` skill's first-use demo: skill prints "open Claude Desktop, say X", watcher catches the resulting write live.
+- **`ctxd-memory` Claude Code skill** at `skill/ctxd-memory/`. Markdown-driven dialog that walks the user through `ctxd onboard --skill-mode`, narrates the JSON-Lines protocol, surfaces OAuth device codes, and runs the first-use demo at the end.
+- **`CTXD_CONFIG_DIR` / `CTXD_DATA_DIR` env vars** override the platform-default paths — useful for parallel test isolation, multi-tenant ctxd installs, and reproducible recordings.
+
+### Tests
+
+**265 tests passing** across the workspace. New onboard/doctor/service/caps/clients/seeds/snapshot/skills_toml/adapter_runtime modules ship with unit tests + nine end-to-end binary tests covering the JSON-Lines contract, the pidfile race, `--strict-scopes`, `--dry-run`, `--only` filters, idempotent re-runs, and the full stdio↔HTTP MCP proxy round-trip. `cargo clippy --all-targets --all-features -- -D warnings` clean.
+
+### Deferred to v0.4.1
+
+- **Gmail / GitHub adapter spawn.** Manifest schema + daemon spawn site are stable; only the OAuth device flow + PAT collection in `step_configure_adapters` remain. The adapter binaries themselves already exist.
+- **Windows.** Documented as v0.5; the null backend errors clearly today.
+
+## v0.3.2 — 2026-04-30
+
+Embedded web dashboard, plus crates.io publishing.
+
+- **Dashboard** — single static HTML/CSS/JS bundle served from the daemon at `http://127.0.0.1:7777/`. Five views: overview (counters + recent events), subjects (hierarchical tree with cumulative counts), search (FTS5 with highlighted snippets), event detail at `#/event/<id>`, subject detail at `#/subject/<path>`, and peers (admin-token-gated). SSE live tail with auto-reconnect. Loopback-only with DNS-rebinding defenses (host-header check + CSP + X-Frame-Options DENY).
+- **`ctxd dashboard`** convenience subcommand starts an HTTP-only daemon (no wire, no MCP, no federation) and opens the URL. For users who already have `ctxd serve` running, the dashboard is at the same URL.
+- **Crates.io release workflow** publishes every workspace crate on each `v*` tag (PR #17).
+
 ## v0.3.1 — 2026-04-24
 
 The launch-ready polish release. Persistent rate-limit caveat state closes the last v0.3 leftover, three first-party SDKs land alongside the daemon, and the `/v1/peers` admin surface gets a friendlier README + architecture pass.
