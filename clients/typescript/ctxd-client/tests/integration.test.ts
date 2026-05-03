@@ -28,12 +28,16 @@ describe("CtxdClient integration", () => {
     await daemon.cleanup();
   });
 
-  it("health() returns status=ok and a 0.3.x version", async () => {
+  it("health() returns status=ok and a supported daemon version", async () => {
     const client = new CtxdClient({ httpUrl: daemon.httpUrl });
     try {
       const info = await client.health();
       expect(info.status).toBe("ok");
-      expect(info.version.startsWith("0.3.")).toBe(true);
+      // SDK supports 0.3.x and 0.4.x daemons — wire format is pinned,
+      // minor versions track new features that don't break the SDK.
+      const supported =
+        info.version.startsWith("0.3.") || info.version.startsWith("0.4.");
+      expect(supported).toBe(true);
     } finally {
       await client.close();
     }

@@ -26,13 +26,16 @@ async fn boot() -> (common::DaemonHandle, CtxdClient) {
 }
 
 #[tokio::test]
-async fn health_returns_v0_3_x_version() {
+async fn health_returns_supported_version() {
     let (_d, client) = boot().await;
     let info = client.health().await.expect("health");
     assert_eq!(info.status, "ok");
+    // SDK supports any 0.3.x or 0.4.x daemon — the wire format is
+    // pinned per major; minors track new features that don't break
+    // the SDK. Update this assertion as the compatibility window shifts.
     assert!(
-        info.version.starts_with("0.3."),
-        "expected version starting 0.3.x, got {}",
+        info.version.starts_with("0.3.") || info.version.starts_with("0.4."),
+        "expected daemon version 0.3.x or 0.4.x, got {}",
         info.version
     );
 }
