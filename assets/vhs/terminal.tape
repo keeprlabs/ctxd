@@ -34,7 +34,14 @@ Set Shell "zsh"
 Set TypingSpeed 30ms
 
 # Hidden setup: tempdir + env-var sandbox + custom prompt.
+# VHS spawns an interactive zsh which sources ~/.zshrc and resets
+# PATH, so the parent's PATH=./target/debug:$PATH env doesn't
+# propagate. We capture the repo root before cd'ing and export the
+# target/debug dir into the recorded shell's PATH explicitly.
 Hide
+Type "export CTXD_BIN_DIR=$PWD/target/debug && export PATH=$CTXD_BIN_DIR:$PATH"
+Enter
+Sleep 200ms
 Type "cd /tmp && rm -rf ctxd-demo && mkdir ctxd-demo && cd ctxd-demo"
 Enter
 Sleep 200ms

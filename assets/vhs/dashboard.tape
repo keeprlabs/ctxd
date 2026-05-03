@@ -30,6 +30,12 @@ Set TypingSpeed 30ms
 # non-default ports so it doesn't collide with anything the
 # recorder happens to have running on :7777.
 Hide
+# VHS spawns an interactive zsh that resets PATH from ~/.zshrc, so
+# we have to push the repo's target/debug dir back onto PATH from
+# inside the recorded shell. Capture the repo root before cd'ing.
+Type "export CTXD_BIN_DIR=$PWD/target/debug && export PATH=$CTXD_BIN_DIR:$PATH"
+Enter
+Sleep 200ms
 Type "cd /tmp && rm -rf ctxd-dash-demo && mkdir ctxd-dash-demo && cd ctxd-dash-demo"
 Enter
 Sleep 200ms
