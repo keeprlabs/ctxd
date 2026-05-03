@@ -136,10 +136,16 @@ pub async fn run(daemon_admin: &str, cap_b64: &str) -> Result<()> {
                 }
             }
             stdout.flush().await?;
-        } else {
-            // Plain JSON response — write as one line.
-            // Some servers pretty-print; collapse to single line so
-            // the MCP client's line-oriented reader sees one frame.
+        } else if !body.trim().is_empty() {
+            // Plain JSON response — write as one line. An empty body
+            // means the daemon answered 202 Accepted for a JSON-RPC
+            // notification (no `id`, no response expected); emitting
+            // even a bare newline would make line-oriented MCP
+            // clients try to JSON.parse("") and surface "Unexpected
+            // end of JSON input" — see Claude Desktop log around the
+            // notifications/initialized handshake. Some servers
+            // pretty-print; collapse to single line so the client's
+            // line reader sees one frame.
             let single_line = body.replace('\n', "");
             stdout.write_all(single_line.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
