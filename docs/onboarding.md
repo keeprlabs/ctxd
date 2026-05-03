@@ -29,9 +29,12 @@ The eight steps, in order:
    git identity), `/me/preferences` (placeholder), `/me/about`
    (welcome) so a fresh AI conversation starts with non-empty
    context.
-7. **`configure-adapters`** — opt-in: walk OAuth flows for Gmail,
-   prompt for a GitHub PAT, prompt for filesystem watch paths.
-   Default off (`--skip-adapters`).
+7. **`configure-adapters`** — opt-in: prompt for filesystem watch
+   paths (the fs adapter is spawned in-process by `ctxd serve`).
+   Default off (`--skip-adapters`). The Gmail and GitHub adapters
+   ship as separate binaries; the in-process spawn for them is on
+   the v0.4.x roadmap, so for now run them as side services per
+   [docs/adapters/running.md](adapters/running.md).
 8. **`doctor`** — run the diagnostic checks and report.
 
 Run `ctxd doctor` anytime to re-verify. Each check carries a

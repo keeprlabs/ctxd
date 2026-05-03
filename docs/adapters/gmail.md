@@ -100,6 +100,11 @@ refresh token, then encrypts and writes it to disk.
 
 ## Running the sync loop
 
+> **Want it running 24/7 alongside `ctxd serve`?** See
+> [docs/adapters/running.md](running.md) for the launchd plist (macOS)
+> and systemd-user unit (Linux). The flags below describe the binary;
+> that page covers daemonizing it.
+
 ```bash
 ctxd-adapter-gmail run \
   --db ./ctxd.db \

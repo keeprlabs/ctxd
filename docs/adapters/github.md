@@ -58,6 +58,11 @@ contents.
 The binary is `ctxd-adapter-github`. The two subcommands are `run` and
 `status`.
 
+> **Want it running 24/7 alongside `ctxd serve`?** See
+> [docs/adapters/running.md](running.md) for build-from-source steps,
+> launchd plist (macOS), and systemd-user unit (Linux). The sections
+> below cover the binary itself; that page covers daemonizing it.
+
 ### Single repo
 
 ```bash

@@ -85,6 +85,8 @@ ctxd read --subject /work --recursive
 
 You now have eight MCP tools wired to your context: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`, `ctx_entities`, `ctx_related`, `ctx_timeline`.
 
+**Want your inbox and pull requests in here too?** The Gmail and GitHub adapters are shipped as separate binaries you run alongside the daemon. See [docs/adapters/running.md](docs/adapters/running.md) for the build + launchd / systemd-user recipe.
+
 ### Foreground / advanced
 
 If you'd rather run ctxd in a terminal tab without installing a service:
@@ -191,7 +193,7 @@ Pre-built tarballs for macOS arm64/x86_64 and Linux x86_64/aarch64 are attached 
 | Federation: two-node tutorial | [docs/federation.md](docs/federation.md) |
 | Embeddings + hybrid search | [docs/embeddings.md](docs/embeddings.md) |
 | Postgres / DuckDB+S3 backends | [storage-postgres.md](docs/storage-postgres.md) · [storage-duckdb-object.md](docs/storage-duckdb-object.md) |
-| Adapters: Gmail, GitHub, authoring guide | [adapters/](docs/adapters/) · [adapter-guide.md](docs/adapter-guide.md) |
+| Adapters: Gmail, GitHub, authoring guide | [adapters/](docs/adapters/) · [running guide](docs/adapters/running.md) · [adapter-guide.md](docs/adapter-guide.md) |
 | Benchmarks (HNSW, FTS, federation) | [benchmark-results.md](docs/benchmark-results.md) |
 | API contract artifact (OpenAPI + JSON Schema + msgpack hex) | [docs/api/](docs/api/) |
 | Architecture decisions (19 ADRs) | [docs/decisions/](docs/decisions/) |
