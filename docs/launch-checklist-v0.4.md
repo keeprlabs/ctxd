@@ -1,6 +1,29 @@
-# v0.4 launch checklist — embedded web dashboard
+# v0.4 launch checklist — onboarding + embedded web dashboard
 
-Process, not code. The dashboard is shipped (steps 0–10) but features that don't ship distribution updates ship invisibly. This is what to do the day v0.4 lands.
+Process, not code. v0.4 ships two headline themes: **frictionless onboarding** (`ctxd onboard`, the Claude Code skill, snapshot-aware offboard, per-client cap files) and the **embedded web dashboard**. Both are reasonable headlines independently, and together they're the v0.4 story: from "install this Rust daemon and configure your apps to talk to it" to "one command, every AI tool on your machine shares memory."
+
+## Pre-tag dogfood
+
+Before `v0.4-rc.1`:
+
+- [ ] **Run `ctxd onboard --skip-adapters` on a clean macOS user** (a
+      fresh user account on the maintainer's machine, or a fresh VM).
+      Verify Claude Desktop sees the MCP entry, `ctxd doctor` is all
+      green, and a `ctx_write` from inside Claude Desktop lands at
+      `/me/preferences` visible via `ctxd query`.
+- [ ] **Run `ctxd offboard` and verify it actually undoes everything.**
+      Open `~/Library/Application Support/Claude/claude_desktop_config.json`
+      before and after — it should match its pre-onboard contents
+      byte-for-byte. The launchd plist should be gone. The DB stays
+      (no `--purge`).
+- [ ] **Re-run `ctxd onboard --skip-adapters --strict-scopes`** and
+      confirm the doctor's caps-valid check still passes (verifies
+      Read on `/me/**` even though Write is missing under strict
+      scopes).
+- [ ] **Test the skill end-to-end.** Copy `skill/ctxd-memory/` to
+      `~/.claude/skills/`, invoke from Claude Code, walk every step.
+      Does the JSON-Lines narration feel friendly? Are the OAuth
+      prompts (when adapters are enabled) clear?
 
 ## Success metric (decide before tagging, check at T+14)
 
@@ -23,12 +46,13 @@ If none hit, the dashboard didn't move the needle and v0.5 priorities should ref
 - [ ] **Capture 4 static dashboard screenshots** for the README and `docs/dashboard.md`:
       overview (populated), subjects view, search results page, peers view (with at least one peer or the empty state). 1200×720 PNG. Commit under `assets/img/dashboard-{view}.png` and reference from `docs/dashboard.md`.
 - [ ] **Verify the GIF renders on github.com.** GitHub processes GIFs differently from local viewers — push to a branch, open the README on the branch view, watch the GIF play through. If it loops too fast or color-shifts, re-record with adjusted `Set PlaybackSpeed` / theme.
-- [ ] **Draft tweet thread** (3–5 tweets):
-  1. Hook: the personal pain ("I run ctxd against Claude Desktop and couldn't see what it was writing. Now I can.")
-  2. The GIF (`dashboard.gif`).
-  3. The command (`brew install keeprlabs/tap/ctxd && ctxd dashboard`).
-  4. The security one-liner (loopback-only, DNS-rebinding defenses, read-only).
-  5. Repo link.
+- [ ] **Draft tweet thread** (4–6 tweets):
+  1. Hook: the personal pain ("Every AI tool on my machine started each session with amnesia. So I built ctxd.")
+  2. The GIF (`onboard.gif` if shipped; otherwise `dashboard.gif`).
+  3. The two commands: `brew install keeprlabs/tap/ctxd && ctxd onboard` — installs the service, wires Claude Desktop / Code / Codex, mints scoped tokens, seeds `/me/**`.
+  4. The proof: same memory, different agents. "Tell Claude Desktop your TypeScript preference, then ask Claude Code about it."
+  5. The security one-liner (loopback-only, capability tokens never in process args, snapshot-aware offboard).
+  6. Repo link.
 - [ ] **Optional: draft a 300–500 word blog post** on the keeprlabs blog or as a HN Show submission. Title hook: "I added a dashboard to ctxd to see what my AI agents were writing." Lead with the dogfooding story, not the architecture.
 - [ ] **Notify the cofounder.** ctxd-code overlap — the dashboard is a generic substrate viewer; ctxd-code's session-replay UX is its own product. Coordinate any cross-promotion.
 

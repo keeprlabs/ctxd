@@ -6,3 +6,5 @@
 *.db
 *.db-shm
 *.db-wal
+*.hnsw.*
+.claude/

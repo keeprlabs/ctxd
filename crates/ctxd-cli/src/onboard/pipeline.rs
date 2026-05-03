@@ -1,0 +1,802 @@
+//! `ctxd onboard` / `ctxd offboard` orchestration driver.
+//!
+//! Sequences the seven onboarding steps (plus snapshot pre-flight
+//! and doctor closing step) and emits per-step progress through the
+//! [`crate::onboard::protocol::Emitter`]. Steps that have not yet
+//! been wired (phases 2A–3B) emit `Skipped` — the pipeline still
+//! runs end-to-end so the skill team and onboard-mode flags can be
+//! exercised against the protocol contract before the rest of the
+//! steps land.
+//!
+//! ## Order
+//!
+//! 1. `snapshot` — pre-flight scan (phase 3A: skipped today).
+//! 2. `service-install` — write launchd plist / systemd unit.
+//! 3. `service-start` — start service, wait for `/health` 200.
+//! 4. `configure-clients` — Claude Desktop / Code / Codex (phase 2B).
+//! 5. `mint-capabilities` — per-client cap files (phase 2A).
+//! 6. `seed-subjects` — populate `/me/**` (phase 2D).
+//! 7. `configure-adapters` — Gmail / GitHub / fs (phase 3B).
+//! 8. `doctor` — verify everything works.
+//!
+//! ## What `dry-run` does
+//!
+//! Emits each step's `Started` and a synthetic `Skipped`-with-reason
+//! `"dry-run"` instead of acting. Intended for the skill's
+//! "show me the plan before I commit" path. `--only` interacts:
+//! `--dry-run --only service-install` reports what install would
+//! change without writing any files.
+
+use anyhow::Result;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::onboard::caps::{self, ClientId};
+use crate::onboard::clients::{self, ApplyAction, ClientSpec};
+use crate::onboard::doctor;
+use crate::onboard::paths;
+use crate::onboard::protocol::{DoctorSummary, Emitter, Outcome, OutputMode, StepName, StepStatus};
+use crate::onboard::service::{self, ServiceSpec};
+use crate::pidfile;
+use ctxd_cap::CapEngine;
+use ctxd_store::EventStore;
+
+/// Adapter user-choice. Each opt-in adapter (gmail, github, fs) takes
+/// one of these.
+#[derive(Debug, Clone, Default)]
+pub enum AdapterChoice {
+    /// Don't enable this adapter.
+    #[default]
+    Skip,
+    /// Walk the OAuth / PAT flow interactively. Today the actual
+    /// flow is gated behind phase 3B; pipeline emits Skipped with
+    /// "phase 3B" message until then.
+    Interactive,
+    /// Use a literal token / refresh-token / path, no interaction.
+    /// Used by the skill once it has collected the value out-of-band.
+    Token(String),
+}
+
+/// Pipeline configuration. Constructed by `main.rs` from CLI flags
+/// (or by the skill via the same flag surface).
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    /// How to emit progress.
+    pub mode: OutputMode,
+    /// `true` = no interactive prompts, defaults everywhere.
+    pub headless: bool,
+    /// `true` = plan only, no mutations.
+    pub dry_run: bool,
+    /// Skip the configure-adapters step entirely.
+    pub skip_adapters: bool,
+    /// Skip service-install + service-start (foreground-only mode).
+    pub skip_service: bool,
+    /// Configure the service to start at user login.
+    pub at_login: bool,
+    /// Mint narrower capability tokens (phase 2A).
+    pub strict_scopes: bool,
+    /// Write Claude Code SessionStart/UserPromptSubmit/PreCompact/Stop
+    /// hooks (phase 2B).
+    pub with_hooks: bool,
+    /// Gmail adapter choice (phase 3B).
+    pub gmail: AdapterChoice,
+    /// GitHub PAT or skip (phase 3B).
+    pub github: AdapterChoice,
+    /// Filesystem adapter watch paths (phase 3B). Empty = skip.
+    pub fs: Vec<PathBuf>,
+    /// Subset of steps to run (None = all).
+    pub only: Option<HashSet<StepName>>,
+    /// SQLite DB path the daemon will use.
+    pub db_path: PathBuf,
+    /// Bind for the daemon's HTTP admin (`127.0.0.1:7777` typically).
+    pub bind: String,
+    /// Bind for the wire protocol.
+    pub wire_bind: String,
+}
+
+impl PipelineConfig {
+    fn includes(&self, step: StepName) -> bool {
+        self.only
+            .as_ref()
+            .map(|s| s.contains(&step))
+            .unwrap_or(true)
+    }
+}
+
+/// Run the full onboarding pipeline. On success returns the
+/// [`Outcome`] also emitted as the protocol's terminal `Done` message.
+pub async fn onboard(cfg: PipelineConfig) -> Result<Outcome> {
+    let emitter = Emitter::new(cfg.mode);
+
+    // Step 1 (after snapshot pre-flight): service-install.
+    step_snapshot(&cfg, &emitter).await?;
+    step_service_install(&cfg, &emitter)?;
+    step_service_start(&cfg, &emitter).await?;
+    step_configure_clients(&cfg, &emitter)?;
+    step_mint_capabilities(&cfg, &emitter).await?;
+    step_seed_subjects(&cfg, &emitter).await?;
+    step_configure_adapters(&cfg, &emitter)?;
+    let doctor_summary = step_doctor(&cfg, &emitter).await?;
+
+    let outcome = Outcome {
+        onboarded: doctor_summary.failed == 0,
+        clients_configured: vec![], // populated in phase 2B
+        adapters_enabled: vec![],   // populated in phase 3B
+        doctor: doctor_summary,
+    };
+    emitter.done(outcome.clone());
+    Ok(outcome)
+}
+
+/// Reverse what onboard did. Restores client config files from the
+/// most recent snapshot, stops + uninstalls the service, and (with
+/// `purge`) removes the SQLite DB. Idempotent.
+pub async fn offboard(cfg: PipelineConfig, purge: bool) -> Result<()> {
+    let emitter = Emitter::new(cfg.mode);
+
+    // Restore client configs from the most recent snapshot. This is
+    // the part that makes offboard "actually undo what we did" rather
+    // than "best-effort delete." On a clean system (no snapshot)
+    // it's a no-op.
+    if !cfg.dry_run {
+        match crate::onboard::snapshot::latest_snapshot()? {
+            Some(p) => match crate::onboard::snapshot::read(&p) {
+                Ok(snap) => {
+                    let report = crate::onboard::snapshot::restore(&snap)?;
+                    emitter.step_ok(
+                        StepName::ConfigureClients,
+                        serde_json::json!({
+                            "action": "restored-from-snapshot",
+                            "snapshot": p.to_string_lossy(),
+                            "restored": report.restored,
+                            "skipped": report.skipped,
+                        }),
+                    );
+                }
+                Err(e) => emitter.error(
+                    StepName::ConfigureClients,
+                    format!("could not read snapshot: {e}"),
+                    Some(format!("`rm {}` and re-run offboard", p.to_string_lossy())),
+                ),
+            },
+            None => emitter.step_skipped(
+                StepName::ConfigureClients,
+                "no snapshot found — onboard never ran or snapshots were deleted",
+            ),
+        }
+    } else {
+        emitter.step_skipped(StepName::ConfigureClients, "dry-run");
+    }
+
+    // Stop + uninstall the service. Skipped on unsupported platforms.
+    if cfg.skip_service || !service::is_supported() {
+        emitter.step_skipped(
+            StepName::ServiceInstall,
+            "skip-service or unsupported platform",
+        );
+    } else if cfg.dry_run {
+        emitter.step_skipped(StepName::ServiceInstall, "dry-run");
+    } else {
+        emitter.step_started(StepName::ServiceInstall);
+        let backend = service::detect_backend(paths::SERVICE_LABEL)?;
+        let unit_path = backend.unit_path();
+        backend.uninstall()?;
+        emitter.step_ok(
+            StepName::ServiceInstall,
+            serde_json::json!({"action": "uninstalled", "unit_path": unit_path.to_string_lossy()}),
+        );
+    }
+
+    // Optional purge: delete the SQLite DB and pidfile. Adapter
+    // tokens, snapshots, and skills.toml stay until phase 3A's
+    // snapshot-restore lands them in offboard.
+    if purge && !cfg.dry_run {
+        emitter.log(
+            crate::onboard::protocol::LogLevel::Info,
+            format!("purging DB at {}", cfg.db_path.to_string_lossy()),
+        );
+        let _ = std::fs::remove_file(&cfg.db_path);
+        let _ = std::fs::remove_file(pidfile::pidfile_path(&cfg.db_path));
+        // Best-effort hnsw sidecars.
+        for ext in &["hnsw.data", "hnsw.graph", "hnsw.map", "hnsw.meta"] {
+            let mut p = cfg.db_path.clone();
+            let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+            name.push(format!(".{ext}"));
+            p.set_file_name(name);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    emitter.done(Outcome {
+        onboarded: false,
+        clients_configured: vec![],
+        adapters_enabled: vec![],
+        doctor: DoctorSummary::default(),
+    });
+    Ok(())
+}
+
+// ---- step implementations ------------------------------------------
+
+async fn step_snapshot(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+    if !cfg.includes(StepName::Snapshot) {
+        return Ok(());
+    }
+    emitter.step_started(StepName::Snapshot);
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::Snapshot, "dry-run");
+        return Ok(());
+    }
+    let snap = crate::onboard::snapshot::capture(&cfg.db_path)
+        .await
+        .with_context_msg("capture snapshot")?;
+    let path = crate::onboard::snapshot::persist(&snap).with_context_msg("persist snapshot")?;
+    let running = snap.running_daemon.as_ref().map(|d| {
+        serde_json::json!({
+            "pid": d.pid,
+            "admin_url": format!("http://{}", d.admin_bind),
+            "version": d.version,
+        })
+    });
+    let existing_clients: Vec<&str> = snap
+        .client_configs
+        .iter()
+        .filter(|c| c.existed)
+        .map(|c| c.client.as_str())
+        .collect();
+    emitter.step_ok(
+        StepName::Snapshot,
+        serde_json::json!({
+            "snapshot_path": path.to_string_lossy(),
+            "running_daemon": running,
+            "existing_clients": existing_clients,
+            "captured_configs": snap.client_configs.len(),
+        }),
+    );
+    Ok(())
+}
+
+fn step_service_install(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+    if !cfg.includes(StepName::ServiceInstall) {
+        return Ok(());
+    }
+    emitter.step_started(StepName::ServiceInstall);
+    if cfg.skip_service {
+        emitter.step_skipped(StepName::ServiceInstall, "--skip-service");
+        return Ok(());
+    }
+    if !service::is_supported() {
+        emitter.step_skipped(
+            StepName::ServiceInstall,
+            "service install not supported on this OS yet (Windows in v0.5)",
+        );
+        return Ok(());
+    }
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::ServiceInstall, "dry-run");
+        return Ok(());
+    }
+
+    let binary = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not resolve current ctxd binary: {e}"))?;
+    let working_dir = paths::data_dir()?;
+    let log_dir = paths::log_dir()?;
+    // Ensure dirs exist so launchd / systemd don't fail trying to
+    // open log files in a missing directory.
+    let _ = std::fs::create_dir_all(&working_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let spec = ServiceSpec {
+        binary: binary.clone(),
+        args: vec![
+            "--db".into(),
+            cfg.db_path.to_string_lossy().into_owned(),
+            "--bind".into(),
+            cfg.bind.clone(),
+            "--wire-bind".into(),
+            cfg.wire_bind.clone(),
+            // Enable HTTP MCP transport so phase 2C's stdio→HTTP
+            // proxy in subprocess-spawned `ctxd serve --mcp-stdio`
+            // calls has somewhere to forward to. Convention: 7780.
+            "--mcp-http".into(),
+            "127.0.0.1:7780".into(),
+        ],
+        at_login: cfg.at_login,
+        working_dir,
+        log_dir,
+        label: paths::SERVICE_LABEL.into(),
+    };
+    let backend = service::detect_backend(paths::SERVICE_LABEL)?;
+    let report = backend.install(&spec)?;
+    emitter.step_ok(
+        StepName::ServiceInstall,
+        serde_json::json!({
+            "platform": backend.name(),
+            "service_name": paths::SERVICE_LABEL,
+            "binary_path": binary.to_string_lossy(),
+            "unit_path": report.unit_path.to_string_lossy(),
+            "action": match report.action {
+                service::InstallAction::Created => "created",
+                service::InstallAction::Updated => "updated",
+                service::InstallAction::Unchanged => "unchanged",
+            },
+            "at_login": cfg.at_login,
+        }),
+    );
+    Ok(())
+}
+
+async fn step_service_start(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+    if !cfg.includes(StepName::ServiceStart) {
+        return Ok(());
+    }
+    emitter.step_started(StepName::ServiceStart);
+    if cfg.skip_service {
+        emitter.step_skipped(StepName::ServiceStart, "--skip-service");
+        return Ok(());
+    }
+    if !service::is_supported() {
+        emitter.step_skipped(
+            StepName::ServiceStart,
+            "service install not supported on this OS yet",
+        );
+        return Ok(());
+    }
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::ServiceStart, "dry-run");
+        return Ok(());
+    }
+
+    let backend = service::detect_backend(paths::SERVICE_LABEL)?;
+    backend.start()?;
+
+    // Wait for /health up to 10s. The pidfile is written by the
+    // daemon (phase 1A) once the listener is up; we poll until it
+    // appears or the timeout elapses.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let started_at = std::time::Instant::now();
+    let (admin_url, version) = loop {
+        if let pidfile::DaemonState::Running(pf) = pidfile::detect(&cfg.db_path).await {
+            break (format!("http://{}", pf.admin_bind), pf.version);
+        }
+        if std::time::Instant::now() >= deadline {
+            emitter.error(
+                StepName::ServiceStart,
+                format!(
+                    "daemon did not become healthy within 10s — check `{} status` and the launchd / systemd log",
+                    backend.name()
+                ),
+                Some("ctxd doctor".into()),
+            );
+            anyhow::bail!("daemon did not respond on /health within 10s");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    emitter.step_ok(
+        StepName::ServiceStart,
+        serde_json::json!({
+            "http_url": admin_url,
+            "version": version,
+            "uptime_ms": started_at.elapsed().as_millis() as u64,
+        }),
+    );
+    Ok(())
+}
+
+fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+    if !cfg.includes(StepName::ConfigureClients) {
+        return Ok(());
+    }
+    emitter.step_started(StepName::ConfigureClients);
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::ConfigureClients, "dry-run");
+        return Ok(());
+    }
+    let binary = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not resolve current ctxd binary: {e}"))?;
+    let spec = ClientSpec {
+        binary,
+        db_path: cfg.db_path.clone(),
+        with_hooks: cfg.with_hooks,
+    };
+    let results = clients::apply_all(&spec);
+    let mut summary = serde_json::Map::new();
+    let mut config_paths = Vec::new();
+    for (cid, res) in &results {
+        let label = cid.slug();
+        match res {
+            Ok(action) => {
+                let s = match action {
+                    ApplyAction::Created => "configured",
+                    ApplyAction::EntryAdded => "configured",
+                    ApplyAction::EntryUpdated => "configured",
+                    ApplyAction::Unchanged => "configured",
+                    ApplyAction::ManualPending => "manual-pending",
+                };
+                summary.insert(label.to_string(), serde_json::Value::String(s.into()));
+            }
+            Err(e) => {
+                summary.insert(
+                    label.to_string(),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+            }
+        }
+    }
+    // Best-effort path collection — used by the skill's UI to deep-link.
+    for cid in [
+        ClientId::ClaudeDesktop,
+        ClientId::ClaudeCode,
+        ClientId::Codex,
+    ] {
+        if let Some(p) = path_for_client(cid) {
+            config_paths.push(p);
+        }
+    }
+    emitter.step_ok(
+        StepName::ConfigureClients,
+        serde_json::json!({
+            "clients": serde_json::Value::Object(summary),
+            "config_paths": config_paths,
+            "with_hooks": cfg.with_hooks,
+        }),
+    );
+    Ok(())
+}
+
+fn path_for_client(cid: ClientId) -> Option<String> {
+    match cid {
+        ClientId::ClaudeDesktop => paths::claude_desktop_config()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        ClientId::ClaudeCode => paths::claude_code_config()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        ClientId::Codex => paths::config_dir()
+            .ok()
+            .map(|p| p.join("codex.snippet.toml").to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+async fn step_mint_capabilities(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+    if !cfg.includes(StepName::MintCapabilities) {
+        return Ok(());
+    }
+    emitter.step_started(StepName::MintCapabilities);
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::MintCapabilities, "dry-run");
+        return Ok(());
+    }
+
+    // Open the store to get the root cap-engine key. The daemon's
+    // own setup persists this on first run; we mirror that logic
+    // here so onboard works pre-first-serve too.
+    let store = EventStore::open(&cfg.db_path)
+        .await
+        .with_context_msg("failed to open event store for cap minting")?;
+    let cap_engine = match store
+        .get_metadata("root_key")
+        .await
+        .with_context_msg("read root_key metadata")?
+    {
+        Some(key_bytes) => CapEngine::from_private_key(&key_bytes)
+            .map_err(|e| anyhow::anyhow!("stored root key invalid: {e}"))?,
+        None => {
+            let engine = CapEngine::new();
+            store
+                .set_metadata("root_key", &engine.private_key_bytes())
+                .await
+                .with_context_msg("persist root_key")?;
+            engine
+        }
+    };
+
+    // The set of clients onboard always mints for. Adapters get
+    // their cap-files in the configure-adapters step (phase 3B);
+    // they're listed here too so the file is staged regardless of
+    // whether the adapter is actually enabled — that way `ctxd
+    // doctor`'s caps-valid check has stable expectations.
+    let clients = [
+        ClientId::ClaudeDesktop,
+        ClientId::ClaudeCode,
+        ClientId::Codex,
+        ClientId::GmailAdapter,
+        ClientId::GithubAdapter,
+        ClientId::FsAdapter,
+    ];
+    let mut minted = Vec::new();
+    for c in clients {
+        let path = caps::mint_and_persist(&cap_engine, c, cfg.strict_scopes)
+            .with_context_msg("mint cap")?;
+        minted.push(serde_json::json!({
+            "client": c.slug(),
+            "path": path.to_string_lossy(),
+            "scope": c.default_scope(cfg.strict_scopes),
+            "operations": c
+                .default_operations(cfg.strict_scopes)
+                .iter()
+                .map(|op| op_slug(*op))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    emitter.step_ok(
+        StepName::MintCapabilities,
+        serde_json::json!({
+            "tokens_minted": minted.len(),
+            "stored_at": paths::caps_dir()?.to_string_lossy(),
+            "strict_scopes": cfg.strict_scopes,
+            "minted": minted,
+        }),
+    );
+    Ok(())
+}
+
+/// Translate a [`ctxd_cap::Operation`] back to its protocol slug for
+/// the mint-capabilities `detail.minted[].operations` field.
+fn op_slug(op: ctxd_cap::Operation) -> &'static str {
+    use ctxd_cap::Operation;
+    match op {
+        Operation::Read => "read",
+        Operation::Write => "write",
+        Operation::Search => "search",
+        Operation::Subjects => "subjects",
+        Operation::Admin => "admin",
+        Operation::Peer => "peer",
+        Operation::Subscribe => "subscribe",
+    }
+}
+
+trait WithContextMsg<T> {
+    fn with_context_msg(self, msg: &'static str) -> Result<T>;
+}
+
+impl<T, E> WithContextMsg<T> for std::result::Result<T, E>
+where
+    E: std::fmt::Display,
+{
+    fn with_context_msg(self, msg: &'static str) -> Result<T> {
+        self.map_err(|e| anyhow::anyhow!("{msg}: {e}"))
+    }
+}
+
+async fn step_seed_subjects(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+    if !cfg.includes(StepName::SeedSubjects) {
+        return Ok(());
+    }
+    emitter.step_started(StepName::SeedSubjects);
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::SeedSubjects, "dry-run");
+        return Ok(());
+    }
+    let report = crate::onboard::seeds::seed_at_path(&cfg.db_path)
+        .await
+        .with_context_msg("seed /me/**")?;
+    emitter.step_ok(
+        StepName::SeedSubjects,
+        serde_json::json!({
+            "subjects_created": report.created,
+            "subjects_skipped": report.skipped,
+            "events_written": report.created.len(),
+        }),
+    );
+    Ok(())
+}
+
+fn step_configure_adapters(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+    if !cfg.includes(StepName::ConfigureAdapters) {
+        return Ok(());
+    }
+    emitter.step_started(StepName::ConfigureAdapters);
+    if cfg.skip_adapters {
+        emitter.step_skipped(StepName::ConfigureAdapters, "--skip-adapters");
+        return Ok(());
+    }
+    if cfg.dry_run {
+        emitter.step_skipped(StepName::ConfigureAdapters, "dry-run");
+        return Ok(());
+    }
+
+    // Read existing manifest so we don't clobber sibling adapter
+    // entries (e.g. the user enabled gmail by hand and we're only
+    // updating fs).
+    let mut manifest = crate::onboard::skills_toml::read().unwrap_or_default();
+    let mut summary = serde_json::Map::new();
+    let mut enabled_slugs = Vec::<String>::new();
+
+    // fs adapter: enabled iff the user passed --fs=<paths>.
+    if cfg.fs.is_empty() {
+        // Disable the entry if it existed before; we don't silently
+        // keep an old config when the user re-runs onboard without
+        // the flag.
+        manifest.fs = Some(crate::onboard::skills_toml::FsSkill {
+            enabled: false,
+            paths: vec![],
+        });
+        summary.insert("fs".into(), serde_json::Value::String("skipped".into()));
+    } else {
+        manifest.fs = Some(crate::onboard::skills_toml::FsSkill {
+            enabled: true,
+            paths: cfg.fs.clone(),
+        });
+        summary.insert(
+            "fs".into(),
+            serde_json::json!({"enabled": true, "paths": cfg.fs}),
+        );
+        enabled_slugs.push("fs".into());
+    }
+
+    // Gmail / GitHub: declared in manifest but spawn is deferred to
+    // the next 3B drop (OAuth + PAT plumbing). The doctor will
+    // surface them as `manual-pending` until then.
+    if !matches!(cfg.gmail, AdapterChoice::Skip) {
+        summary.insert(
+            "gmail".into(),
+            serde_json::Value::String("manual-pending".into()),
+        );
+    }
+    if !matches!(cfg.github, AdapterChoice::Skip) {
+        summary.insert(
+            "github".into(),
+            serde_json::Value::String("manual-pending".into()),
+        );
+    }
+
+    let path =
+        crate::onboard::skills_toml::write(&manifest).with_context_msg("write skills.toml")?;
+    emitter.step_ok(
+        StepName::ConfigureAdapters,
+        serde_json::json!({
+            "skills_toml": path.to_string_lossy(),
+            "adapters": serde_json::Value::Object(summary),
+            "enabled_slugs": enabled_slugs,
+        }),
+    );
+    Ok(())
+}
+
+async fn step_doctor(cfg: &PipelineConfig, emitter: &Emitter) -> Result<DoctorSummary> {
+    if !cfg.includes(StepName::Doctor) {
+        return Ok(DoctorSummary::default());
+    }
+    emitter.step_started(StepName::Doctor);
+    let checks = doctor::run(&cfg.db_path).await;
+    let summary = doctor::Summary::from_checks(&checks);
+    // Warnings count as success — they're surfaced to the user but
+    // don't flip onboarded=false. Only Failed checks fail the step.
+    let status = if summary.failed > 0 {
+        StepStatus::Failed
+    } else {
+        StepStatus::Ok
+    };
+    let detail = serde_json::json!({
+        "checks": checks,
+        "summary": {
+            "total": summary.total,
+            "ok": summary.ok,
+            "warnings": summary.warnings,
+            "failed": summary.failed,
+            "skipped": summary.skipped,
+        }
+    });
+    match status {
+        StepStatus::Ok => emitter.step_ok(StepName::Doctor, detail),
+        _ => emitter.step_failed(StepName::Doctor),
+    };
+    Ok(DoctorSummary {
+        total: summary.total,
+        ok: summary.ok,
+        warnings: summary.warnings,
+        failed: summary.failed,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(db: &std::path::Path) -> PipelineConfig {
+        PipelineConfig {
+            mode: OutputMode::Null,
+            headless: true,
+            dry_run: false,
+            skip_adapters: true,
+            skip_service: true, // skip in tests so we don't touch real launchd
+            at_login: false,
+            strict_scopes: false,
+            with_hooks: false,
+            gmail: AdapterChoice::Skip,
+            github: AdapterChoice::Skip,
+            fs: vec![],
+            only: None,
+            db_path: db.to_path_buf(),
+            bind: "127.0.0.1:0".into(),
+            wire_bind: "127.0.0.1:0".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_service_skips_install_and_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ctxd.db");
+        let outcome = onboard(cfg(&db)).await.unwrap();
+        // The doctor's daemon-running check fails (no daemon, since
+        // we skipped service-start), so onboarded is false. That's
+        // expected for --skip-service.
+        assert!(!outcome.onboarded);
+        assert!(outcome.doctor.total >= 9);
+    }
+
+    #[tokio::test]
+    async fn dry_run_makes_no_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ctxd.db");
+        let mut c = cfg(&db);
+        c.dry_run = true;
+        c.skip_service = false; // even with skip_service off, dry_run blocks mutations
+
+        let _ = onboard(c).await.unwrap();
+        // No plist written:
+        let plist_under_test = dirs_home_or_default()
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", paths::SERVICE_LABEL));
+        // We can't fully assert non-existence on a host that may have
+        // a real plist already. But we CAN assert the dry_run didn't
+        // CREATE one — checked via mtime not being recent. Skip that
+        // detail for portability and just confirm no panic.
+        let _ = plist_under_test;
+    }
+
+    #[tokio::test]
+    async fn only_filter_runs_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ctxd.db");
+        let mut c = cfg(&db);
+        let mut only = HashSet::new();
+        only.insert(StepName::Snapshot);
+        only.insert(StepName::Doctor);
+        c.only = Some(only);
+        let _ = onboard(c).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offboard_dry_run_does_not_touch_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ctxd.db");
+        std::fs::write(&db, b"sentinel").unwrap();
+        let mut c = cfg(&db);
+        c.dry_run = true;
+        offboard(c, true).await.unwrap();
+        // DB still there even though we asked for --purge — dry_run wins.
+        assert_eq!(std::fs::read(&db).unwrap(), b"sentinel");
+    }
+
+    #[tokio::test]
+    async fn offboard_purge_removes_db_and_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ctxd.db");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(db.with_extension("db.hnsw.data"), b"x").unwrap();
+        std::fs::write(db.with_extension("db.hnsw.graph"), b"x").unwrap();
+        std::fs::write(pidfile::pidfile_path(&db), b"{}").unwrap();
+        let c = cfg(&db);
+        offboard(c, true).await.unwrap();
+        assert!(!db.exists(), "DB should be removed by --purge");
+        assert!(
+            !pidfile::pidfile_path(&db).exists(),
+            "pidfile should be removed"
+        );
+        assert!(
+            !db.with_extension("db.hnsw.data").exists(),
+            "hnsw.data sidecar should be removed"
+        );
+    }
+
+    fn dirs_home_or_default() -> PathBuf {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    }
+}

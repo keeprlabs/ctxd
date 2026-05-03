@@ -115,6 +115,19 @@ enum Commands {
         /// the duckdb-object backend's local-fs mode.
         #[arg(long = "storage-uri")]
         storage_uri: Option<String>,
+
+        /// Path to a base64-encoded capability token file (mode
+        /// `0600`). When set, the daemon reads the token at startup
+        /// for use as the bearer credential on inbound MCP-stdio
+        /// requests when this serve invocation is itself a stdio
+        /// subprocess spawned by an MCP client (Claude Desktop /
+        /// Code / Codex). v0.4 reads the file but defers full
+        /// stdio→HTTP proxy semantics — for now this argument is
+        /// accepted so onboard-written client configs don't fail
+        /// to launch. May be passed more than once for multi-tenant
+        /// scenarios.
+        #[arg(long = "cap-file")]
+        cap_file: Vec<PathBuf>,
     },
 
     /// Open the embedded web dashboard at `http://127.0.0.1:7777/`.
@@ -213,6 +226,66 @@ enum Commands {
         public_key: String,
     },
 
+    /// Live tail of new events, optionally filtered by subject pattern.
+    ///
+    /// Connects to the running daemon's `/v1/events/stream` SSE endpoint
+    /// and prints each event as one JSON Line on stdout. Exits when
+    /// stdin closes (or on the configured timeout). Used by the
+    /// `ctxd-memory` skill's first-use demo: skill says "open Claude
+    /// Desktop, say X, come back," then runs
+    /// `ctxd watch /me/preferences --timeout 30s` to confirm the write
+    /// landed within a window.
+    Watch {
+        /// Subject pattern to filter on (substring match against the
+        /// event's subject path). Empty = all events.
+        #[arg(default_value = "")]
+        pattern: String,
+
+        /// Connect to this admin URL. Defaults to the pidfile-resolved
+        /// daemon at `<db_path>.pid`.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Stop after this many seconds. Default: forever.
+        #[arg(long)]
+        timeout_s: Option<u64>,
+
+        /// Stop after this many matching events.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// Receive a Claude Code hook payload on stdin and append it to the
+    /// event log under `/me/sessions/<slug>`.
+    ///
+    /// Wired into `~/.claude/settings.json` by `ctxd onboard
+    /// --with-hooks` (phase 2B). The skill installs four entries —
+    /// `session-start`, `user-prompt-submit`, `pre-compact`, `stop`
+    /// — each invoked by Claude Code at the corresponding lifecycle
+    /// event with a JSON payload on stdin. This subcommand reads
+    /// stdin (best-effort; up to 64 KiB), parses if possible, and
+    /// writes a single event so the agent's session lifecycle is
+    /// captured in `/me/sessions`.
+    ///
+    /// Failures are silent — if the cap-file is missing, the DB
+    /// can't be opened, etc., we exit 0 with a stderr warning so
+    /// Claude Code's stop event doesn't surface a noisy error to
+    /// the user. Hooks are best-effort instrumentation, not a
+    /// critical path.
+    Hook {
+        /// Event slug. One of `session-start`, `user-prompt-submit`,
+        /// `pre-compact`, `stop` (or any custom slug — we don't
+        /// gate on the set).
+        slug: String,
+
+        /// Capability file. Today the hook uses the local DB
+        /// directly without verification; the arg is accepted so
+        /// the settings.json command line matches what onboard
+        /// writes.
+        #[arg(long = "cap-file")]
+        cap_file: Option<PathBuf>,
+    },
+
     /// List subjects in the store.
     Subjects {
         /// Optional prefix to filter.
@@ -265,6 +338,113 @@ enum Commands {
         /// Decision to record: `allow` or `deny`.
         #[arg(long)]
         decision: String,
+    },
+
+    /// Set up ctxd as a one-time install: service + clients + caps + seeds.
+    ///
+    /// The single command that turns a fresh `ctxd` install into a
+    /// running, MCP-connected, opinion-having context substrate.
+    /// Walks the seven onboarding steps, optionally pausing for
+    /// adapter consent. See `docs/onboarding.md` for the full
+    /// step-by-step.
+    ///
+    /// `--skill-mode` switches output to newline-delimited JSON per
+    /// the `docs/onboard-protocol.md` contract — the Claude Code
+    /// skill (in `skill/ctxd-memory/`) and any other front door
+    /// shell to ctxd in this mode.
+    Onboard {
+        /// Output as newline-delimited JSON per `docs/onboard-protocol.md`.
+        /// Implies `--headless`.
+        #[arg(long, default_value_t = false)]
+        skill_mode: bool,
+
+        /// Run with all defaults; never pause on a prompt.
+        #[arg(long, default_value_t = false)]
+        headless: bool,
+
+        /// Plan only — emit step messages but make no changes.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Skip the configure-adapters step entirely.
+        #[arg(long, default_value_t = false)]
+        skip_adapters: bool,
+
+        /// Don't install the system service. Useful when running
+        /// `ctxd serve` in a foreground terminal instead.
+        #[arg(long, default_value_t = false)]
+        skip_service: bool,
+
+        /// Configure the service to start at user login.
+        #[arg(long, default_value_t = false)]
+        at_login: bool,
+
+        /// Mint narrower per-client capability tokens (phase 2A).
+        #[arg(long, default_value_t = false)]
+        strict_scopes: bool,
+
+        /// Write Claude Code SessionStart / UserPromptSubmit /
+        /// PreCompact / Stop hooks (phase 2B).
+        #[arg(long, default_value_t = true)]
+        with_hooks: bool,
+
+        /// Comma-separated list of step slugs to run (e.g.
+        /// `service-install,service-start`). Default: all steps.
+        #[arg(long)]
+        only: Option<String>,
+
+        /// Address to bind the daemon's HTTP admin API.
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        bind: String,
+
+        /// Address to bind the wire protocol.
+        #[arg(long, default_value = "127.0.0.1:7778")]
+        wire_bind: String,
+
+        /// Comma- or repeat-separated absolute paths to watch with
+        /// the in-process fs adapter. Empty = skip. Each path
+        /// landing in `/me/fs/<relative-path>`.
+        #[arg(long, value_delimiter = ',')]
+        fs: Vec<PathBuf>,
+    },
+
+    /// Reverse a previous `ctxd onboard` cleanly.
+    ///
+    /// Stops + uninstalls the system service, deletes capability
+    /// files, and (with `--purge`) removes the SQLite DB. Idempotent
+    /// — running offboard on a clean system is a no-op.
+    Offboard {
+        /// Output as newline-delimited JSON.
+        #[arg(long, default_value_t = false)]
+        skill_mode: bool,
+
+        /// Plan only — emit messages but make no changes.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Also delete the SQLite DB and HNSW sidecars. Default off
+        /// — caller must opt in to data loss.
+        #[arg(long, default_value_t = false)]
+        purge: bool,
+
+        /// Don't touch the system service. Useful if you want to
+        /// keep launchd / systemd config but delete data.
+        #[arg(long, default_value_t = false)]
+        skip_service: bool,
+    },
+
+    /// Run diagnostic checks on the local ctxd installation.
+    ///
+    /// Reports daemon health, storage integrity, configured clients,
+    /// minted capabilities, and adapter status. Each failed check
+    /// includes a remediation hint. Run anytime — standalone, or as
+    /// step 7 of `ctxd onboard`.
+    Doctor {
+        /// Emit JSON instead of human-readable output. Used by the
+        /// Claude Code skill and CI scripts. Schema mirrors
+        /// `onboard::doctor::Check`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Connect to a running ctxd daemon via the wire protocol.
@@ -422,7 +602,23 @@ async fn main() -> Result<()> {
             embedder_api_key,
             storage,
             storage_uri,
+            cap_file,
         } => {
+            // Best-effort cap-file presence check. Non-fatal — the
+            // file may legitimately not exist yet (first-run race
+            // between client launch and onboard) and we'd rather
+            // start with a warning than refuse. Full enforcement
+            // (proxy stdio→HTTP MCP, validate caps on each tool call)
+            // is deferred from v0.4 — see docs/onboarding.md.
+            for p in &cap_file {
+                if !p.exists() {
+                    tracing::warn!(
+                        path = %p.to_string_lossy(),
+                        "cap-file does not exist yet; continuing without enforcement"
+                    );
+                }
+            }
+            let _ = &cap_file; // future use: stdio proxy auth
             let cfg = ctxd_cli::serve::ServeConfig {
                 bind,
                 wire_bind: Some(wire_bind),
@@ -437,6 +633,8 @@ async fn main() -> Result<()> {
                 storage,
                 storage_uri,
                 federation: true,
+                db_path: Some(cli.db.clone()),
+                cap_files: cap_file,
             };
             ctxd_cli::serve::serve(cfg, store, cap_engine, caveat_state, pending_approval_tx)
                 .await?;
@@ -461,6 +659,8 @@ async fn main() -> Result<()> {
                 storage: "sqlite".to_string(),
                 storage_uri: None,
                 federation: false,
+                db_path: Some(cli.db.clone()),
+                cap_files: vec![],
             };
             // Spawn a deferred opener that fires once the bind has
             // had a moment to come up. Doing this *before* the
@@ -913,6 +1113,296 @@ async fn main() -> Result<()> {
             );
         }
 
+        Commands::Onboard {
+            skill_mode,
+            headless,
+            dry_run,
+            skip_adapters,
+            skip_service,
+            at_login,
+            strict_scopes,
+            with_hooks,
+            only,
+            bind,
+            wire_bind,
+            fs,
+        } => {
+            use ctxd_cli::onboard::pipeline::{onboard, AdapterChoice, PipelineConfig};
+            use ctxd_cli::onboard::protocol::OutputMode;
+            use std::collections::HashSet;
+            let mode = if skill_mode {
+                OutputMode::Skill
+            } else {
+                OutputMode::Human
+            };
+            let only_set = only.as_deref().map(|s| {
+                s.split(',')
+                    .map(|p| p.trim())
+                    .filter(|p| !p.is_empty())
+                    .filter_map(parse_step)
+                    .collect::<HashSet<_>>()
+            });
+            let cfg = PipelineConfig {
+                mode,
+                headless: headless || skill_mode,
+                dry_run,
+                skip_adapters,
+                skip_service,
+                at_login,
+                strict_scopes,
+                with_hooks,
+                gmail: AdapterChoice::Skip,
+                github: AdapterChoice::Skip,
+                fs,
+                only: only_set,
+                db_path: cli.db.clone(),
+                bind,
+                wire_bind,
+            };
+            let outcome = onboard(cfg).await?;
+            if !outcome.onboarded {
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Offboard {
+            skill_mode,
+            dry_run,
+            purge,
+            skip_service,
+        } => {
+            use ctxd_cli::onboard::pipeline::{offboard, AdapterChoice, PipelineConfig};
+            use ctxd_cli::onboard::protocol::OutputMode;
+            let mode = if skill_mode {
+                OutputMode::Skill
+            } else {
+                OutputMode::Human
+            };
+            let cfg = PipelineConfig {
+                mode,
+                headless: true,
+                dry_run,
+                skip_adapters: true,
+                skip_service,
+                at_login: false,
+                strict_scopes: false,
+                with_hooks: false,
+                gmail: AdapterChoice::Skip,
+                github: AdapterChoice::Skip,
+                fs: vec![],
+                only: None,
+                db_path: cli.db.clone(),
+                bind: "127.0.0.1:7777".to_string(),
+                wire_bind: "127.0.0.1:7778".to_string(),
+            };
+            offboard(cfg, purge).await?;
+        }
+
+        Commands::Watch {
+            pattern,
+            url,
+            timeout_s,
+            limit,
+        } => {
+            // Resolve the daemon URL: explicit --url overrides; else
+            // read the pidfile alongside --db.
+            let admin_url = match url {
+                Some(u) => u,
+                None => {
+                    let pf = ctxd_cli::pidfile::read(&cli.db).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no pidfile at {} — daemon not running, or pass --url",
+                            ctxd_cli::pidfile::pidfile_path(&cli.db).to_string_lossy()
+                        )
+                    })?;
+                    format!("http://{}", pf.admin_bind)
+                }
+            };
+            let host_header = admin_url
+                .strip_prefix("http://")
+                .or_else(|| admin_url.strip_prefix("https://"))
+                .unwrap_or(&admin_url)
+                .to_string();
+            // Raw TCP + manual HTTP/1.1 request. We can't use
+            // reqwest's bytes_stream() here because hyper buffers
+            // chunked-transfer responses opaquely on some macOS
+            // builds, never delivering bytes until the connection
+            // closes — which never happens for an SSE stream.
+            // Loopback-only, no TLS needed.
+            let connect_target = host_header.clone();
+            let mut tcp_stream = tokio::net::TcpStream::connect(&connect_target)
+                .await
+                .with_context(|| format!("connect to {connect_target}"))?;
+            let req_line = format!(
+                "GET /v1/events/stream HTTP/1.1\r\n\
+                 Host: {host_header}\r\n\
+                 Accept: text/event-stream\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n"
+            );
+            use tokio::io::AsyncWriteExt;
+            tcp_stream
+                .write_all(req_line.as_bytes())
+                .await
+                .context("write SSE request")?;
+            tcp_stream.flush().await.context("flush SSE request")?;
+            let mut buf = String::new();
+            let deadline =
+                timeout_s.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+            let mut emitted = 0usize;
+            'outer: loop {
+                if let Some(d) = deadline {
+                    if std::time::Instant::now() >= d {
+                        break;
+                    }
+                }
+                use tokio::io::AsyncReadExt;
+                let mut chunk_buf = [0u8; 4096];
+                let n = if let Some(d) = deadline {
+                    let remaining = d.saturating_duration_since(std::time::Instant::now());
+                    match tokio::time::timeout(remaining, tcp_stream.read(&mut chunk_buf)).await {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => return Err(e).context("read SSE bytes"),
+                        Err(_) => break,
+                    }
+                } else {
+                    match tcp_stream.read(&mut chunk_buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => return Err(e).context("read SSE bytes"),
+                    }
+                };
+                buf.push_str(&String::from_utf8_lossy(&chunk_buf[..n]));
+                // Normalise CRLF to LF so the frame split tolerates
+                // both axum/hyper's \r\n\r\n and bare \n\n.
+                buf = buf.replace("\r\n", "\n");
+                // Hyper sends chunked transfer encoding, interleaving
+                // hex chunk-size lines with SSE framing. Rather than
+                // parse chunked encoding by hand, scan for `data:`
+                // lines anywhere in the buffer — chunk-size lines
+                // are pure hex and never start with "data:".
+                while let Some(start) = buf.find("data:") {
+                    let after = &buf[start..];
+                    let nl = match after.find('\n') {
+                        Some(n) => n,
+                        None => break, // partial; wait for more bytes
+                    };
+                    let line = &after[..nl];
+                    let payload = line
+                        .strip_prefix("data:")
+                        .map(|s| s.trim_start())
+                        .unwrap_or("")
+                        .to_string();
+                    let consumed = start + nl + 1;
+                    buf.drain(..consumed);
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&payload);
+                    let matched = if pattern.is_empty() {
+                        parsed.is_ok()
+                    } else {
+                        parsed
+                            .as_ref()
+                            .ok()
+                            .and_then(|v| {
+                                v.get("subject").and_then(|s| s.as_str()).map(String::from)
+                            })
+                            .map(|s| s.contains(&pattern))
+                            .unwrap_or(false)
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    println!("{payload}");
+                    emitted += 1;
+                    if let Some(l) = limit {
+                        if emitted >= l {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            // Exit code conveys whether anything matched, so scripts
+            // can branch on "watcher saw 0 events" vs "watcher saw N."
+            if emitted == 0 {
+                std::process::exit(2);
+            }
+        }
+
+        Commands::Hook { slug, cap_file } => {
+            let _ = cap_file; // accepted; future: verify before append
+                              // Read up to 64 KiB from stdin. Hooks send small JSON
+                              // payloads; we cap to keep this pure overhead-free.
+            use std::io::Read as _;
+            let mut payload = Vec::with_capacity(4096);
+            let _ = std::io::stdin()
+                .lock()
+                .take(65_536)
+                .read_to_end(&mut payload);
+            let parsed: serde_json::Value = if payload.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&payload).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "raw": String::from_utf8_lossy(&payload).into_owned(),
+                    })
+                })
+            };
+            let subject_path = format!("/me/sessions/{slug}");
+            let subject = match Subject::new(&subject_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ctxd hook: invalid slug {slug:?}: {e}");
+                    return Ok(());
+                }
+            };
+            let data = serde_json::json!({
+                "event": slug,
+                "captured_at": chrono::Utc::now().to_rfc3339(),
+                "payload": parsed,
+            });
+            let event = Event::new(
+                "ctxd://hook".to_string(),
+                subject,
+                format!("hook.{slug}"),
+                data,
+            );
+            // Best-effort append; never panic from a hook.
+            if let Err(e) = store.append(event).await {
+                eprintln!("ctxd hook: append failed (best-effort): {e}");
+            }
+            // Exit 0 regardless — hooks must not surface errors to
+            // Claude Code or it spams the user on every Stop.
+        }
+
+        Commands::Doctor { json } => {
+            let checks = ctxd_cli::onboard::doctor::run(&cli.db).await;
+            if json {
+                let summary = ctxd_cli::onboard::doctor::Summary::from_checks(&checks);
+                let body = serde_json::json!({
+                    "checks": checks,
+                    "summary": {
+                        "total": summary.total,
+                        "ok": summary.ok,
+                        "warnings": summary.warnings,
+                        "failed": summary.failed,
+                        "skipped": summary.skipped,
+                    },
+                });
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                if !summary.all_ok() {
+                    std::process::exit(1);
+                }
+            } else {
+                let all_ok = ctxd_cli::onboard::doctor::render_human(&checks);
+                if !all_ok {
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::Connect { addr, action } => {
             let mut client = ProtocolClient::connect(&addr)
                 .await
@@ -983,6 +1473,25 @@ impl Drop for OtelGuard {
                 eprintln!("OpenTelemetry shutdown error: {e}");
             }
         }
+    }
+}
+
+/// Parse one step slug from `--only` into the typed [`StepName`].
+/// Unknown slugs are dropped silently — the protocol's stable
+/// kebab-case slugs are the contract; any string outside that set
+/// shouldn't crash the CLI.
+fn parse_step(slug: &str) -> Option<ctxd_cli::onboard::protocol::StepName> {
+    use ctxd_cli::onboard::protocol::StepName;
+    match slug {
+        "snapshot" => Some(StepName::Snapshot),
+        "service-install" => Some(StepName::ServiceInstall),
+        "service-start" => Some(StepName::ServiceStart),
+        "configure-clients" => Some(StepName::ConfigureClients),
+        "mint-capabilities" => Some(StepName::MintCapabilities),
+        "seed-subjects" => Some(StepName::SeedSubjects),
+        "configure-adapters" => Some(StepName::ConfigureAdapters),
+        "doctor" => Some(StepName::Doctor),
+        _ => None,
     }
 }
 
