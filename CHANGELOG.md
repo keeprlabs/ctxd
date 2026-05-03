@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.1 — 2026-05-03
+
+Fixes the path footgun shipped in v0.4: **`ctxd onboard` now works regardless of which directory you invoke it from.**
+
+### What was wrong
+
+The global `--db` flag defaulted to the literal string `"ctxd.db"` — relative to cwd. When `ctxd onboard` ran from any directory other than `~/Library/Application Support/ctxd/`:
+
+* The foreground command opened the SQLite DB at `<cwd>/ctxd.db`, generated a root_key there, and minted six capability files at the global `<config_dir>/ctxd/caps/<client>.bk` path against that root_key.
+* The launchd plist that `service-install` wrote pointed the daemon at the canonical `~/Library/Application Support/ctxd/ctxd.db` (because the plist's WorkingDirectory is `paths::data_dir()`). The daemon there generated its OWN root_key.
+* `service-start` polled the cli.db's pidfile (`<cwd>/ctxd.db.pid`) but the launchd-spawned daemon wrote its pidfile alongside the canonical DB — the two paths never aligned, so onboard always failed at the 10-second `/health` deadline.
+* Even after manual cleanup, every `ctxd doctor` reported `caps-valid: failed` for all six clients with `biscuit error: error deserializing or verifying the token` — the caps were signed by the cwd DB's root_key but verified against the canonical DB's root_key.
+
+### Fixes
+
+- **`--db` now defaults to `paths::default_db_path()`.** macOS resolves to `~/Library/Application Support/ctxd/ctxd.db`, Linux to `$XDG_DATA_HOME/ctxd/ctxd.db`, Windows to `%APPDATA%\ctxd\data\ctxd.db`. `CTXD_DATA_DIR` overrides. Existing `--db <path>` invocations are unchanged.
+- **`service-start` probes both pidfile paths.** When the cli.db pidfile doesn't show up within the deadline, also try the canonical default-db pidfile. Defense-in-depth: a 0.4 binary running against an old plist (or vice-versa) won't wedge.
+- **`Outcome.clients_configured` and `Outcome.adapters_enabled` populate correctly.** The closing `done — N client(s) configured, M adapter(s) enabled` line was always `0 / 0` because the pipeline never threaded the slugs through. Now it reads `done — 3 client(s) configured` (claude-desktop, claude-code, codex) on a typical onboard.
+
+### Migration from v0.4.0
+
+If you ran `ctxd onboard` on v0.4.0 from outside `Application Support` and hit the symptoms above, run the cleanup once on your machine:
+
+```bash
+launchctl bootout gui/$UID/com.ctxd.serve 2>/dev/null
+launchctl bootout gui/$UID/dev.ctxd.daemon 2>/dev/null
+rm -f ~/Library/LaunchAgents/{com.ctxd.serve,dev.ctxd.daemon}.plist
+rm -rf "$HOME/Library/Application Support/ctxd/caps"
+rm -f  "$HOME/Library/Application Support/ctxd/ctxd.db.pid"
+ctxd onboard   # picks up the v0.4.1 default
+```
+
 ## v0.4 — 2026-05-02
 
 The plug-and-play release. **Every AI on your machine, one memory** — installed in two commands.

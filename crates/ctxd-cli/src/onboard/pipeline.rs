@@ -113,16 +113,16 @@ pub async fn onboard(cfg: PipelineConfig) -> Result<Outcome> {
     step_snapshot(&cfg, &emitter).await?;
     step_service_install(&cfg, &emitter)?;
     step_service_start(&cfg, &emitter).await?;
-    step_configure_clients(&cfg, &emitter)?;
+    let clients_configured = step_configure_clients(&cfg, &emitter)?;
     step_mint_capabilities(&cfg, &emitter).await?;
     step_seed_subjects(&cfg, &emitter).await?;
-    step_configure_adapters(&cfg, &emitter)?;
+    let adapters_enabled = step_configure_adapters(&cfg, &emitter)?;
     let doctor_summary = step_doctor(&cfg, &emitter).await?;
 
     let outcome = Outcome {
         onboarded: doctor_summary.failed == 0,
-        clients_configured: vec![], // populated in phase 2B
-        adapters_enabled: vec![],   // populated in phase 3B
+        clients_configured,
+        adapters_enabled,
         doctor: doctor_summary,
     };
     emitter.done(outcome.clone());
@@ -352,13 +352,29 @@ async fn step_service_start(cfg: &PipelineConfig, emitter: &Emitter) -> Result<(
     backend.start()?;
 
     // Wait for /health up to 10s. The pidfile is written by the
-    // daemon (phase 1A) once the listener is up; we poll until it
-    // appears or the timeout elapses.
+    // daemon (phase 1A) once the listener is up. Probe BOTH the
+    // cli.db pidfile and the canonical default-db pidfile — the
+    // launchd plist's --db is whatever was passed to onboard, but
+    // its WorkingDirectory is paths::data_dir(); a relative cli.db
+    // would put the plist's pidfile at <data_dir>/<basename>.pid
+    // while onboard's pidfile probe looks at <cwd>/<basename>.pid.
+    // Pre-0.4.1 the default --db was relative ("ctxd.db"), so the
+    // two paths diverged whenever onboard ran outside data_dir;
+    // probing both makes service-start tolerant of older daemons
+    // and any future path mismatch.
+    let canonical = paths::default_db_path().ok();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let started_at = std::time::Instant::now();
     let (admin_url, version) = loop {
         if let pidfile::DaemonState::Running(pf) = pidfile::detect(&cfg.db_path).await {
             break (format!("http://{}", pf.admin_bind), pf.version);
+        }
+        if let Some(c) = &canonical {
+            if c != &cfg.db_path {
+                if let pidfile::DaemonState::Running(pf) = pidfile::detect(c).await {
+                    break (format!("http://{}", pf.admin_bind), pf.version);
+                }
+            }
         }
         if std::time::Instant::now() >= deadline {
             emitter.error(
@@ -385,14 +401,21 @@ async fn step_service_start(cfg: &PipelineConfig, emitter: &Emitter) -> Result<(
     Ok(())
 }
 
-fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+/// Run the configure-clients step. Returns the slugs of clients
+/// whose config was successfully written (i.e. ApplyAction is one
+/// of Created / EntryAdded / EntryUpdated / Unchanged) — these
+/// flow through to `Outcome.clients_configured` so the closing
+/// `done` line accurately reports what happened. Codex with
+/// ManualPending is INCLUDED because the snippet file was written;
+/// the user needs to paste it but the step did its work.
+fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<Vec<String>> {
     if !cfg.includes(StepName::ConfigureClients) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     emitter.step_started(StepName::ConfigureClients);
     if cfg.dry_run {
         emitter.step_skipped(StepName::ConfigureClients, "dry-run");
-        return Ok(());
+        return Ok(Vec::new());
     }
     let binary = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("could not resolve current ctxd binary: {e}"))?;
@@ -404,6 +427,7 @@ fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()>
     let results = clients::apply_all(&spec);
     let mut summary = serde_json::Map::new();
     let mut config_paths = Vec::new();
+    let mut configured_slugs = Vec::new();
     for (cid, res) in &results {
         let label = cid.slug();
         match res {
@@ -416,6 +440,7 @@ fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()>
                     ApplyAction::ManualPending => "manual-pending",
                 };
                 summary.insert(label.to_string(), serde_json::Value::String(s.into()));
+                configured_slugs.push(label.to_string());
             }
             Err(e) => {
                 summary.insert(
@@ -443,7 +468,7 @@ fn step_configure_clients(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()>
             "with_hooks": cfg.with_hooks,
         }),
     );
-    Ok(())
+    Ok(configured_slugs)
 }
 
 fn path_for_client(cid: ClientId) -> Option<String> {
@@ -585,18 +610,23 @@ async fn step_seed_subjects(cfg: &PipelineConfig, emitter: &Emitter) -> Result<(
     Ok(())
 }
 
-fn step_configure_adapters(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()> {
+/// Configure-adapters step. Returns the slugs of adapters whose
+/// spawn is wired up today (only `fs` in v0.4 — gmail / github
+/// register in skills.toml as `manual-pending` and surface in the
+/// step's detail but don't flip `Outcome.adapters_enabled` until
+/// their OAuth/PAT plumbing lands).
+fn step_configure_adapters(cfg: &PipelineConfig, emitter: &Emitter) -> Result<Vec<String>> {
     if !cfg.includes(StepName::ConfigureAdapters) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     emitter.step_started(StepName::ConfigureAdapters);
     if cfg.skip_adapters {
         emitter.step_skipped(StepName::ConfigureAdapters, "--skip-adapters");
-        return Ok(());
+        return Ok(Vec::new());
     }
     if cfg.dry_run {
         emitter.step_skipped(StepName::ConfigureAdapters, "dry-run");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Read existing manifest so we don't clobber sibling adapter
@@ -651,10 +681,10 @@ fn step_configure_adapters(cfg: &PipelineConfig, emitter: &Emitter) -> Result<()
         serde_json::json!({
             "skills_toml": path.to_string_lossy(),
             "adapters": serde_json::Value::Object(summary),
-            "enabled_slugs": enabled_slugs,
+            "enabled_slugs": enabled_slugs.clone(),
         }),
     );
-    Ok(())
+    Ok(enabled_slugs)
 }
 
 async fn step_doctor(cfg: &PipelineConfig, emitter: &Emitter) -> Result<DoctorSummary> {

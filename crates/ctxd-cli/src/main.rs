@@ -24,11 +24,39 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "ctxd", version, about)]
 struct Cli {
     /// Path to the SQLite database file.
-    #[arg(long, default_value = "ctxd.db", global = true)]
-    db: PathBuf,
+    ///
+    /// Defaults to the canonical platform path (resolved at runtime
+    /// via `onboard::paths::default_db_path()`):
+    ///
+    /// * macOS  → `~/Library/Application Support/ctxd/ctxd.db`
+    /// * Linux  → `$XDG_DATA_HOME/ctxd/ctxd.db`
+    /// * Windows → `%APPDATA%\ctxd\data\ctxd.db`
+    ///
+    /// Override with `CTXD_DATA_DIR` (also affects related files
+    /// like the pidfile and HNSW sidecars).
+    ///
+    /// Pre-v0.4.1 ctxd defaulted this to `"ctxd.db"` (relative to
+    /// cwd), which split the cli.db and the launchd plist's `--db`
+    /// across different absolute paths whenever onboard was invoked
+    /// from outside `Application Support` — caps minted against the
+    /// cli.db's root_key never matched the daemon's. See #27.
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Resolve the effective DB path: the user's `--db` override if set,
+/// otherwise `paths::default_db_path()`. Bails with a friendly error
+/// if neither is available (e.g. `$HOME` unset on a misconfigured
+/// system).
+fn resolve_db_path(cli_db: &Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = cli_db {
+        return Ok(p.clone());
+    }
+    ctxd_cli::onboard::paths::default_db_path()
+        .context("could not resolve default DB path; pass --db explicitly or set CTXD_DATA_DIR")
 }
 
 #[derive(Subcommand)]
@@ -558,7 +586,8 @@ async fn main() -> Result<()> {
     let _otel_guard = init_tracing();
 
     let cli = Cli::parse();
-    let store = EventStore::open(&cli.db)
+    let db_path = resolve_db_path(&cli.db)?;
+    let store = EventStore::open(&db_path)
         .await
         .context("failed to open event store")?;
     // Load or create the root capability key, persisted in the database
@@ -633,7 +662,7 @@ async fn main() -> Result<()> {
                 storage,
                 storage_uri,
                 federation: true,
-                db_path: Some(cli.db.clone()),
+                db_path: Some(db_path.clone()),
                 cap_files: cap_file,
             };
             ctxd_cli::serve::serve(cfg, store, cap_engine, caveat_state, pending_approval_tx)
@@ -659,7 +688,7 @@ async fn main() -> Result<()> {
                 storage: "sqlite".to_string(),
                 storage_uri: None,
                 federation: false,
-                db_path: Some(cli.db.clone()),
+                db_path: Some(db_path.clone()),
                 cap_files: vec![],
             };
             // Spawn a deferred opener that fires once the bind has
@@ -1155,7 +1184,7 @@ async fn main() -> Result<()> {
                 github: AdapterChoice::Skip,
                 fs,
                 only: only_set,
-                db_path: cli.db.clone(),
+                db_path: db_path.clone(),
                 bind,
                 wire_bind,
             };
@@ -1191,7 +1220,7 @@ async fn main() -> Result<()> {
                 github: AdapterChoice::Skip,
                 fs: vec![],
                 only: None,
-                db_path: cli.db.clone(),
+                db_path: db_path.clone(),
                 bind: "127.0.0.1:7777".to_string(),
                 wire_bind: "127.0.0.1:7778".to_string(),
             };
@@ -1209,10 +1238,10 @@ async fn main() -> Result<()> {
             let admin_url = match url {
                 Some(u) => u,
                 None => {
-                    let pf = ctxd_cli::pidfile::read(&cli.db).ok_or_else(|| {
+                    let pf = ctxd_cli::pidfile::read(&db_path).ok_or_else(|| {
                         anyhow::anyhow!(
                             "no pidfile at {} — daemon not running, or pass --url",
-                            ctxd_cli::pidfile::pidfile_path(&cli.db).to_string_lossy()
+                            ctxd_cli::pidfile::pidfile_path(&db_path).to_string_lossy()
                         )
                     })?;
                     format!("http://{}", pf.admin_bind)
@@ -1378,7 +1407,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Doctor { json } => {
-            let checks = ctxd_cli::onboard::doctor::run(&cli.db).await;
+            let checks = ctxd_cli::onboard::doctor::run(&db_path).await;
             if json {
                 let summary = ctxd_cli::onboard::doctor::Summary::from_checks(&checks);
                 let body = serde_json::json!({
