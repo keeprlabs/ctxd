@@ -12,6 +12,8 @@ If `ctxd serve` is already running on `:7777`, point your browser there directly
 
 ## What you see
 
+![dashboard overview](../assets/img/dashboard-overview.png)
+
 ### Overview
 
 Six counters at the top: events, subjects, peers, pending approvals, embeddings, uptime. Two panels below: top subjects (sorted by event count, capped to 10) and recent events (newest first, last 50, live-tailed).
@@ -21,6 +23,8 @@ The recent-events panel uses Server-Sent Events (`/v1/events/stream`) to push ap
 When the substrate is empty, the recent-events panel becomes a one-button tutorial that writes a hello-world event for you. Click it to see what a populated dashboard looks like with zero ceremony.
 
 ### Subjects
+
+![dashboard subjects view](../assets/img/dashboard-subjects.png)
 
 Hierarchical view of your subject tree with cumulative counts. Clicking a node toggles its children. The top-level prefix defaults to `/`; pass `?prefix=/work` to drill in.
 

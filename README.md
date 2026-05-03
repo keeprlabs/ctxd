@@ -8,13 +8,13 @@
 <h1 align="center">Every AI on your machine, <em>one memory.</em></h1>
 
 <p align="center">
-  <strong>Star us&nbsp;→</strong>&nbsp;<a href="https://github.com/keeprlabs/ctxd/stargazers" title="Star ctxd on GitHub — the open-source context substrate for AI agents"><img alt="GitHub stars" src="https://img.shields.io/github/stars/keeprlabs/ctxd?style=for-the-badge&logo=github&label=ctxd&color=000000"></a>
+  <strong>Star us&nbsp;❤️&nbsp;→</strong>&nbsp;<a href="https://github.com/keeprlabs/ctxd" title="Star ctxd on GitHub — click then use the ⭐ button at the top of the repo page"><img alt="Star ctxd on GitHub" src="https://img.shields.io/github/stars/keeprlabs/ctxd?style=for-the-badge&logo=github&label=Star&color=24292e"></a>
   &nbsp;·&nbsp;
-  <a href="https://keeprlabs.github.io/ctxd/">Homepage</a>
+  <a href="https://keeprlabs.github.io/ctxd/">🌐&nbsp;ctxd.dev</a>
   &nbsp;·&nbsp;
-  <a href="docs/architecture.md">Docs</a>
+  <a href="docs/onboarding.md">📖&nbsp;Docs</a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/keeprlabs/ctxd/releases">Releases</a>
+  <a href="https://github.com/keeprlabs/ctxd/releases">📦&nbsp;Releases</a>
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@ ctxd onboard
 That's it. `ctxd onboard` installs ctxd as a background service, configures Claude Desktop / Claude Code / Codex over MCP, mints scoped capability tokens per app, and seeds a baseline `/me/**` so a fresh AI conversation starts with non-empty context. Two minutes, idempotent, fully reversible with `ctxd offboard`.
 
 <p align="center">
-  <img alt="ctxd terminal demo: write, read, grant, serve" src="assets/img/terminal.gif" width="100%">
+  <img alt="ctxd onboard demo: snapshot, configure clients, mint caps, seed /me/**" src="assets/img/terminal.gif" width="100%">
 </p>
 
 ---
@@ -95,6 +95,10 @@ ctxd dashboard
 ```
 
 Opens an embedded web UI at `http://127.0.0.1:7777/`. Watch events stream in live via SSE, browse the subject tree, search the log, see which capability wrote what. Read-only by default — writes still go through MCP, the wire protocol, or the CLI. Localhost-only with DNS-rebinding defenses (host-header check, CSP, X-Frame-Options).
+
+<p align="center">
+  <img alt="ctxd dashboard demo: stats, subject tree, live event tail" src="assets/img/dashboard.gif" width="100%">
+</p>
 
 The dashboard ships in the daemon, not as a separate process. If `ctxd serve` is already running, just point your browser at `http://127.0.0.1:7777/`. See [docs/dashboard.md](docs/dashboard.md) for the security model and what each view shows.
 
@@ -210,7 +214,7 @@ Bugs, features, and adapter PRs all welcome.
 If ctxd is useful to you, a star is the single most useful signal you can send. It tells us this approach matters, helps other developers find the project, and shapes what we prioritize next.
 
 <p align="center">
-  <a href="https://github.com/keeprlabs/ctxd/stargazers"><img alt="Star history" src="https://api.star-history.com/svg?repos=keeprlabs/ctxd&type=Date" width="80%"></a>
+  <a href="https://github.com/keeprlabs/ctxd"><img alt="Star history" src="https://api.star-history.com/svg?repos=keeprlabs/ctxd&type=Date" width="80%"></a>
 </p>
 
 ## License
