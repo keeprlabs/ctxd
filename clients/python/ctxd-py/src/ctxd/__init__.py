@@ -45,7 +45,7 @@ from ._operation import Operation
 from ._signing import verify_signature
 from ._sync import CtxdClient
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "AuthError",

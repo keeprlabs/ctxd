@@ -26,8 +26,8 @@ path = "src/lib.rs"
 # wire format moves in lockstep with the daemon — an SDK published
 # against a different ctxd-core minor version would silently produce
 # wrong canonical bytes.
-ctxd-core = { path = "../../../crates/ctxd-core", version = "0.3.2" }
-ctxd-wire = { path = "../../../crates/ctxd-wire", version = "0.3.2" }
+ctxd-core = { path = "../../../crates/ctxd-core", version = "0.4.0" }
+ctxd-wire = { path = "../../../crates/ctxd-wire", version = "0.4.0" }
 
 # Serialization. Both used by the HTTP admin types and (transitively)
 # by the wire protocol surface.

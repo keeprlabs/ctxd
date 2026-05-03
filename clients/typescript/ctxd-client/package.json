@@ -1,6 +1,6 @@
 {
   "name": "@ctxd/client",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Official TypeScript/JavaScript SDK for the ctxd context substrate daemon.",
   "license": "Apache-2.0",
   "type": "module",

@@ -51,4 +51,4 @@ export { verifySignature } from "./signing.js";
 
 export { WireClient } from "./wire.browser.js";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";

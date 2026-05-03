@@ -8,9 +8,9 @@
 <h1 align="center">Every AI on your machine, <em>one memory.</em></h1>
 
 <p align="center">
-  <strong>Star us&nbsp;❤️&nbsp;→</strong>&nbsp;<a href="https://github.com/keeprlabs/ctxd" title="Star ctxd on GitHub — click then use the ⭐ button at the top of the repo page"><img alt="Star ctxd on GitHub" src="https://img.shields.io/github/stars/keeprlabs/ctxd?style=for-the-badge&logo=github&label=Star&color=24292e"></a>
+  <strong>Star us&nbsp;❤️&nbsp;→</strong>&nbsp;<a href="https://github.com/keeprlabs/ctxd" title="Star ctxd on GitHub — click then use the ⭐ button at the top of the repo page"><img alt="Star ctxd on GitHub" src="https://img.shields.io/github/stars/keeprlabs/ctxd?style=social&label=Star"></a>
   &nbsp;·&nbsp;
-  <a href="https://keeprlabs.github.io/ctxd/">🌐&nbsp;ctxd.dev</a>
+  <a href="https://keeprlabs.github.io/ctxd/">🌐&nbsp;ctxd</a>
   &nbsp;·&nbsp;
   <a href="docs/onboarding.md">📖&nbsp;Docs</a>
   &nbsp;·&nbsp;
@@ -18,13 +18,20 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/keeprlabs/ctxd/releases"><img alt="Release" src="https://img.shields.io/github/v/release/keeprlabs/ctxd?style=flat-square"></a>
+  <a href="https://github.com/keeprlabs/ctxd/releases"><img alt="Release" src="https://img.shields.io/github/v/release/keeprlabs/ctxd?style=flat-square&color=24292e"></a>
   <a href="https://github.com/keeprlabs/ctxd/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/keeprlabs/ctxd/ci.yml?branch=main&style=flat-square&label=CI"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/keeprlabs/ctxd?style=flat-square"></a>
-  <a href="https://crates.io/crates/ctxd"><img alt="crates.io" src="https://img.shields.io/crates/v/ctxd?style=flat-square&label=crates.io"></a>
-  <a href="https://pypi.org/project/ctxd-client/"><img alt="PyPI" src="https://img.shields.io/pypi/v/ctxd-client?style=flat-square&label=PyPI"></a>
-  <a href="https://www.npmjs.com/package/@ctxd/client"><img alt="npm" src="https://img.shields.io/npm/v/@ctxd/client?style=flat-square&label=npm"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/keeprlabs/ctxd?style=flat-square&color=24292e"></a>
 </p>
+
+<!--
+  crates.io / PyPI / npm badges live in clients/<lang>/README.md.
+  They're omitted from the top-level README until each registry
+  actually has a v0.4 release for `ctxd-cli`, `ctxd-client`, and
+  `@ctxd/client` — shields.io would otherwise render "not found"
+  badges for unpublished versions, and a half-published row reads
+  worse than no row at all.
+-->
+
 
 <p align="center">
   <strong>ctxd</strong> is a single-binary daemon that gives every MCP-aware AI tool on your machine — Claude Desktop, Claude Code, Codex — <em>one shared memory.</em> Append-only event log, capability tokens, federation, embedded dashboard. <strong>One command sets it up.</strong>
