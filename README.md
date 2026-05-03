@@ -1,19 +1,33 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/img/logo-dark.svg">
-    <img alt="ctxd" src="assets/img/logo-light.svg" width="72" height="72">
+    <img alt="ctxd" src="assets/img/logo-light.svg" width="96" height="96">
   </picture>
 </p>
 
-<h1 align="center">ctxd</h1>
+<h1 align="center">Every AI on your machine, <em>one memory.</em></h1>
 
-<p align="center"><strong>Context substrate for AI agents.</strong> A single-binary daemon that gives every agent — Claude Desktop, Cursor, your own code — one place to write and read shared context, with capability tokens, federation, and a native MCP server.</p>
+<p align="center">
+  <strong>Star us&nbsp;❤️&nbsp;→</strong>&nbsp;<a href="https://github.com/keeprlabs/ctxd" title="Star ctxd on GitHub — click then use the ⭐ button at the top of the repo page"><img alt="Star ctxd on GitHub" src="https://img.shields.io/github/stars/keeprlabs/ctxd?style=for-the-badge&logo=github&label=Star&color=24292e"></a>
+  &nbsp;·&nbsp;
+  <a href="https://keeprlabs.github.io/ctxd/">🌐&nbsp;ctxd.dev</a>
+  &nbsp;·&nbsp;
+  <a href="docs/onboarding.md">📖&nbsp;Docs</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/keeprlabs/ctxd/releases">📦&nbsp;Releases</a>
+</p>
 
 <p align="center">
   <a href="https://github.com/keeprlabs/ctxd/releases"><img alt="Release" src="https://img.shields.io/github/v/release/keeprlabs/ctxd?style=flat-square"></a>
   <a href="https://github.com/keeprlabs/ctxd/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/keeprlabs/ctxd/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/keeprlabs/ctxd?style=flat-square"></a>
-  <a href="https://github.com/keeprlabs/ctxd/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/keeprlabs/ctxd?style=flat-square"></a>
+  <a href="https://crates.io/crates/ctxd"><img alt="crates.io" src="https://img.shields.io/crates/v/ctxd?style=flat-square&label=crates.io"></a>
+  <a href="https://pypi.org/project/ctxd-client/"><img alt="PyPI" src="https://img.shields.io/pypi/v/ctxd-client?style=flat-square&label=PyPI"></a>
+  <a href="https://www.npmjs.com/package/@ctxd/client"><img alt="npm" src="https://img.shields.io/npm/v/@ctxd/client?style=flat-square&label=npm"></a>
+</p>
+
+<p align="center">
+  <strong>ctxd</strong> is a single-binary daemon that gives every MCP-aware AI tool on your machine — Claude Desktop, Claude Code, Codex — <em>one shared memory.</em> Append-only event log, capability tokens, federation, embedded dashboard. <strong>One command sets it up.</strong>
 </p>
 
 ```bash
@@ -21,15 +35,27 @@ brew install keeprlabs/tap/ctxd
 ctxd onboard
 ```
 
-`ctxd onboard` installs ctxd as a background service, configures Claude Desktop / Claude Code / Codex to use it over MCP, mints scoped capability tokens per app, and seeds a baseline `/me/**` so every connected AI starts with non-empty context. One command, two minutes, your AI tools share memory.
+That's it. `ctxd onboard` installs ctxd as a background service, configures Claude Desktop / Claude Code / Codex over MCP, mints scoped capability tokens per app, and seeds a baseline `/me/**` so a fresh AI conversation starts with non-empty context. Two minutes, idempotent, fully reversible with `ctxd offboard`.
+
+<p align="center">
+  <img alt="ctxd onboard demo: snapshot, configure clients, mint caps, seed /me/**" src="assets/img/terminal.gif" width="100%">
+</p>
 
 ---
 
-## Why ctxd
+## The pitch in one paragraph
 
-Every AI agent starts each session with amnesia. Context is scattered across Gmail, Slack, GitHub, Notion, and chat windows. None of those tools share a view, and your AI re-derives state from scratch every time.
+Every AI agent starts each session with amnesia. Context is scattered across Gmail, Slack, GitHub, Notion, and chat windows. None of those tools share a view, and your AI re-derives state from scratch every time. **ctxd is the place that context lives.** Write once over MCP or HTTP, query from any agent, prove what was written via Ed25519 signatures, replicate to peer nodes you trust. Not a vector DB, not an agent framework, not a knowledge graph — a substrate the rest of those things plug into.
 
-ctxd is the place that context lives. Write once over MCP or HTTP, query from any agent, prove what was written via Ed25519 signatures, replicate to peer nodes you trust. Not a vector DB, not an agent framework, not a knowledge graph — a substrate the rest of those things plug into.
+## Why this is different
+
+|   | Today | With ctxd |
+|---|-------|-----------|
+| **Setup** | Hand-edit JSON for each AI app, paste tokens, hope nothing drifts | `ctxd onboard` — one command, all clients wired |
+| **Memory across tools** | Claude Desktop and Claude Code don't share a byte | Same SQLite log, eight MCP tools, every agent reads/writes the same store |
+| **Trust** | Agents write into a shared bucket, no provenance | Ed25519-signed events, biscuit capability tokens, per-client cap files |
+| **Observability** | You guess what your agent wrote | Embedded web dashboard at `127.0.0.1:7777` — live event tail, subject tree, search |
+| **Backends** | Pick one and migrate later | SQLite, Postgres (clustered FTS), DuckDB-on-S3 — all behind one trait + conformance suite |
 
 ## Quickstart
 
@@ -48,56 +74,76 @@ ctxd write --subject /work/notes/standup --type ctx.note \
 ctxd read --subject /work --recursive
 ```
 
-`ctxd onboard` is idempotent — re-running it updates configs and re-mints caps without losing data. Use `ctxd offboard` to fully reverse the install (restore client configs from snapshot, stop the service, optionally delete the DB with `--purge`). See [docs/onboarding.md](docs/onboarding.md) for the full step-by-step.
+`ctxd onboard` is idempotent — re-running it updates configs and re-mints caps without losing data. Use `ctxd offboard` to fully reverse the install (restore client configs from snapshot, stop the service, optionally `--purge` the DB). Full walkthrough: [docs/onboarding.md](docs/onboarding.md).
 
 You now have eight MCP tools wired to your context: `ctx_write`, `ctx_read`, `ctx_subjects`, `ctx_search`, `ctx_subscribe`, `ctx_entities`, `ctx_related`, `ctx_timeline`.
 
 ### Foreground / advanced
 
-If you'd rather run ctxd in a terminal tab without installing a service, use `ctxd serve` directly:
+If you'd rather run ctxd in a terminal tab without installing a service:
 
 ```bash
 ctxd serve                   # HTTP admin :7777, MCP on stdio
 ```
 
-You'll need to wire Claude Desktop / Code / Codex by hand. The MCP entry is documented in [docs/onboarding.md](docs/onboarding.md#manual-client-config).
+Wire Claude Desktop / Code / Codex by hand with the snippets in [docs/onboarding.md](docs/onboarding.md#manual-client-config).
 
-## See it run
-
-The same flow against a real daemon — write, read, grant, serve. Generated from [`assets/vhs/terminal.tape`](assets/vhs/terminal.tape).
-
-![ctxd terminal demo](assets/img/terminal.gif)
-
-## Dashboard
+## Watch what your agents are writing
 
 ```bash
 ctxd dashboard
 ```
 
-Opens an embedded web UI at `http://127.0.0.1:7777/`. See your event count fill up, browse the subject tree, search the log, watch new events stream in live via SSE. Read-only by default — writes still go through MCP, the wire protocol, or the CLI. Localhost-only with DNS-rebinding defenses (host-header check, CSP, X-Frame-Options).
-
-If `ctxd serve` is already running, point your browser at `http://127.0.0.1:7777/` directly — the dashboard ships in the daemon, not as a separate process. See [docs/dashboard.md](docs/dashboard.md) for the security model and what each view shows.
-
-## How it fits
+Opens an embedded web UI at `http://127.0.0.1:7777/`. Watch events stream in live via SSE, browse the subject tree, search the log, see which capability wrote what. Read-only by default — writes still go through MCP, the wire protocol, or the CLI. Localhost-only with DNS-rebinding defenses (host-header check, CSP, X-Frame-Options).
 
 <p align="center">
-  <img alt="ctxd architecture: clients → surfaces → capability gate → event store → views" src="assets/img/architecture.svg" width="100%">
+  <img alt="ctxd dashboard demo: stats, subject tree, live event tail" src="assets/img/dashboard.gif" width="100%">
 </p>
 
-The event log is append-only. Views (KV, FTS, vector, graph, temporal) are derived from it and rebuildable from it. See [docs/architecture.md](docs/architecture.md) for the full picture, or the live landing page at [keeprlabs.github.io/ctxd](https://keeprlabs.github.io/ctxd/) for the animated diagram in context.
+The dashboard ships in the daemon, not as a separate process. If `ctxd serve` is already running, just point your browser at `http://127.0.0.1:7777/`. See [docs/dashboard.md](docs/dashboard.md) for the security model and what each view shows.
 
-## Features
+## Architecture
 
-| Feature | Description |
-|---------|-------------|
-| **Multi-transport** | One binary speaks HTTP admin (`:7777`), MessagePack wire (`:7778`), and MCP over stdio + SSE + streamable-HTTP — concurrently, off the same tool surface |
-| **Tamper-evident log** | Append-only event log, predecessor hash chains, Ed25519 signatures, causal-DAG `parents` for deterministic conflict resolution |
-| **Capability tokens** | Biscuit-based, attenuable, bearer. Stateful caveats: budget limits, human approval, rate limits |
-| **Storage backends** | SQLite (default), Postgres (clustered FTS via `tsvector`), DuckDB-on-object-store (Parquet on S3 / R2 / local fs) — all behind one `Store` trait + conformance suite |
-| **Federation** | Two nodes peer with one command, replicate subjects bidirectionally, resume from cursors after a crash, backfill missing parents on causal-DAG gaps |
-| **Hybrid search** | Pluggable embedder (OpenAI, Ollama, none); persisted HNSW vector index + FTS fused via Reciprocal Rank Fusion |
-| **Real adapters** | Gmail (OAuth2 + AES-256-GCM token at rest + History API). GitHub (PAT + ETag caching + rate limits) |
-| **Three SDKs** | Rust, Python, TypeScript — all pinned to the same `docs/api/` conformance corpus the daemon runs |
+<p align="center">
+  <img alt="ctxd architecture: clients reach surfaces (HTTP/wire/MCP), gated by capability tokens, persisted to an append-only event store, projected into KV/FTS/vector/graph/temporal views" src="assets/img/architecture.svg" width="100%">
+</p>
+
+The event log is append-only. Views (KV, FTS, vector, graph, temporal) are derived from it and rebuildable from it. Federation is event replay across signed cursors. Capabilities gate every write at the surface layer, before anything touches the store. See [docs/architecture.md](docs/architecture.md) for the full picture, or the [animated landing page](https://keeprlabs.github.io/ctxd/) for the diagram in motion.
+
+## What's in the box
+
+| Capability | Detail |
+|------------|--------|
+| **One-command onboarding** | `ctxd onboard` installs the service, configures clients, mints caps, seeds `/me/**`. `ctxd doctor` verifies. `ctxd offboard` restores from snapshot. |
+| **MCP-native** | Eight tools (`ctx_write` / `ctx_read` / `ctx_subjects` / `ctx_search` / `ctx_subscribe` / `ctx_entities` / `ctx_related` / `ctx_timeline`) over stdio, SSE, and streamable-HTTP — concurrently, off the same surface. |
+| **Embedded dashboard** | Localhost web UI: live SSE event tail, subject tree, full-text search, peer view. Read-only, DNS-rebinding-safe. |
+| **Tamper-evident log** | Append-only, predecessor hash chains, Ed25519 signatures, causal-DAG `parents` for deterministic conflict resolution. |
+| **Capability tokens** | Biscuit-based, attenuable, bearer. Stateful caveats: budget limits, human approval, rate limits. Per-client cap files, never in process args. |
+| **Storage backends** | SQLite (default), Postgres (clustered FTS via `tsvector`), DuckDB-on-object-store (Parquet on S3 / R2 / local fs) — all behind one `Store` trait + conformance suite. |
+| **Federation** | Two nodes peer with one command, replicate subjects bidirectionally, resume from cursors after a crash, backfill missing parents on causal-DAG gaps. |
+| **Hybrid search** | Pluggable embedder (OpenAI, Ollama, none); persisted HNSW vector index + FTS fused via Reciprocal Rank Fusion. |
+| **Real adapters** | Gmail (OAuth2 + AES-256-GCM token at rest + History API). GitHub (PAT + ETag caching + rate limits). |
+| **Three SDKs** | Rust, Python, TypeScript — all pinned to the same [`docs/api/`](docs/api/) conformance corpus the daemon runs. |
+| **Apache-2.0** | All of it. No open-core split. |
+
+## Build a client
+
+The three first-party SDKs all wrap the same HTTP admin + wire protocol surface. Each pins to the same [`docs/api/`](docs/api/) contract.
+
+| Language | Install | README |
+|----------|---------|--------|
+| Rust | `cargo add ctxd-client` | [clients/rust](clients/rust/ctxd-client/README.md) |
+| Python | `pip install ctxd-client` (imports as `ctxd`) | [clients/python](clients/python/ctxd-py/README.md) |
+| TypeScript | `npm i @ctxd/client` | [clients/typescript](clients/typescript/ctxd-client/README.md) |
+
+The Rust SDK is the source of truth; the Python and TypeScript packages mirror it. All three run the same MessagePack hex fixtures and JSON Schema corpus the daemon runs.
+
+```rust
+use ctxd_client::CtxdClient;
+let client = CtxdClient::connect("http://127.0.0.1:7777").await?
+    .with_wire("127.0.0.1:7778").await?;
+let id = client.write("/work/notes", "ctx.note", json!({"hi": "there"})).await?;
+```
 
 ## Install
 
@@ -125,30 +171,12 @@ cargo build --release
 
 Pre-built tarballs for macOS arm64/x86_64 and Linux x86_64/aarch64 are attached to every [release](https://github.com/keeprlabs/ctxd/releases).
 
-## Build a client
-
-The three first-party SDKs all wrap the same HTTP admin + wire protocol surface. Each pins to the same [`docs/api/`](docs/api/) contract.
-
-| Language | Install | Status |
-|----------|---------|--------|
-| Rust | `cargo add ctxd-client` ([README](clients/rust/ctxd-client/README.md)) | v0.3 — published |
-| Python | `pip install ctxd-client` (imports as `ctxd`, [README](clients/python/ctxd-py/README.md)) | v0.3 — published |
-| TypeScript | `npm i @ctxd/client` ([README](clients/typescript/ctxd-client/README.md)) | v0.3 — published |
-
-The Rust SDK is the source of truth; the Python and TypeScript packages mirror it. All three run the same MessagePack hex fixtures and JSON Schema corpus the daemon runs.
-
-```rust
-use ctxd_client::CtxdClient;
-let client = CtxdClient::connect("http://127.0.0.1:7777").await?
-    .with_wire("127.0.0.1:7778").await?;
-let id = client.write("/work/notes", "ctx.note", json!({"hi": "there"})).await?;
-```
-
 ## Going further
 
 | Topic | Link |
 |-------|------|
 | Architecture, data flow, crate map | [docs/architecture.md](docs/architecture.md) |
+| Onboarding: `ctxd onboard` deep dive | [docs/onboarding.md](docs/onboarding.md) |
 | Events: schema, canonical form, hash chain | [docs/events.md](docs/events.md) |
 | Subjects: path syntax, recursive reads | [docs/subjects.md](docs/subjects.md) |
 | Capabilities: biscuit tokens, caveats | [docs/capabilities.md](docs/capabilities.md) (+ [hands-on](docs/capability-tutorial.md)) |
@@ -181,6 +209,14 @@ Bugs, features, and adapter PRs all welcome.
 - Open PRs against `main`. CI must be green; clippy and `cargo fmt --check` are gates.
 - We aim to triage every PR within a few days.
 
+## Star history
+
+If ctxd is useful to you, a star is the single most useful signal you can send. It tells us this approach matters, helps other developers find the project, and shapes what we prioritize next.
+
+<p align="center">
+  <a href="https://github.com/keeprlabs/ctxd"><img alt="Star history" src="https://api.star-history.com/svg?repos=keeprlabs/ctxd&type=Date" width="80%"></a>
+</p>
+
 ## License
 
-Apache-2.0
+Apache-2.0. All of it.

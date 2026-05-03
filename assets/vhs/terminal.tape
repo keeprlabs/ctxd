@@ -1,20 +1,28 @@
-# VHS tape for assets/img/terminal.gif
+# VHS tape for assets/img/terminal.gif (v0.4 redesign).
 #
-# Runs the same write -> read -> grant -> serve flow the landing page
-# animates, against a real ctxd binary. Regenerate with:
+# Pitches the v0.4 onboard flow: every step lands clean, then the
+# user immediately sees the seeded /me/** the next AI conversation
+# will read.
 #
-#   vhs assets/vhs/terminal.tape
+# Regenerate with:
 #
-# Requires: vhs (brew install vhs) and ctxd on PATH.
+#   cargo build -p ctxd-cli
+#   PATH=./target/debug:$PATH vhs assets/vhs/terminal.tape
 #
-# Note on quoting: VHS' Type command does not honor backslash-escaped
-# quotes inside its string. Shell commands that need both single and
-# double quotes (e.g. --data '{"k":"v"}') are emitted by chaining
-# multiple Type calls — VHS types them on the same shell line.
+# Requires: vhs (brew install vhs) + a built ctxd binary on PATH.
+#
+# Sandboxing: CTXD_DATA_DIR + CTXD_CONFIG_DIR (added in #24) point
+# ctxd at a tempdir so the recording is reproducible and doesn't
+# touch the recorder's real Application Support / XDG dir.
+#
+# Cleanliness: --only filters to the steps that don't depend on a
+# real launchd plist install. The omitted steps (service-install,
+# service-start, configure-adapters, doctor) are valid in production
+# but would surface "skip" or "fail" markers tied to the recording
+# environment, which would distract from the actual pitch.
 
 Output assets/img/terminal.gif
 
-# Custom monochrome theme matched to the landing page (site/landing.css `.terminal`).
 Set Theme '{ "name": "ctxd", "background": "#07090a", "foreground": "#e8e8e8", "cursor": "#ffffff", "selection": "#ffffff33", "black": "#0a0a0a", "red": "#e8e8e8", "green": "#e8e8e8", "yellow": "#cfcfcf", "blue": "#cfcfcf", "magenta": "#e8e8e8", "cyan": "#e8e8e8", "white": "#ffffff", "brightBlack": "#5e5e5e", "brightRed": "#ffffff", "brightGreen": "#ffffff", "brightYellow": "#ffffff", "brightBlue": "#ffffff", "brightMagenta": "#ffffff", "brightCyan": "#ffffff", "brightWhite": "#ffffff" }'
 Set FontSize 14
 Set Width 1200
@@ -23,49 +31,47 @@ Set Padding 24
 Set Framerate 30
 Set PlaybackSpeed 1.0
 Set Shell "zsh"
-Set TypingSpeed 35ms
+Set TypingSpeed 30ms
 
-# Use a fresh sandbox db so the recording is reproducible.
+# Hidden setup: tempdir + env-var sandbox + custom prompt.
+# VHS spawns an interactive zsh which sources ~/.zshrc and resets
+# PATH, so the parent's PATH=./target/debug:$PATH env doesn't
+# propagate. We capture the repo root before cd'ing and export the
+# target/debug dir into the recorded shell's PATH explicitly.
 Hide
+Type "export CTXD_BIN_DIR=$PWD/target/debug && export PATH=$CTXD_BIN_DIR:$PATH"
+Enter
+Sleep 200ms
 Type "cd /tmp && rm -rf ctxd-demo && mkdir ctxd-demo && cd ctxd-demo"
+Enter
+Sleep 200ms
+Type "export CTXD_DATA_DIR=$PWD CTXD_CONFIG_DIR=$PWD PS1='$ '"
 Enter
 Sleep 200ms
 Type "clear"
 Enter
 Show
 
-# write 1
-Type "ctxd write --subject /work/acme/notes/standup --type ctx.note --data "
-Type "'"
-Type `{"content":"Ship auth Friday"}`
-Type "'"
+# The pitch as a comment.
+Type "# every AI on your machine, one memory."
 Enter
-Sleep 1500ms
+Sleep 800ms
+Type "# brew install keeprlabs/tap/ctxd && ctxd onboard"
+Enter
+Sleep 1200ms
+Type "clear"
+Enter
+Sleep 200ms
 
-# write 2
-Type "ctxd write --subject /work/acme/customers/cust-42 --type ctx.crm --data "
-Type "'"
-Type `{"plan":"enterprise"}`
-Type "'"
+# Run onboard. --only restricts to the steps that succeed without
+# actually installing the launchd plist (which the recording host
+# can't make permanent). In production users just type `ctxd onboard`.
+Type "ctxd onboard --only=snapshot,configure-clients,mint-capabilities,seed-subjects --skip-service --skip-adapters"
 Enter
-Sleep 1500ms
+Sleep 4000ms
 
-# read recursive
-Type "ctxd read --subject /work/acme --recursive"
+# Show the seeded /me/about — the welcome event a fresh AI would
+# read on its first query. Proof the substrate isn't empty.
+Type "ctxd read --subject /me/about"
 Enter
-Sleep 2200ms
-
-# grant
-Type "ctxd grant --subject "
-Type `"/work/acme/**"`
-Type " --operations "
-Type `"read,subjects"`
-Enter
-Sleep 2000ms
-
-# serve, then Ctrl+C so the loop returns to a fresh prompt
-Type "ctxd serve"
-Enter
-Sleep 3500ms
-Ctrl+C
-Sleep 600ms
+Sleep 3000ms
