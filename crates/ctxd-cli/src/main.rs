@@ -13,7 +13,7 @@ use ctxd_store::caveat_state::SqliteCaveatState;
 use ctxd_store::EventStore;
 use opentelemetry::trace::TracerProvider;
 use protocol::ProtocolClient;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -24,11 +24,100 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "ctxd", version, about)]
 struct Cli {
     /// Path to the SQLite database file.
-    #[arg(long, default_value = "ctxd.db", global = true)]
-    db: PathBuf,
+    ///
+    /// Defaults to the canonical platform path (resolved at runtime
+    /// via `onboard::paths::default_db_path()`):
+    ///
+    /// * macOS  → `~/Library/Application Support/ctxd/ctxd.db`
+    /// * Linux  → `$XDG_DATA_HOME/ctxd/ctxd.db`
+    /// * Windows → `%APPDATA%\ctxd\data\ctxd.db`
+    ///
+    /// Override with `CTXD_DATA_DIR` (also affects related files
+    /// like the pidfile and HNSW sidecars).
+    ///
+    /// Pre-v0.4.1 ctxd defaulted this to `"ctxd.db"` (relative to
+    /// cwd), which split the cli.db and the launchd plist's `--db`
+    /// across different absolute paths whenever onboard was invoked
+    /// from outside `Application Support` — caps minted against the
+    /// cli.db's root_key never matched the daemon's. See #27.
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Resolve the effective DB path: the user's `--db` override if set,
+/// otherwise `paths::default_db_path()`. Bails with a friendly error
+/// if neither is available (e.g. `$HOME` unset on a misconfigured
+/// system).
+fn resolve_db_path(cli_db: &Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = cli_db {
+        return Ok(p.clone());
+    }
+    ctxd_cli::onboard::paths::default_db_path()
+        .context("could not resolve default DB path; pass --db explicitly or set CTXD_DATA_DIR")
+}
+
+/// Run a Claude Code hook in pure best-effort mode.
+///
+/// Reads up to 64 KiB of JSON payload from stdin and appends one event
+/// to `/me/sessions/<slug>`. Any error — DB path resolves to a wiped
+/// tempdir, DB exclusively locked, parent dir missing, permission
+/// denied, malformed slug — is logged to stderr and we exit 0.
+///
+/// Why not propagate errors: Claude Code surfaces a non-zero hook exit
+/// to the user as a "Stop hook error" message in the chat, on every
+/// session end. A stale settings.json entry pointing at a deleted
+/// tempdir would spam the user forever; a brief lock-contention with
+/// the daemon would interrupt the conversation. Hooks are
+/// instrumentation, not a critical path — the user must never know
+/// they exist when they fail.
+async fn run_hook(slug: &str, _cap_file: Option<&Path>, db_path: &Path) {
+    use std::io::Read as _;
+    let mut payload = Vec::with_capacity(4096);
+    let _ = std::io::stdin()
+        .lock()
+        .take(65_536)
+        .read_to_end(&mut payload);
+    let parsed: serde_json::Value = if payload.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice(&payload).unwrap_or_else(|_| {
+            serde_json::json!({
+                "raw": String::from_utf8_lossy(&payload).into_owned(),
+            })
+        })
+    };
+    let subject_path = format!("/me/sessions/{slug}");
+    let subject = match Subject::new(&subject_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ctxd hook: invalid slug {slug:?}: {e}");
+            return;
+        }
+    };
+    let data = serde_json::json!({
+        "event": slug,
+        "captured_at": chrono::Utc::now().to_rfc3339(),
+        "payload": parsed,
+    });
+    let event = Event::new(
+        "ctxd://hook".to_string(),
+        subject,
+        format!("hook.{slug}"),
+        data,
+    );
+    let store = match EventStore::open(db_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ctxd hook: open failed (best-effort): {e}");
+            return;
+        }
+    };
+    if let Err(e) = store.append(event).await {
+        eprintln!("ctxd hook: append failed (best-effort): {e}");
+    }
 }
 
 #[derive(Subcommand)]
@@ -558,7 +647,24 @@ async fn main() -> Result<()> {
     let _otel_guard = init_tracing();
 
     let cli = Cli::parse();
-    let store = EventStore::open(&cli.db)
+
+    // Short-circuit Claude Code hooks before the upfront EventStore::open
+    // below. The hook command must be best-effort: a stale --db path in
+    // settings.json (e.g. a tempdir from a sandboxed onboard run that's
+    // since been wiped) would otherwise propagate SQLITE_CANTOPEN as a
+    // non-zero exit, and Claude Code surfaces that to the user as a
+    // "Stop hook error" on every session end — a permanent, visible
+    // failure mode the user can only break out of by re-running onboard.
+    if let Commands::Hook { slug, cap_file } = &cli.command {
+        match resolve_db_path(&cli.db) {
+            Ok(db_path) => run_hook(slug, cap_file.as_deref(), &db_path).await,
+            Err(e) => eprintln!("ctxd hook: cannot resolve DB path (best-effort): {e}"),
+        }
+        return Ok(());
+    }
+
+    let db_path = resolve_db_path(&cli.db)?;
+    let store = EventStore::open(&db_path)
         .await
         .context("failed to open event store")?;
     // Load or create the root capability key, persisted in the database
@@ -633,7 +739,7 @@ async fn main() -> Result<()> {
                 storage,
                 storage_uri,
                 federation: true,
-                db_path: Some(cli.db.clone()),
+                db_path: Some(db_path.clone()),
                 cap_files: cap_file,
             };
             ctxd_cli::serve::serve(cfg, store, cap_engine, caveat_state, pending_approval_tx)
@@ -659,7 +765,7 @@ async fn main() -> Result<()> {
                 storage: "sqlite".to_string(),
                 storage_uri: None,
                 federation: false,
-                db_path: Some(cli.db.clone()),
+                db_path: Some(db_path.clone()),
                 cap_files: vec![],
             };
             // Spawn a deferred opener that fires once the bind has
@@ -1155,7 +1261,7 @@ async fn main() -> Result<()> {
                 github: AdapterChoice::Skip,
                 fs,
                 only: only_set,
-                db_path: cli.db.clone(),
+                db_path: db_path.clone(),
                 bind,
                 wire_bind,
             };
@@ -1191,7 +1297,7 @@ async fn main() -> Result<()> {
                 github: AdapterChoice::Skip,
                 fs: vec![],
                 only: None,
-                db_path: cli.db.clone(),
+                db_path: db_path.clone(),
                 bind: "127.0.0.1:7777".to_string(),
                 wire_bind: "127.0.0.1:7778".to_string(),
             };
@@ -1209,10 +1315,10 @@ async fn main() -> Result<()> {
             let admin_url = match url {
                 Some(u) => u,
                 None => {
-                    let pf = ctxd_cli::pidfile::read(&cli.db).ok_or_else(|| {
+                    let pf = ctxd_cli::pidfile::read(&db_path).ok_or_else(|| {
                         anyhow::anyhow!(
                             "no pidfile at {} — daemon not running, or pass --url",
-                            ctxd_cli::pidfile::pidfile_path(&cli.db).to_string_lossy()
+                            ctxd_cli::pidfile::pidfile_path(&db_path).to_string_lossy()
                         )
                     })?;
                     format!("http://{}", pf.admin_bind)
@@ -1331,54 +1437,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Hook { slug, cap_file } => {
-            let _ = cap_file; // accepted; future: verify before append
-                              // Read up to 64 KiB from stdin. Hooks send small JSON
-                              // payloads; we cap to keep this pure overhead-free.
-            use std::io::Read as _;
-            let mut payload = Vec::with_capacity(4096);
-            let _ = std::io::stdin()
-                .lock()
-                .take(65_536)
-                .read_to_end(&mut payload);
-            let parsed: serde_json::Value = if payload.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_slice(&payload).unwrap_or_else(|_| {
-                    serde_json::json!({
-                        "raw": String::from_utf8_lossy(&payload).into_owned(),
-                    })
-                })
-            };
-            let subject_path = format!("/me/sessions/{slug}");
-            let subject = match Subject::new(&subject_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("ctxd hook: invalid slug {slug:?}: {e}");
-                    return Ok(());
-                }
-            };
-            let data = serde_json::json!({
-                "event": slug,
-                "captured_at": chrono::Utc::now().to_rfc3339(),
-                "payload": parsed,
-            });
-            let event = Event::new(
-                "ctxd://hook".to_string(),
-                subject,
-                format!("hook.{slug}"),
-                data,
-            );
-            // Best-effort append; never panic from a hook.
-            if let Err(e) = store.append(event).await {
-                eprintln!("ctxd hook: append failed (best-effort): {e}");
-            }
-            // Exit 0 regardless — hooks must not surface errors to
-            // Claude Code or it spams the user on every Stop.
+        Commands::Hook { .. } => {
+            // Handled by the early short-circuit in main(). Reaching
+            // this arm would mean we opened the store unnecessarily;
+            // unreachable in practice but kept exhaustive so adding a
+            // new variant fails to compile until a handler exists.
+            unreachable!("Hook handled before match");
         }
 
         Commands::Doctor { json } => {
-            let checks = ctxd_cli::onboard::doctor::run(&cli.db).await;
+            let checks = ctxd_cli::onboard::doctor::run(&db_path).await;
             if json {
                 let summary = ctxd_cli::onboard::doctor::Summary::from_checks(&checks);
                 let body = serde_json::json!({
