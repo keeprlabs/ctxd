@@ -14,13 +14,12 @@
 //!   or duplicate seeds.
 //!
 //! Tests use `--skip-service` so they don't touch launchd/systemd
-//! on the test host. They override `--db` to a tempdir so they
-//! don't trample the user's real cap files / skills.toml at
-//! `~/Library/Application Support/ctxd/`. The CLI's cap-file path
-//! IS global (`<config_dir>/ctxd/caps/`), so each onboard run
-//! against a different DB writes new caps under the same root_key
-//! — these tests assert the new state, not the leftover from a
-//! prior run.
+//! on the test host. Each test sets `CTXD_CONFIG_DIR` and
+//! `CTXD_DATA_DIR` to per-test tempdirs so parallel test execution
+//! doesn't race on the global `<config_dir>/ctxd/caps/` path —
+//! before this isolation, two parallel tests would each mint caps
+//! signed by their own root_key and overwrite each other's files,
+//! making whichever test ran later see a verify failure.
 
 use ctxd_cap::{CapEngine, Operation};
 use ctxd_cli::onboard::caps;
@@ -38,26 +37,40 @@ fn parse_jsonl(stdout: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Run `ctxd onboard` with the given flags, return stdout/stderr
-async fn run_onboard_with_db(args: &[&str]) -> (std::process::Output, std::path::PathBuf) {
+/// Run `ctxd onboard` with the given flags inside a fully isolated
+/// per-test config + data dir. Returns (output, db_path,
+/// config_dir_keepalive). The keepalive guard owns the tempdir; the
+/// caller drops it after the test.
+async fn run_onboard_with_db(
+    args: &[&str],
+) -> (std::process::Output, std::path::PathBuf, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("ctxd.db");
-    let _ = Box::leak(Box::new(dir));
+    // Per-test cap files / skills.toml / snapshots — without this
+    // override, parallel tests race on the global Application Support
+    // path and clobber each other's caps.
+    let config = dir.path().join("config");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&config).expect("create config dir");
+    std::fs::create_dir_all(&data).expect("create data dir");
+
     let mut full_args = vec!["--db", db.to_str().unwrap(), "onboard", "--skip-service"];
     full_args.extend_from_slice(args);
     let out = tokio::process::Command::new(ctxd_bin())
+        .env("CTXD_CONFIG_DIR", &config)
+        .env("CTXD_DATA_DIR", &data)
         .args(&full_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
         .expect("spawn ctxd onboard");
-    (out, db)
+    (out, db, dir)
 }
 
 #[tokio::test]
 async fn strict_scopes_caps_grant_read_but_reject_write() {
-    let (out, db) = run_onboard_with_db(&[
+    let (out, db, dir) = run_onboard_with_db(&[
         "--skip-adapters",
         "--skill-mode",
         "--strict-scopes",
@@ -89,15 +102,18 @@ async fn strict_scopes_caps_grant_read_but_reject_write() {
         .expect("root_key persisted");
     let cap_engine = CapEngine::from_private_key(&root_key).expect("root_key valid");
 
-    for client in [
-        caps::ClientId::ClaudeDesktop,
-        caps::ClientId::ClaudeCode,
-        caps::ClientId::Codex,
+    // Read caps from the per-test config dir, not the global one —
+    // CTXD_CONFIG_DIR was passed to the subprocess so its mint
+    // wrote here.
+    let caps_dir = dir.path().join("config").join("caps");
+
+    for (client, slug) in [
+        (caps::ClientId::ClaudeDesktop, "claude-desktop"),
+        (caps::ClientId::ClaudeCode, "claude-code"),
+        (caps::ClientId::Codex, "codex"),
     ] {
-        let path = caps::cap_file_path(client).expect("cap path");
-        if !path.exists() {
-            continue;
-        }
+        let path = caps_dir.join(format!("{slug}.bk"));
+        assert!(path.exists(), "cap file missing for {client:?} at {path:?}");
         let b64 = caps::read_cap_file(&path).expect("read cap");
         let token = CapEngine::token_from_base64(&b64).expect("decode cap");
         // Read on /me/** must succeed.
@@ -120,7 +136,7 @@ async fn dry_run_makes_no_mutations() {
     // the cap_file_path is global on macOS, but we can assert that
     // the daemon's tempdir DB doesn't grow events and that the
     // step messages are all `skipped`.
-    let (out, db) = run_onboard_with_db(&[
+    let (out, db, _dir) = run_onboard_with_db(&[
         "--skip-adapters",
         "--skill-mode",
         "--dry-run",
@@ -163,7 +179,7 @@ async fn dry_run_makes_no_mutations() {
 
 #[tokio::test]
 async fn skill_mode_stdout_is_pure_jsonl_no_human_formatting() {
-    let (out, _db) = run_onboard_with_db(&[
+    let (out, _db, _dir) = run_onboard_with_db(&[
         "--skip-adapters",
         "--skill-mode",
         "--bind",
@@ -195,7 +211,7 @@ async fn skill_mode_stdout_is_pure_jsonl_no_human_formatting() {
 async fn only_filter_runs_exactly_the_listed_steps() {
     // A non-trivial subset: snapshot + mint-capabilities + doctor.
     // Excludes everything else.
-    let (out, _db) = run_onboard_with_db(&[
+    let (out, _db, _dir) = run_onboard_with_db(&[
         "--skip-adapters",
         "--skill-mode",
         "--only",
@@ -235,6 +251,10 @@ async fn only_filter_runs_exactly_the_listed_steps() {
 async fn idempotent_rerun_does_not_duplicate_seeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("ctxd.db");
+    let config = dir.path().join("config");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
     let common_args: Vec<&str> = vec![
         "--db",
         db.to_str().unwrap(),
@@ -250,6 +270,8 @@ async fn idempotent_rerun_does_not_duplicate_seeds() {
 
     // First run.
     let out1 = tokio::process::Command::new(ctxd_bin())
+        .env("CTXD_CONFIG_DIR", &config)
+        .env("CTXD_DATA_DIR", &data)
         .args(&common_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -269,6 +291,8 @@ async fn idempotent_rerun_does_not_duplicate_seeds() {
 
     // Second run.
     let out2 = tokio::process::Command::new(ctxd_bin())
+        .env("CTXD_CONFIG_DIR", &config)
+        .env("CTXD_DATA_DIR", &data)
         .args(&common_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

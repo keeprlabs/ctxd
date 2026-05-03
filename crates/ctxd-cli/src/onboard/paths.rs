@@ -38,7 +38,17 @@ fn project_dirs() -> Result<ProjectDirs> {
 /// Where ctxd stores the SQLite DB + HNSW index sidecars. Matches
 /// the Homebrew install path on macOS so `brew install` and
 /// `ctxd onboard` resolve to the same location.
+///
+/// `CTXD_DATA_DIR` overrides the default. Used by integration tests
+/// to isolate state per test (each test sets a tempdir) and by
+/// operators who want to point ctxd at a non-default location
+/// without recompiling.
 pub fn data_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("CTXD_DATA_DIR") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         // Force `Application Support/ctxd` rather than
@@ -56,7 +66,15 @@ pub fn data_dir() -> Result<PathBuf> {
 
 /// Where ctxd stores user-facing configuration (`skills.toml`,
 /// capability file pointers, snapshot manifests).
+///
+/// `CTXD_CONFIG_DIR` overrides the default. Used by integration
+/// tests to isolate state per test (each test sets a tempdir).
 pub fn config_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("CTXD_CONFIG_DIR") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         // On macOS we co-locate config with data — Apple convention
