@@ -18,6 +18,8 @@ The global `--db` flag defaulted to the literal string `"ctxd.db"` — relative 
 - **`--db` now defaults to `paths::default_db_path()`.** macOS resolves to `~/Library/Application Support/ctxd/ctxd.db`, Linux to `$XDG_DATA_HOME/ctxd/ctxd.db`, Windows to `%APPDATA%\ctxd\data\ctxd.db`. `CTXD_DATA_DIR` overrides. Existing `--db <path>` invocations are unchanged.
 - **`service-start` probes both pidfile paths.** When the cli.db pidfile doesn't show up within the deadline, also try the canonical default-db pidfile. Defense-in-depth: a 0.4 binary running against an old plist (or vice-versa) won't wedge.
 - **`Outcome.clients_configured` and `Outcome.adapters_enabled` populate correctly.** The closing `done — N client(s) configured, M adapter(s) enabled` line was always `0 / 0` because the pipeline never threaded the slugs through. Now it reads `done — 3 client(s) configured` (claude-desktop, claude-code, codex) on a typical onboard.
+- **`ctxd hook` now exits 0 silently when the DB can't be opened.** Stale hooks left behind by a sandboxed onboard run (e.g. `CTXD_DATA_DIR=$(mktemp -d) ctxd onboard`, then tempdir wiped) used to surface SQLITE_CANTOPEN as a non-zero exit. Claude Code rendered that as `Stop hook error: ... (code: 14) unable to open database file` in the chat on every Stop event — a permanent visible failure mode that could only be cleared by re-running onboard. Hooks are now best-effort end-to-end: any failure (missing DB, locked DB, malformed slug, malformed payload) logs to stderr and exits 0. Five integration tests pin the contract.
+- **MCP stdio proxy no longer emits empty frames for JSON-RPC notifications.** The proxy used to write a bare newline whenever the daemon answered `202 Accepted` to a notification (no `id`, no response expected). Line-oriented MCP clients then tried to `JSON.parse("")` and surfaced "Unexpected end of JSON input" — visible in the Claude Desktop log around the `notifications/initialized` handshake.
 
 ### Migration from v0.4.0
 
@@ -31,6 +33,8 @@ rm -rf "$HOME/Library/Application Support/ctxd/caps"
 rm -f  "$HOME/Library/Application Support/ctxd/ctxd.db.pid"
 ctxd onboard   # picks up the v0.4.1 default
 ```
+
+If you saw `Stop hook error: ... (code: 14) unable to open database file` repeating in Claude Code chats, upgrading to v0.4.1 silences the symptom immediately (hooks are now best-effort). To also clear out the stale entry that's been firing, run `ctxd onboard --only configure-clients` once on v0.4.1 — settings.json is rewritten with the canonical DB path.
 
 ## v0.4 — 2026-05-02
 
